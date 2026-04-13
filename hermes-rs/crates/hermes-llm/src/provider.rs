@@ -132,6 +132,26 @@ pub fn provider_headers(provider: ProviderType) -> HashMap<String, String> {
     headers
 }
 
+/// Get the default model for a provider when no model is configured.
+///
+/// Mirrors Python: `get_default_model_for_provider()` in `hermes_cli/models.py`.
+/// Returns the provider's first catalog model so the API call doesn't fail
+/// with "model must be a non-empty string".
+pub fn get_default_model_for_provider(provider: ProviderType) -> Option<&'static str> {
+    match provider {
+        ProviderType::Anthropic => Some("claude-sonnet-4-6-20250514"),
+        ProviderType::OpenAI => Some("gpt-4.1"),
+        ProviderType::OpenRouter => Some("anthropic/claude-sonnet-4-6"),
+        ProviderType::Nous => Some("nousresearch/hermes-3-llama-3.1-70b"),
+        ProviderType::Codex => Some("o3"),
+        ProviderType::Gemini => Some("gemini-2.5-flash"),
+        ProviderType::Zai => Some("glm-4-plus"),
+        ProviderType::Kimi => Some("kimi-k2-0905"),
+        ProviderType::Minimax => Some("MiniMax-M2.5"),
+        ProviderType::Custom | ProviderType::Unknown => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

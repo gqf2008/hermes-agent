@@ -37,9 +37,25 @@ impl HermesApp {
             println!();
         }
 
+        // Resolve provider for default model fallback.
+        // When no model is explicitly configured, fall back to the provider's
+        // first catalog model so the API call doesn't fail with "model must be non-empty".
+        let provider_str = model_name.split('/').next().unwrap_or("").to_lowercase();
+        let provider = hermes_llm::provider::parse_provider(&provider_str);
+        let final_model = if model_name.is_empty() {
+            if let Some(default) = hermes_llm::provider::get_default_model_for_provider(provider.clone()) {
+                tracing::info!("No model configured — defaulting to {default} for provider {}", provider);
+                default.to_string()
+            } else {
+                "anthropic/claude-opus-4.6".to_string()
+            }
+        } else {
+            model_name
+        };
+
         // Build agent config
         let config = AgentConfig {
-            model: model_name,
+            model: final_model,
             max_iterations: 90,
             skip_context_files: skip_context,
             terminal_cwd: std::env::current_dir().ok(),
@@ -551,8 +567,22 @@ impl HermesApp {
         let mut agent_registry = ToolRegistry::new();
         register_all_tools(&mut agent_registry);
 
+        // Provider default model fallback for gateway
+        let provider_str = model_name.split('/').next().unwrap_or("openrouter").to_lowercase();
+        let provider = hermes_llm::provider::parse_provider(&provider_str);
+        let final_model = if model_name.is_empty() {
+            if let Some(default) = hermes_llm::provider::get_default_model_for_provider(provider.clone()) {
+                tracing::info!("No model configured — defaulting to {default} for provider {}", provider);
+                default.to_string()
+            } else {
+                "anthropic/claude-opus-4.6".to_string()
+            }
+        } else {
+            model_name
+        };
+
         let agent_config = AgentConfig {
-            model: model_name.clone(),
+            model: final_model.clone(),
             max_iterations: 90,
             skip_context_files: false,
             terminal_cwd: std::env::current_dir().ok(),
@@ -562,7 +592,7 @@ impl HermesApp {
         let agent = AIAgent::new(agent_config, Arc::new(agent_registry))
             .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, format!("Failed to create agent: {e}")))?;
 
-        tracing::info!("Gateway started with {} platform(s) using model: {}", platform_count, model_name);
+        tracing::info!("Gateway started with {} platform(s) using model: {}", platform_count, final_model);
         println!("  Gateway running (Ctrl+C to stop)");
 
         // Create agent-based message handler

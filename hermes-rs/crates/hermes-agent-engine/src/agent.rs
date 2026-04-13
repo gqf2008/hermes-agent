@@ -67,6 +67,94 @@ fn has_truncated_tool_args(tool_calls: &[Value]) -> bool {
     false
 }
 
+/// Check if the base URL is a local endpoint (localhost, 127.0.0.1, etc.).
+fn is_local_endpoint(base_url: &str) -> bool {
+    let url = base_url.to_lowercase();
+    url.contains("localhost") || url.contains("127.0.0.1") || url.contains("0.0.0.0")
+        || url.starts_with("http://local")
+}
+
+/// Estimate token count from message length (rough chars/4 heuristic).
+fn estimate_tokens(messages: &[Value]) -> usize {
+    let mut total = 0;
+    for msg in messages {
+        if let Some(content) = msg.get("content").and_then(Value::as_str) {
+            total += content.len() / 4;
+        }
+    }
+    total
+}
+
+/// Compute stale-call timeout for non-streaming API calls.
+///
+/// Mirrors Python: default 300s, scales up for large contexts
+/// (>100K tokens → 600s, >50K → 450s), disabled for local endpoints.
+fn stale_call_timeout(base_url: Option<&str>, messages: &[Value]) -> std::time::Duration {
+    const DEFAULT: f64 = 300.0;
+
+    // Check env var override
+    if let Ok(val) = std::env::var("HERMES_API_CALL_STALE_TIMEOUT") {
+        if let Ok(secs) = val.parse::<f64>() {
+            if secs > 0.0 {
+                return std::time::Duration::from_secs_f64(secs);
+            }
+        }
+    }
+
+    // Local endpoints: no stale timeout (local models may be slow)
+    if base_url.is_some_and(is_local_endpoint) {
+        return std::time::Duration::from_secs(u64::MAX);
+    }
+
+    let est_tokens = estimate_tokens(messages);
+    let secs = if est_tokens > 100_000 {
+        600.0
+    } else if est_tokens > 50_000 {
+        450.0
+    } else {
+        DEFAULT
+    };
+    std::time::Duration::from_secs_f64(secs)
+}
+
+/// Build a human-readable failure hint from the error classification.
+///
+/// Mirrors Python: instead of always assuming "rate limiting", extract
+/// HTTP error code (429/504/524/500/503) and response time for context.
+fn build_failure_hint(classification: &hermes_llm::error_classifier::ClassifiedError, api_duration: f64) -> String {
+    use hermes_llm::error_classifier::FailoverReason;
+
+    match classification.status_code {
+        Some(524) => format!("upstream provider timed out (Cloudflare 524, {:.0}s)", api_duration),
+        Some(504) => format!("upstream gateway timeout (504, {:.0}s)", api_duration),
+        Some(429) => "rate limited by upstream provider (429)".to_string(),
+        Some(402) => {
+            match classification.reason {
+                FailoverReason::Billing => "billing/payment issue — check account".to_string(),
+                FailoverReason::RateLimit => "rate limited by upstream provider (402)".to_string(),
+                _ => format!("billing or rate limit (402, {:.1}s)", api_duration),
+            }
+        }
+        Some(500) | Some(502) => format!("upstream server error (code {}, {:.0}s)", classification.status_code.unwrap(), api_duration),
+        Some(503) | Some(529) => format!("upstream provider overloaded ({})", classification.status_code.unwrap()),
+        Some(code) => format!("upstream error (code {}, {:.1}s)", code, api_duration),
+        None => {
+            // No status code — use response time and reason as hint
+            match classification.reason {
+                FailoverReason::RateLimit => "likely rate limited by provider".to_string(),
+                FailoverReason::Timeout => format!("upstream timeout ({:.0}s)", api_duration),
+                FailoverReason::Overloaded => "upstream overloaded".to_string(),
+                FailoverReason::ServerError => format!("upstream server error ({:.0}s)", api_duration),
+                FailoverReason::Billing => "billing/payment issue — check account".to_string(),
+                FailoverReason::Auth | FailoverReason::AuthPermanent => "authentication failed — check API key".to_string(),
+                _ if api_duration < 10.0 => format!("fast response ({:.1}s) — likely rate limited", api_duration),
+                _ if api_duration > 60.0 => format!("slow response ({:.0}s) — likely upstream timeout", api_duration),
+                _ => format!("response time {:.1}s", api_duration),
+            }
+        }
+    }
+}
+
 /// Rollback message history to the last complete assistant turn.
 ///
 /// When an unrecoverable error occurs during a conversation turn,
@@ -224,6 +312,14 @@ pub struct AIAgent {
     turns_since_memory: usize,
     /// Iterations since last skill_manage tool use (starts at 0).
     iters_since_skill: usize,
+    /// Provider signaled "stream not supported" — switch to non-streaming
+    /// for the rest of this session instead of re-failing every retry.
+    /// Mirrors Python: `_disable_streaming` in `run_agent.py`.
+    #[allow(dead_code)]
+    disable_streaming: bool,
+    /// Force ASCII-only payload for API calls (set when ASCII codec error detected).
+    #[allow(dead_code)]
+    force_ascii_payload: bool,
 }
 
 impl AIAgent {
@@ -282,6 +378,8 @@ impl AIAgent {
             activity_callback: None,
             turns_since_memory: 0,
             iters_since_skill: 0,
+            disable_streaming: false,
+            force_ascii_payload: false,
         })
     }
 
@@ -392,9 +490,22 @@ impl AIAgent {
                 break;
             }
 
-            // Call the LLM
-            match self.call_llm(&active_system_prompt, &messages).await {
-                Ok(response) => {
+            // Call the LLM with stale-call timeout wrapper.
+            // Mirrors Python: stale-call detector kills hung connections
+            // after configured timeout (default 300s) so the retry loop
+            // can apply richer recovery (credential rotation, provider fallback).
+            let stale_timeout = stale_call_timeout(
+                self.config.base_url.as_deref(),
+                &messages,
+            );
+            let call_start = std::time::Instant::now();
+            let llm_result = tokio::time::timeout(
+                stale_timeout,
+                self.call_llm(&active_system_prompt, &messages),
+            ).await;
+
+            match llm_result {
+                Ok(Ok(response)) => {
                     api_call_count += 1;
 
                     // Detect truncated tool_call arguments (finish_reason="length"
@@ -564,11 +675,21 @@ impl AIAgent {
                         break;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Classify the error to determine if compression can help
                     let error_msg = e.to_string();
                     let classification = hermes_llm::error_classifier::classify_api_error(
                         "unknown", &self.config.model, None, &error_msg,
+                    );
+
+                    // Build human-readable failure hint from error classification.
+                    // Mirrors Python: extract HTTP error code (429/504/524/500/503)
+                    // and response time for contextual diagnostics instead of always
+                    // assuming rate limiting.
+                    let api_duration = call_start.elapsed().as_secs_f64();
+                    let failure_hint = build_failure_hint(
+                        &classification,
+                        api_duration,
                     );
 
                     if classification.should_compress && self.compressor.is_some() {
@@ -596,8 +717,25 @@ impl AIAgent {
                         }
                     }
 
-                    tracing::error!("LLM call failed: {}", e);
-                    final_response = format!("Error: {}", e);
+                    tracing::error!("LLM call failed: {} ({})", e, failure_hint);
+                    final_response = format!("Error: {} ({})", e, failure_hint);
+                    exit_reason = "llm_error".to_string();
+                    break;
+                }
+                Err(_timeout) => {
+                    // Stale-call timeout: no response arrived within timeout.
+                    // Kill the connection and return error so retry loop can
+                    // apply richer recovery (credential rotation, provider fallback).
+                    let est_tokens = estimate_tokens(&messages);
+                    let timeout_secs = stale_timeout.as_secs();
+                    tracing::warn!(
+                        "Non-streaming API call stale for {}s (threshold {}s). model={} context=~{} tokens. Killing connection.",
+                        timeout_secs, timeout_secs, self.config.model, est_tokens,
+                    );
+                    final_response = format!(
+                        "Error: no response from provider for {}s (model: {}, ~{} tokens)",
+                        timeout_secs, self.config.model, est_tokens
+                    );
                     exit_reason = "llm_error".to_string();
                     break;
                 }
@@ -1406,5 +1544,136 @@ mod tests {
         });
         let result = agent.execute_tool_call(&tool_call).await;
         assert_eq!(result["role"], "tool");
+    }
+
+    // ── Stale-call timeout tests ──────────────────────────────────────
+
+    #[test]
+    fn test_is_local_endpoint() {
+        assert!(is_local_endpoint("http://localhost:8080"));
+        assert!(is_local_endpoint("http://127.0.0.1:11434"));
+        assert!(is_local_endpoint("http://0.0.0.0:8000"));
+        assert!(is_local_endpoint("http://local.something"));
+        assert!(!is_local_endpoint("https://api.openai.com/v1"));
+        assert!(!is_local_endpoint("https://api.openrouter.ai/v1"));
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi there"}),
+        ];
+        let tokens = estimate_tokens(&messages);
+        // "hello" + "hi there" = ~13 chars / 4 ≈ 3 tokens
+        assert!(tokens >= 2 && tokens <= 5);
+    }
+
+    #[test]
+    fn test_estimate_tokens_empty() {
+        let messages: Vec<Value> = vec![];
+        assert_eq!(estimate_tokens(&messages), 0);
+    }
+
+    #[test]
+    fn test_stale_call_timeout_default() {
+        // No base_url, no env var → default 300s
+        let timeout = stale_call_timeout(None, &[]);
+        assert_eq!(timeout, std::time::Duration::from_secs_f64(300.0));
+    }
+
+    #[test]
+    fn test_stale_call_timeout_local_disabled() {
+        let timeout = stale_call_timeout(Some("http://localhost:8080"), &[]);
+        assert_eq!(timeout, std::time::Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn test_stale_call_timeout_large_context() {
+        // Simulate >100K tokens (chars/4 heuristic → need >400K chars)
+        let large_content = "x".repeat(440_000);
+        let messages = vec![serde_json::json!({"role": "user", "content": large_content})];
+        let timeout = stale_call_timeout(Some("https://api.openai.com/v1"), &messages);
+        assert_eq!(timeout, std::time::Duration::from_secs_f64(600.0));
+    }
+
+    #[test]
+    fn test_stale_call_timeout_mid_context() {
+        // Simulate >50K tokens but <100K (200K-400K chars)
+        let content = "x".repeat(240_000);
+        let messages = vec![serde_json::json!({"role": "user", "content": content})];
+        let timeout = stale_call_timeout(Some("https://api.openai.com/v1"), &messages);
+        assert_eq!(timeout, std::time::Duration::from_secs_f64(450.0));
+    }
+
+    #[test]
+    fn test_stale_call_timeout_env_override() {
+        std::env::set_var("HERMES_API_CALL_STALE_TIMEOUT", "60");
+        let timeout = stale_call_timeout(None, &[]);
+        assert_eq!(timeout, std::time::Duration::from_secs_f64(60.0));
+        std::env::remove_var("HERMES_API_CALL_STALE_TIMEOUT");
+    }
+
+    // ── Failure hint tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_failure_hint_524() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "openrouter", "gpt-4", Some(524), "A timeout occurred");
+        let hint = build_failure_hint(&classification, 120.0);
+        assert!(hint.contains("524"));
+        assert!(hint.contains("120s"));
+    }
+
+    #[test]
+    fn test_failure_hint_429() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "openai", "gpt-4", Some(429), "Rate limit exceeded");
+        let hint = build_failure_hint(&classification, 5.0);
+        assert!(hint.contains("rate limited"));
+        assert!(hint.contains("429"));
+    }
+
+    #[test]
+    fn test_failure_hint_500() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "openrouter", "gpt-4", Some(500), "Internal server error");
+        let hint = build_failure_hint(&classification, 30.0);
+        assert!(hint.contains("server error"));
+        assert!(hint.contains("500"));
+    }
+
+    #[test]
+    fn test_failure_hint_no_status_fast() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "unknown", "model", None, "Something went wrong");
+        let hint = build_failure_hint(&classification, 3.0);
+        assert!(hint.contains("fast response"));
+        assert!(hint.contains("likely rate limited"));
+    }
+
+    #[test]
+    fn test_failure_hint_no_status_slow() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "unknown", "model", None, "Something went wrong");
+        let hint = build_failure_hint(&classification, 90.0);
+        assert!(hint.contains("slow response"));
+        assert!(hint.contains("timeout"));
+    }
+
+    #[test]
+    fn test_failure_hint_timeout_reason() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "unknown", "model", None, "Request timed out");
+        let hint = build_failure_hint(&classification, 15.0);
+        assert!(hint.contains("upstream timeout"));
+    }
+
+    #[test]
+    fn test_failure_hint_billing() {
+        let classification = hermes_llm::error_classifier::classify_api_error(
+            "openrouter", "model", Some(402), "Insufficient credits");
+        let hint = build_failure_hint(&classification, 2.0);
+        assert!(hint.contains("billing"));
     }
 }
