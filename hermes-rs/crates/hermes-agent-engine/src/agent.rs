@@ -1,0 +1,1410 @@
+//! AIAgent — core conversation loop with tool calling.
+//!
+//! Mirrors the Python `AIAgent` class in `run_agent.py`.
+//! Manages:
+//! - System prompt assembly (via hermes_prompt)
+//! - Main tool-calling loop
+//! - Context compression integration
+//! - Sub-agent delegation
+//! - Session persistence
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use serde_json::Value;
+
+use hermes_core::{HermesConfig, Result};
+use hermes_prompt::{
+    apply_anthropic_cache_control, build_system_prompt, CompressorConfig, ContextCompressor,
+    PromptBuilderConfig, ToolUseEnforcement, CacheTtl,
+};
+use hermes_tools::registry::ToolRegistry;
+
+use crate::budget::IterationBudget;
+use crate::subagent::{SubagentManager, SubagentResult};
+
+/// Dispatch subagent delegation in a separate tokio task to break
+/// the type-level cycle between execute_tool_call and execute_delegation.
+fn dispatch_delegation(
+    mgr: Arc<SubagentManager>,
+    registry: Arc<ToolRegistry>,
+    args: Value,
+) -> tokio::sync::oneshot::Receiver<Vec<SubagentResult>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let results = mgr.execute_delegation(args, registry).await;
+        let _ = tx.send(results);
+    });
+    rx
+}
+
+/// Check if any tool call has truncated JSON arguments.
+///
+/// Returns true when finish_reason indicates length truncation AND
+/// any tool_call's function arguments don't parse as valid JSON
+/// or don't end with `}` or `]`.
+fn has_truncated_tool_args(tool_calls: &[Value]) -> bool {
+    for tc in tool_calls {
+        if let Some(args_str) = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+        {
+            let trimmed = args_str.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Quick check: doesn't end with closing bracket
+            if !trimmed.ends_with('}') && !trimmed.ends_with(']') {
+                return true;
+            }
+            // Deep check: try to parse as JSON
+            if serde_json::from_str::<Value>(trimmed).is_err() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Rollback message history to the last complete assistant turn.
+///
+/// When an unrecoverable error occurs during a conversation turn,
+/// discard the last incomplete assistant message and return to the
+/// state before it was added.
+///
+/// Mirrors Python: `_rollback_to_last_assistant()` in `run_agent.py`.
+#[allow(dead_code)]
+fn rollback_to_last_assistant(messages: &[Value]) -> Vec<Value> {
+    // Find the last complete assistant message (one without tool_calls
+    // that has content, or one with valid tool_calls + all tool results)
+    let mut last_assistant_idx: Option<usize> = None;
+
+    for (i, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "assistant" {
+            // Mark this as a potential rollback point
+            last_assistant_idx = Some(i);
+        }
+    }
+
+    if let Some(idx) = last_assistant_idx {
+        // Keep everything before the last assistant message
+        messages[..idx].to_vec()
+    } else {
+        // No assistant message found — return original
+        messages.to_vec()
+    }
+}
+
+/// Check if the model output contains thinking tags.
+///
+/// Detects `<think>`, `<thinking>`, `<reasoning>` tags.
+/// Used for thinking-exhaustion gating: only reasoning models
+/// (Claude, o1/o3) should be marked as having exhausted their
+/// thinking budget. Non-reasoning models (GLM, MiniMax) won't
+/// produce these tags and shouldn't be falsely marked as exhausted.
+#[allow(dead_code)]
+fn has_think_tags(content: &str) -> bool {
+    content.contains("<think>") || content.contains("</think>")
+        || content.contains("<thinking>") || content.contains("</thinking>")
+        || content.contains("<reasoning>") || content.contains("</reasoning>")
+}
+
+/// Activity callback to prevent gateway inactivity timeout.
+///
+/// Called before each tool execution to signal activity.
+#[allow(dead_code)]
+type ActivityCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Configuration for the AIAgent.
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    /// Model name (e.g., "anthropic/claude-opus-4-6").
+    pub model: String,
+    /// Provider override.
+    pub provider: Option<String>,
+    /// Base URL for API endpoint.
+    pub base_url: Option<String>,
+    /// API key.
+    pub api_key: Option<String>,
+    /// API mode: "openai", "anthropic", "codex".
+    pub api_mode: Option<String>,
+    /// Maximum tool-calling iterations per turn.
+    pub max_iterations: usize,
+    /// Whether to skip context files.
+    pub skip_context_files: bool,
+    /// Platform key (e.g., "cli", "telegram").
+    pub platform: Option<String>,
+    /// Session ID.
+    pub session_id: Option<String>,
+    /// Whether to apply Anthropic prompt caching.
+    pub enable_caching: bool,
+    /// Whether context compression is enabled.
+    pub compression_enabled: bool,
+    /// Compression configuration.
+    pub compression_config: Option<CompressorConfig>,
+    /// Working directory for context file discovery.
+    pub terminal_cwd: Option<std::path::PathBuf>,
+    /// Ephemeral system message (not saved to session DB).
+    pub ephemeral_system_prompt: Option<String>,
+    /// Nudge interval for memory review (default 10 turns).
+    pub memory_nudge_interval: usize,
+    /// Nudge interval for skill review (default 10 iterations).
+    pub skill_nudge_interval: usize,
+    /// Minimum turns between memory flushes (default 6).
+    /// Reserved for future memory flush logic.
+    #[allow(dead_code)]
+    pub memory_flush_min_turns: usize,
+    /// Whether background self-review is enabled (default true).
+    pub self_evolution_enabled: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            model: "anthropic/claude-opus-4-6".to_string(),
+            provider: None,
+            base_url: None,
+            api_key: None,
+            api_mode: None,
+            max_iterations: 90,
+            skip_context_files: false,
+            platform: None,
+            session_id: None,
+            enable_caching: true,
+            compression_enabled: false,
+            compression_config: None,
+            terminal_cwd: None,
+            ephemeral_system_prompt: None,
+            memory_nudge_interval: 10,
+            skill_nudge_interval: 10,
+            memory_flush_min_turns: 6,
+            self_evolution_enabled: true,
+        }
+    }
+}
+
+/// Result of a conversation turn.
+#[derive(Debug, Clone)]
+pub struct TurnResult {
+    /// Final assistant response text.
+    pub response: String,
+    /// Complete message history after the turn.
+    pub messages: Vec<Value>,
+    /// Number of API calls made.
+    pub api_calls: usize,
+    /// Exit reason.
+    pub exit_reason: String,
+}
+
+/// AI Agent with tool calling capabilities.
+pub struct AIAgent {
+    config: AgentConfig,
+    tool_registry: Arc<ToolRegistry>,
+    /// Cached system prompt (rebuilt only after compression).
+    cached_system_prompt: Option<String>,
+    /// Context compressor (if enabled).
+    compressor: Option<ContextCompressor>,
+    /// Shared iteration budget.
+    pub budget: Arc<IterationBudget>,
+    /// Subagent manager for delegation.
+    subagent_mgr: Option<Arc<SubagentManager>>,
+    /// Shared interrupt flag for child agents.
+    #[allow(dead_code)]
+    interrupt: Arc<AtomicBool>,
+    /// Delegation depth (0 = top-level agent).
+    #[allow(dead_code)]
+    delegate_depth: u32,
+    /// Pending subagent results to inject as tool messages.
+    delegate_results: std::sync::Mutex<Vec<SubagentResult>>,
+    /// Activity callback to prevent gateway inactivity timeout.
+    activity_callback: Option<ActivityCallback>,
+    /// Turns since last memory tool use (starts at 0).
+    turns_since_memory: usize,
+    /// Iterations since last skill_manage tool use (starts at 0).
+    iters_since_skill: usize,
+}
+
+impl AIAgent {
+    /// Create a new agent.
+    pub fn new(config: AgentConfig, tool_registry: Arc<ToolRegistry>) -> Result<Self> {
+        Self::with_depth(config, tool_registry, 0)
+    }
+
+    /// Create a new agent at a specific delegation depth.
+    pub fn with_depth(config: AgentConfig, tool_registry: Arc<ToolRegistry>, depth: u32) -> Result<Self> {
+        // Load full config from YAML for disabled tools, etc.
+        let global_config = HermesConfig::load().ok();
+
+        let compressor = if config.compression_enabled {
+            let comp_config = config.compression_config.clone().unwrap_or_else(|| {
+                let mut c = CompressorConfig::default();
+                if let Some(ref gc) = global_config {
+                    if gc.compression.enabled {
+                        c.config_context_length = gc.compression.target_tokens;
+                        c.protect_first_n = gc.compression.protect_first_n;
+                        c.summary_model_override = gc.compression.model.clone();
+                    }
+                }
+                c
+            });
+            Some(ContextCompressor::new(comp_config))
+        } else {
+            None
+        };
+
+        let max_iterations = config.max_iterations;
+        let interrupt = Arc::new(AtomicBool::new(false));
+
+        // Create subagent manager for top-level agents
+        let subagent_mgr = if depth == 0 {
+            let target = global_config
+                .as_ref()
+                .and_then(|gc| gc.compression.target_tokens)
+                .unwrap_or(50);
+            let max_child = target.min(200); // cap at reasonable max
+            Some(Arc::new(SubagentManager::new(depth, interrupt.clone(), max_child)))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            config,
+            tool_registry,
+            cached_system_prompt: None,
+            compressor,
+            budget: Arc::new(IterationBudget::new(max_iterations)),
+            subagent_mgr,
+            interrupt,
+            delegate_depth: depth,
+            delegate_results: std::sync::Mutex::new(Vec::new()),
+            activity_callback: None,
+            turns_since_memory: 0,
+            iters_since_skill: 0,
+        })
+    }
+
+    /// Build or retrieve the cached system prompt.
+    pub fn build_system_prompt(&mut self, system_message: Option<&str>) -> String {
+        if let Some(ref cached) = self.cached_system_prompt {
+            return cached.clone();
+        }
+
+        let available_tools: std::collections::HashSet<String> = self
+            .tool_registry
+            .get_definitions(None)
+            .into_iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .collect();
+
+        let builder_config = PromptBuilderConfig {
+            model: Some(self.config.model.clone()),
+            provider: self.config.provider.clone(),
+            session_id: self.config.session_id.clone(),
+            platform: self.config.platform.clone(),
+            skip_context_files: self.config.skip_context_files,
+            terminal_cwd: self.config.terminal_cwd.clone(),
+            tool_use_enforcement: ToolUseEnforcement::Auto,
+            available_tools: Some(available_tools),
+        };
+
+        let result = build_system_prompt(&builder_config, system_message);
+        self.cached_system_prompt = Some(result.system_prompt.clone());
+        result.system_prompt
+    }
+
+    /// Run a complete conversation turn with the user.
+    ///
+    /// This is the main entry point for the agent loop:
+    /// 1. Build system prompt (cached after first call)
+    /// 2. Add user message to history
+    /// 3. Loop: call LLM → parse tool calls → execute tools → append results
+    /// 4. Return when no more tool calls or budget exhausted
+    pub async fn run_conversation(
+        &mut self,
+        user_message: &str,
+        system_message: Option<&str>,
+        conversation_history: Option<&[Value]>,
+    ) -> TurnResult {
+        let mut messages: Vec<Value> = conversation_history
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+
+        // Build system prompt
+        let active_system_prompt = self.build_system_prompt(system_message);
+
+        // Add user message
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": user_message
+        }));
+
+        let mut api_call_count = 0;
+        let mut final_response = String::new();
+        // Exit reason — all branches in the loop set this before breaking.
+        #[allow(unused_assignments)]
+        let mut exit_reason = "max_iterations".to_string();
+        let mut truncated_retry = false;
+        let mut length_continue_retries: u32 = 0;
+        let mut truncated_response_prefix = String::new();
+        let mut compression_attempts: u32 = 0;
+        let max_compression_attempts: u32 = 3;
+
+        // Self-evolution: increment turn counter, check memory nudge threshold
+        let mut should_review_memory = false;
+        let mut should_review_skills = false;
+        self.turns_since_memory += 1;
+        if self.config.self_evolution_enabled
+            && self.turns_since_memory >= self.config.memory_nudge_interval
+        {
+            should_review_memory = true;
+            self.turns_since_memory = 0;
+        }
+
+        // Main conversation loop
+        // Grace call: when budget is exhausted, give the model one final chance.
+        // Mirrors Python: `while (budget remaining > 0) or self._budget_grace_call`
+        loop {
+            let should_continue = if self.budget.remaining() > 0 {
+                self.budget.consume()
+            } else if self.budget.take_grace_call() {
+                // Grace call — budget was exhausted but we get one more chance.
+                // Consume the flag so loop exits after this iteration.
+                tracing::debug!("Budget grace call — one final iteration");
+                true
+            } else {
+                // Budget exhausted, no grace call available
+                exit_reason = "budget_exhausted".to_string();
+                break;
+            };
+
+            if !should_continue {
+                // Budget exhausted — set grace call for one more iteration
+                self.budget.set_grace_call();
+                exit_reason = "budget_exhausted".to_string();
+                break;
+            }
+
+            // Call the LLM
+            match self.call_llm(&active_system_prompt, &messages).await {
+                Ok(response) => {
+                    api_call_count += 1;
+
+                    // Detect truncated tool_call arguments (finish_reason="length"
+                    // with invalid JSON in tool arguments). Mirrors Python: retry
+                    // once instead of wasting 3 continuation attempts.
+                    if truncated_retry {
+                        truncated_retry = false;
+                        // Previous call had truncated tool args — don't append,
+                        // just re-run from current message state.
+                        continue;
+                    }
+
+                    // Successful response — reset compression counter
+                    if compression_attempts > 0 {
+                        compression_attempts = 0;
+                    }
+
+                    // Check for tool calls
+                    if let Some(tool_calls) = response.get("tool_calls").and_then(Value::as_array) {
+                        if tool_calls.is_empty() {
+                            // Empty tool_calls array — may still be length truncated
+                            let is_length = response.get("finish_reason")
+                                .and_then(Value::as_str)
+                                .is_some_and(|fr| fr == "length" || fr == "length_limit");
+
+                            if is_length && length_continue_retries < 3 {
+                                length_continue_retries += 1;
+                                let content = response
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                truncated_response_prefix.push_str(content);
+                                tracing::warn!(
+                                    "Response truncated with empty tool_calls — continuing (attempt {}/{})",
+                                    length_continue_retries, 3
+                                );
+                                messages.push(response.clone());
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": "Please continue your previous response from exactly where you left off. Do NOT repeat content, do NOT summarize — just continue."
+                                }));
+                                continue;
+                            }
+
+                            // Not truncated or exceeded retries — treat as final
+                            if let Some(content) = response.get("content").and_then(Value::as_str) {
+                                if !truncated_response_prefix.is_empty() {
+                                    let mut full = truncated_response_prefix.clone();
+                                    full.push_str(content);
+                                    final_response = full;
+                                } else {
+                                    final_response = content.to_string();
+                                }
+                            }
+                            exit_reason = "completed".to_string();
+                            messages.push(response);
+                            break;
+                        }
+
+                        // Check for truncated tool arguments
+                        let is_truncated = response.get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|fr| fr == "length" || fr == "length_limit")
+                            && has_truncated_tool_args(tool_calls);
+
+                        if is_truncated {
+                            truncated_retry = true;
+                            tracing::warn!(
+                                "Truncated tool call detected — retrying API call (tool_calls={})",
+                                tool_calls.len()
+                            );
+                            continue;
+                        }
+
+                        // Add assistant message with tool calls
+                        messages.push(response.clone());
+
+                        // Execute tools and append results
+                        for tc in tool_calls {
+                            let tool_result = self.execute_tool_call(tc).await;
+                            messages.push(tool_result);
+                        }
+
+                        // Check for subagent delegation results
+                        if let Some(delegate_results) = self.take_delegate_results() {
+                            for r in delegate_results {
+                                messages.push(serde_json::json!({
+                                    "role": "tool",
+                                    "content": serde_json::json!({
+                                        "goal": r.goal,
+                                        "response": r.response,
+                                        "exit_reason": r.exit_reason,
+                                        "api_calls": r.api_calls,
+                                    }).to_string(),
+                                    "tool_call_id": "delegate_result",
+                                }));
+                            }
+                        }
+
+                        // Check context compression
+                        if let Some(ref mut compressor) = self.compressor {
+                            if compressor.should_compress(None) {
+                                messages = compressor.compress(&messages, None);
+                                // Rebuild system prompt after compression
+                                self.cached_system_prompt = None;
+                                let _ = self.build_system_prompt(system_message);
+                                // Fallback compression resets the retry counter
+                                compression_attempts = 0;
+                            }
+                        }
+
+                        // Self-evolution: increment iteration counter after each tool-calling iteration
+                        self.iters_since_skill += 1;
+                    } else {
+                        // No tool_calls key in response — check content
+                        let is_length_truncated = response.get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|fr| fr == "length" || fr == "length_limit");
+
+                        if is_length_truncated {
+                            // Text was cut off — try to continue (up to 3 times)
+                            if length_continue_retries < 3 {
+                                length_continue_retries += 1;
+                                let content = response
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                truncated_response_prefix.push_str(content);
+                                tracing::warn!(
+                                    "Response truncated (length) — continuing (attempt {}/{})",
+                                    length_continue_retries, 3
+                                );
+                                // Inject continue message
+                                messages.push(response.clone());
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": "Please continue your previous response from exactly where you left off. Do NOT repeat content, do NOT summarize — just continue."
+                                }));
+                                continue;
+                            } else {
+                                // Exceeded 3 retries — return partial response
+                                let content = response
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                truncated_response_prefix.push_str(content);
+                                final_response = truncated_response_prefix.clone();
+                                exit_reason = "partial".to_string();
+                                messages.push(response);
+                                break;
+                            }
+                        }
+
+                        // Not truncated — this is the final response
+                        if let Some(content) = response.get("content").and_then(Value::as_str) {
+                            // Prepend any accumulated continuation prefix
+                            if truncated_response_prefix.is_empty() {
+                                final_response = content.to_string();
+                            } else {
+                                let mut full = truncated_response_prefix.clone();
+                                full.push_str(content);
+                                final_response = full;
+                            }
+                        }
+                        exit_reason = "completed".to_string();
+                        messages.push(response);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Classify the error to determine if compression can help
+                    let error_msg = e.to_string();
+                    let classification = hermes_llm::error_classifier::classify_api_error(
+                        "unknown", &self.config.model, None, &error_msg,
+                    );
+
+                    if classification.should_compress && self.compressor.is_some() {
+                        if compression_attempts < max_compression_attempts {
+                            compression_attempts += 1;
+                            tracing::warn!(
+                                "Context/rate error — triggering compression (attempt {}/{})",
+                                compression_attempts, max_compression_attempts
+                            );
+                            if let Some(ref mut compressor) = self.compressor {
+                                messages = compressor.compress(&messages, None);
+                                self.cached_system_prompt = None;
+                                let _ = self.build_system_prompt(system_message);
+                                // Retry the LLM call with compressed context
+                                continue;
+                            }
+                        } else {
+                            tracing::error!(
+                                "Context/rate error — max compression attempts ({}) reached",
+                                max_compression_attempts
+                            );
+                            final_response = format!("Error: context too large after {} compression attempts: {}", max_compression_attempts, e);
+                            exit_reason = "llm_error".to_string();
+                            break;
+                        }
+                    }
+
+                    tracing::error!("LLM call failed: {}", e);
+                    final_response = format!("Error: {}", e);
+                    exit_reason = "llm_error".to_string();
+                    break;
+                }
+            }
+        }
+
+        // Self-evolution: check skill nudge at turn end
+        if self.config.self_evolution_enabled
+            && self.iters_since_skill >= self.config.skill_nudge_interval
+        {
+            should_review_skills = true;
+            self.iters_since_skill = 0;
+        }
+
+        // Spawn background review if warranted
+        if self.config.self_evolution_enabled
+            && !final_response.is_empty()
+            && (should_review_memory || should_review_skills)
+        {
+            self.spawn_background_review(&messages, should_review_memory, should_review_skills);
+        }
+
+        // If loop ended without setting exit_reason
+        if !matches!(exit_reason.as_ref(), "completed" | "llm_error" | "budget_exhausted") {
+            exit_reason = "max_iterations".to_string();
+        }
+
+        TurnResult {
+            response: final_response,
+            messages,
+            api_calls: api_call_count,
+            exit_reason: exit_reason.to_string(),
+        }
+    }
+
+    /// Call the LLM with the current messages.
+    ///
+    /// Dispatches to hermes_llm::client::call_llm based on the model prefix.
+    async fn call_llm(
+        &self,
+        system_prompt: &str,
+        messages: &[Value],
+    ) -> Result<Value> {
+        // Build API request with system prompt and messages
+        let mut api_messages: Vec<Value> = vec![serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        })];
+        api_messages.extend(messages.iter().cloned());
+
+        // Apply Anthropic caching if enabled
+        let cached_messages = if self.config.enable_caching {
+            apply_anthropic_cache_control(&api_messages, CacheTtl::FiveMinutes, false)
+        } else {
+            api_messages
+        };
+
+        // Get tool definitions for the API request
+        let tool_definitions = self.tool_registry.get_definitions(None);
+
+        tracing::info!(
+            "LLM call: model={}, messages={}, tools={}",
+            self.config.model,
+            cached_messages.len(),
+            tool_definitions.len()
+        );
+
+        // Build the LLM request
+        let request = hermes_llm::client::LlmRequest {
+            model: self.config.model.clone(),
+            messages: cached_messages,
+            tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions) },
+            temperature: None,
+            max_tokens: None,
+            base_url: self.config.base_url.clone(),
+            api_key: self.config.api_key.clone(),
+            timeout_secs: None,
+        };
+
+        let response = hermes_llm::client::call_llm(request).await
+            .map_err(|e| hermes_core::HermesError::new(
+                hermes_core::ErrorCategory::ApiError,
+                e.to_string(),
+            ))?;
+
+        // Convert to internal format
+        let mut result = serde_json::json!({
+            "role": "assistant",
+            "content": response.content.unwrap_or_default(),
+        });
+
+        if let Some(tool_calls) = response.tool_calls {
+            result["tool_calls"] = serde_json::Value::Array(tool_calls);
+        }
+
+        if let Some(ref finish) = response.finish_reason {
+            result["finish_reason"] = serde_json::Value::String(finish.clone());
+        }
+
+        Ok(result)
+    }
+
+    /// Extract and clear pending delegate results.
+    fn take_delegate_results(&self) -> Option<Vec<SubagentResult>> {
+        let mut guard = self.delegate_results.lock().ok()?;
+        if guard.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut *guard))
+        }
+    }
+
+    /// Store delegate results for injection into the conversation.
+    fn store_delegate_results(&self, results: Vec<SubagentResult>) {
+        let mut guard = self.delegate_results.lock().unwrap();
+        guard.extend(results);
+    }
+
+    /// Set an activity callback to prevent gateway inactivity timeout.
+    ///
+    /// Called before each tool execution with a message like
+    /// `"calling tool: {name}"`. Useful for gateway deployments
+    /// that need to signal activity to avoid inactivity timeouts.
+    pub fn set_activity_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.activity_callback = Some(Arc::new(callback));
+    }
+
+    /// Spawn a fire-and-forget background review agent.
+    ///
+    /// Mirrors Python `_spawn_background_review()`: creates a separate task
+    /// that reviews the just-completed conversation and creates/updates
+    /// memories or skills if warranted. Never blocks the main conversation.
+    fn spawn_background_review(
+        &self,
+        messages: &[Value],
+        review_memory: bool,
+        review_skills: bool,
+    ) {
+        let config = self.config.clone();
+        let registry = Arc::clone(&self.tool_registry);
+        let history = messages.to_vec();
+        let prompt = if review_memory && review_skills {
+            crate::self_evolution::COMBINED_REVIEW_PROMPT.to_string()
+        } else if review_memory {
+            crate::self_evolution::MEMORY_REVIEW_PROMPT.to_string()
+        } else {
+            crate::self_evolution::SKILL_REVIEW_PROMPT.to_string()
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = crate::review_agent::run_review(
+                config, registry, history, prompt,
+                review_memory, review_skills,
+            ).await {
+                tracing::warn!("Self-evolution review failed: {e}");
+            }
+        });
+    }
+
+    /// Release all resources held by this agent instance.
+    ///
+    /// Cleans up:
+    /// - Signals running child agents to stop via interrupt flag
+    /// - Clears pending delegate results
+    ///
+    /// Safe to call multiple times (idempotent).
+    /// Each cleanup step is independently guarded.
+    pub fn close(&mut self) {
+        // 1. Signal child agents to stop (mirrors Python: kill_all, cleanup_vm, cleanup_browser)
+        self.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // 2. Clear pending delegate results (mirrors Python: close active child agents)
+        if let Ok(mut guard) = self.delegate_results.lock() {
+            guard.clear();
+        }
+
+        // Note: Rust doesn't hold persistent HTTP clients or subprocess handles
+        // at the agent level — those are per-request/per-call in the Rust architecture.
+        // This matches Python's close() intent without needing explicit teardown.
+
+        tracing::debug!(
+            "Agent closed: session_id={:?}",
+            self.config.session_id
+        );
+    }
+
+    /// Execute a single tool call and return the result.
+    async fn execute_tool_call(&mut self, tool_call: &Value) -> Value {
+        let tool_name = tool_call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+
+        let tool_call_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+
+        let arguments = tool_call
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+
+        let args: std::result::Result<Value, _> = serde_json::from_str(arguments);
+        let args = match args {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({
+                    "role": "tool",
+                    "content": format!("Invalid JSON arguments for {}: {}", tool_name, e),
+                    "tool_call_id": tool_call_id
+                });
+            }
+        };
+
+        // Intercept delegate_task and route through SubagentManager.
+        // We handle this at the tool-call level but outside the main conversation
+        // loop to avoid circular async dependencies between modules.
+        if tool_name == "delegate_task" {
+            if let Some(ref mgr) = self.subagent_mgr {
+                let mgr = Arc::clone(mgr);
+                let registry = Arc::clone(&self.tool_registry);
+                let args_clone = args.clone();
+                // Use a separate async boundary to break the type-level cycle.
+                // The spawned task has its own Send requirement that doesn't
+                // feed back into execute_tool_call's future type.
+                let rx = dispatch_delegation(mgr, registry, args_clone);
+                let results = rx.await.unwrap_or_default();
+                self.store_delegate_results(results);
+                return serde_json::json!({
+                    "role": "tool",
+                    "content": "Subagent tasks dispatched. Results will be provided after the next LLM call.",
+                    "tool_call_id": tool_call_id
+                });
+            }
+            // Child agents don't have subagent_mgr — fall through to regular dispatch
+        }
+
+        tracing::info!(
+            "Executing tool: {} (id: {})",
+            tool_name,
+            tool_call_id
+        );
+
+        // Signal activity to prevent gateway inactivity timeout
+        if let Some(ref cb) = self.activity_callback {
+            cb(&format!("calling tool: {tool_name}"));
+        }
+
+        // Self-evolution: reset nudge counters on relevant tool use
+        if tool_name == "memory" {
+            self.turns_since_memory = 0;
+        } else if tool_name == "skill_manage" {
+            self.iters_since_skill = 0;
+        }
+
+        // Dispatch through the tool registry
+        match self.tool_registry.dispatch(tool_name, args) {
+            Ok(result) => {
+                serde_json::json!({
+                    "role": "tool",
+                    "content": result,
+                    "tool_call_id": tool_call_id
+                })
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "role": "tool",
+                    "content": format!("Error executing tool {}: {}", tool_name, e),
+                    "tool_call_id": tool_call_id
+                })
+            }
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_config_default() {
+        let config = AgentConfig::default();
+        assert_eq!(config.model, "anthropic/claude-opus-4-6");
+        assert_eq!(config.max_iterations, 90);
+        assert!(config.enable_caching);
+        assert!(!config.compression_enabled);
+    }
+
+    #[test]
+    fn test_iteration_budget_shared() {
+        let budget = Arc::new(IterationBudget::new(5));
+        assert_eq!(budget.remaining(), 5);
+
+        // Simulate consuming budget
+        for _ in 0..5 {
+            budget.consume();
+        }
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn test_build_system_prompt() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let prompt = agent.build_system_prompt(None);
+        assert!(!prompt.is_empty());
+        // Should contain the default agent identity
+        assert!(prompt.contains("Hermes Agent") || prompt.contains("You are"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_cached() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let first = agent.build_system_prompt(None);
+        let second = agent.build_system_prompt(Some("different"));
+        // Second call should return cached version (ignores new system_message)
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_agent_config_custom() {
+        let config = AgentConfig {
+            model: "openai/gpt-4".to_string(),
+            provider: Some("openai".to_string()),
+            base_url: Some("http://custom.api".to_string()),
+            api_key: Some("sk-test".to_string()),
+            api_mode: Some("openai".to_string()),
+            max_iterations: 30,
+            skip_context_files: true,
+            platform: Some("telegram".to_string()),
+            session_id: Some("sess-123".to_string()),
+            enable_caching: false,
+            compression_enabled: true,
+            compression_config: None,
+            terminal_cwd: Some(std::path::PathBuf::from("/tmp")),
+            ephemeral_system_prompt: Some("override".to_string()),
+            memory_nudge_interval: 5,
+            skill_nudge_interval: 5,
+            memory_flush_min_turns: 3,
+            self_evolution_enabled: true,
+        };
+        assert_eq!(config.model, "openai/gpt-4");
+        assert_eq!(config.max_iterations, 30);
+        assert!(!config.enable_caching);
+        assert!(config.compression_enabled);
+        assert!(config.skip_context_files);
+    }
+
+    #[test]
+    fn test_agent_creation() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let agent = AIAgent::new(config, registry).unwrap();
+        assert_eq!(agent.budget.max_total, 90);
+        assert!(agent.subagent_mgr.is_some());
+        // Nudge counters start at 0
+        assert_eq!(agent.turns_since_memory, 0);
+        assert_eq!(agent.iters_since_skill, 0);
+    }
+
+    #[test]
+    fn test_self_evolution_defaults() {
+        let config = AgentConfig::default();
+        assert_eq!(config.memory_nudge_interval, 10);
+        assert_eq!(config.skill_nudge_interval, 10);
+        assert_eq!(config.memory_flush_min_turns, 6);
+        assert!(config.self_evolution_enabled);
+    }
+
+    #[test]
+    fn test_agent_with_depth_zero_has_manager() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let agent = AIAgent::with_depth(config, registry, 0).unwrap();
+        assert!(agent.subagent_mgr.is_some());
+    }
+
+    #[test]
+    fn test_agent_with_depth_nonzero_no_manager() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let agent = AIAgent::with_depth(config, registry, 1).unwrap();
+        assert!(agent.subagent_mgr.is_none());
+    }
+
+    #[test]
+    fn test_take_delegate_results_empty() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let agent = AIAgent::new(config, registry).unwrap();
+        let results = agent.take_delegate_results();
+        assert!(results.is_none());
+    }
+
+    #[test]
+    fn test_store_and_take_delegate_results() {
+        use crate::subagent::SubagentResult;
+
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let agent = AIAgent::new(config, registry).unwrap();
+
+        agent.store_delegate_results(vec![SubagentResult {
+            goal: "test".to_string(),
+            response: "done".to_string(),
+            exit_reason: "completed".to_string(),
+            api_calls: 3,
+        }]);
+
+        let results = agent.take_delegate_results();
+        assert!(results.is_some());
+        let results = results.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].goal, "test");
+
+        // Second take should return None (cleared)
+        let results2 = agent.take_delegate_results();
+        assert!(results2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_unknown_tool() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let tool_call = serde_json::json!({
+            "id": "call_123",
+            "function": {
+                "name": "nonexistent_tool",
+                "arguments": "{}"
+            }
+        });
+
+        let result = agent.execute_tool_call(&tool_call).await;
+        assert_eq!(result["role"], "tool");
+        assert!(result["content"].as_str().unwrap().contains("Error executing tool"));
+        assert_eq!(result["tool_call_id"], "call_123");
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_invalid_json_args() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let tool_call = serde_json::json!({
+            "id": "call_456",
+            "function": {
+                "name": "todo",
+                "arguments": "{invalid json"
+            }
+        });
+
+        let result = agent.execute_tool_call(&tool_call).await;
+        assert_eq!(result["role"], "tool");
+        assert!(result["content"].as_str().unwrap().contains("Invalid JSON"));
+        assert_eq!(result["tool_call_id"], "call_456");
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_empty_args() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let tool_call = serde_json::json!({
+            "id": "call_789",
+            "function": {
+                "name": "todo",
+                "arguments": ""
+            }
+        });
+
+        let result = agent.execute_tool_call(&tool_call).await;
+        // Empty string is invalid JSON, should return error
+        assert_eq!(result["role"], "tool");
+        assert!(result["content"].as_str().unwrap().contains("Invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_missing_function() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let tool_call = serde_json::json!({
+            "id": "call_missing"
+        });
+
+        let result = agent.execute_tool_call(&tool_call).await;
+        assert_eq!(result["role"], "tool");
+        // name defaults to "unknown"
+        assert!(result["content"].as_str().unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_with_tools() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config.clone(), registry.clone()).unwrap();
+
+        let prompt = agent.build_system_prompt(None);
+        assert!(!prompt.is_empty());
+
+        // Add a tool and check that prompt gets rebuilt (cache invalidated)
+        // Note: cache is only invalidated when compression happens, so this
+        // verifies the cached path
+        let prompt2 = agent.build_system_prompt(None);
+        assert_eq!(prompt, prompt2); // Same due to caching
+    }
+
+    #[test]
+    fn test_turn_result_fields() {
+        let result = TurnResult {
+            response: "hello".to_string(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            api_calls: 1,
+            exit_reason: "completed".to_string(),
+        };
+        assert_eq!(result.response, "hello");
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.api_calls, 1);
+        assert_eq!(result.exit_reason, "completed");
+    }
+
+    #[test]
+    fn test_agent_config_all_defaults_explicit() {
+        let config = AgentConfig::default();
+        assert_eq!(config.model, "anthropic/claude-opus-4-6");
+        assert!(config.provider.is_none());
+        assert!(config.base_url.is_none());
+        assert!(config.api_key.is_none());
+        assert!(config.api_mode.is_none());
+        assert_eq!(config.max_iterations, 90);
+        assert!(!config.skip_context_files);
+        assert!(config.platform.is_none());
+        assert!(config.session_id.is_none());
+        assert!(config.enable_caching);
+        assert!(!config.compression_enabled);
+        assert!(config.compression_config.is_none());
+        assert!(config.terminal_cwd.is_none());
+        assert!(config.ephemeral_system_prompt.is_none());
+    }
+
+    #[test]
+    fn test_close_sets_interrupt() {
+        use std::sync::atomic::Ordering;
+
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        // Interrupt should be false initially
+        assert!(!agent.interrupt.load(Ordering::SeqCst));
+
+        // Close should set it
+        agent.close();
+        assert!(agent.interrupt.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_close_idempotent() {
+        use std::sync::atomic::Ordering;
+
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        agent.close();
+        agent.close(); // Second call should not panic
+        assert!(agent.interrupt.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_close_clears_delegate_results() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        agent.store_delegate_results(vec![SubagentResult {
+            goal: "test".to_string(),
+            response: "done".to_string(),
+            exit_reason: "completed".to_string(),
+            api_calls: 1,
+        }]);
+        assert!(agent.take_delegate_results().is_some());
+
+        // Store again and close
+        agent.store_delegate_results(vec![SubagentResult {
+            goal: "test2".to_string(),
+            response: "done2".to_string(),
+            exit_reason: "completed".to_string(),
+            api_calls: 2,
+        }]);
+        agent.close();
+
+        // After close, delegate results should be cleared
+        assert!(agent.take_delegate_results().is_none());
+    }
+
+    #[test]
+    fn test_has_truncated_tool_args_valid_json() {
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "todo",
+                "arguments": "{\"action\": \"view\"}"
+            }
+        })];
+        assert!(!has_truncated_tool_args(&tool_calls));
+    }
+
+    #[test]
+    fn test_has_truncated_tool_args_truncated() {
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "todo",
+                "arguments": "{\"action\": \"vie"
+            }
+        })];
+        assert!(has_truncated_tool_args(&tool_calls));
+    }
+
+    #[test]
+    fn test_has_truncated_tool_args_empty() {
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "todo",
+                "arguments": ""
+            }
+        })];
+        // Empty args is not truncated (treated as no args)
+        assert!(!has_truncated_tool_args(&tool_calls));
+    }
+
+    #[test]
+    fn test_has_truncated_tool_args_no_function() {
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1"
+        })];
+        assert!(!has_truncated_tool_args(&tool_calls));
+    }
+
+    #[test]
+    fn test_has_truncated_tool_args_multiple_one_truncated() {
+        let tool_calls = vec![
+            serde_json::json!({
+                "id": "call_1",
+                "function": {
+                    "name": "todo",
+                    "arguments": "{\"action\": \"view\"}"
+                }
+            }),
+            serde_json::json!({
+                "id": "call_2",
+                "function": {
+                    "name": "file_ops",
+                    "arguments": "{\"path\": \"/hom"
+                }
+            }),
+        ];
+        assert!(has_truncated_tool_args(&tool_calls));
+    }
+
+    #[test]
+    fn test_has_truncated_tool_args_ends_with_bracket_invalid_json() {
+        // Ends with } but inner structure is broken
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "todo",
+                "arguments": "\"key\": \"value\"}"
+            }
+        })];
+        assert!(has_truncated_tool_args(&tool_calls));
+    }
+
+    #[test]
+    fn test_rollback_to_last_assistant() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi there"}),
+            serde_json::json!({"role": "user", "content": "follow up"}),
+            serde_json::json!({"role": "assistant", "content": "partial response", "tool_calls": []}),
+        ];
+        let rolled_back = rollback_to_last_assistant(&messages);
+        // Should keep everything before the last assistant message
+        assert_eq!(rolled_back.len(), 3);
+        assert_eq!(rolled_back[0]["content"], "hello");
+        assert_eq!(rolled_back[1]["content"], "hi there");
+        assert_eq!(rolled_back[2]["content"], "follow up");
+    }
+
+    #[test]
+    fn test_rollback_no_assistant() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+        let rolled_back = rollback_to_last_assistant(&messages);
+        // No assistant message — return original
+        assert_eq!(rolled_back.len(), 1);
+    }
+
+    #[test]
+    fn test_rollback_empty_messages() {
+        let messages: Vec<Value> = vec![];
+        let rolled_back = rollback_to_last_assistant(&messages);
+        assert!(rolled_back.is_empty());
+    }
+
+    #[test]
+    fn test_rollback_single_assistant() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let rolled_back = rollback_to_last_assistant(&messages);
+        // Only one assistant — rollback removes it, keeping just the user msg
+        assert_eq!(rolled_back.len(), 1);
+        assert_eq!(rolled_back[0]["content"], "hello");
+    }
+
+    #[test]
+    fn test_has_think_tags_thonking() {
+        assert!(has_think_tags("<think>Let me think"));
+        assert!(has_think_tags("Some text\n</think>\nresponse"));
+    }
+
+    #[test]
+    fn test_has_think_tags_thinking() {
+        assert!(has_think_tags("<thinking>I need to analyze</thinking>"));
+    }
+
+    #[test]
+    fn test_has_think_tags_reasoning() {
+        assert!(has_think_tags("<reasoning>Step 1: parse input</reasoning>"));
+    }
+
+    #[test]
+    fn test_has_think_tags_no_tags() {
+        // Non-reasoning models (GLM, MiniMax) don't produce think tags
+        assert!(!has_think_tags("Hello! How can I help you?"));
+        assert!(!has_think_tags(""));
+        assert!(!has_think_tags("Some text with <b>html</b> tags"));
+    }
+
+    #[test]
+    fn test_has_think_tags_mixed_content() {
+        // Tags embedded in larger response
+        assert!(has_think_tags("<think>\nThe answer is 42\n</think>\nThe answer is 42."));
+        assert!(has_think_tags("Let me reason... <thinking>analysis</thinking> done."));
+    }
+
+    #[tokio::test]
+    async fn test_activity_callback_invoked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        agent.set_activity_callback(move |_msg| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Execute a tool — callback should fire
+        let tool_call = serde_json::json!({
+            "id": "call_cb",
+            "function": {
+                "name": "todo",
+                "arguments": "{}"
+            }
+        });
+        let _ = agent.execute_tool_call(&tool_call).await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_no_activity_callback_none() {
+        // Without a callback, tool execution should not panic
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        let tool_call = serde_json::json!({
+            "id": "call_nocb",
+            "function": {
+                "name": "todo",
+                "arguments": "{}"
+            }
+        });
+        let result = agent.execute_tool_call(&tool_call).await;
+        assert_eq!(result["role"], "tool");
+    }
+}

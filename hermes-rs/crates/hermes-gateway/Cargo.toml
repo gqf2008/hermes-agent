@@ -1,0 +1,26 @@
+[package]
+name = "hermes-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+hermes-state.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serial_test = "3"
