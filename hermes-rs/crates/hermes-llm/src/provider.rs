@@ -209,4 +209,26 @@ mod tests {
         );
         assert_eq!(default_base_url(ProviderType::Custom), None);
     }
+
+    #[test]
+    fn test_get_default_model_for_provider() {
+        assert_eq!(
+            get_default_model_for_provider(ProviderType::Anthropic),
+            Some("claude-sonnet-4-6-20250514")
+        );
+        assert_eq!(
+            get_default_model_for_provider(ProviderType::OpenAI),
+            Some("gpt-4.1")
+        );
+        assert_eq!(
+            get_default_model_for_provider(ProviderType::Zai),
+            Some("glm-4-plus")
+        );
+    }
+
+    #[test]
+    fn test_get_default_model_for_provider_none() {
+        assert_eq!(get_default_model_for_provider(ProviderType::Custom), None);
+        assert_eq!(get_default_model_for_provider(ProviderType::Unknown), None);
+    }
 }

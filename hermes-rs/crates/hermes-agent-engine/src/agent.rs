@@ -70,16 +70,29 @@ fn has_truncated_tool_args(tool_calls: &[Value]) -> bool {
 /// Check if the base URL is a local endpoint (localhost, 127.0.0.1, etc.).
 fn is_local_endpoint(base_url: &str) -> bool {
     let url = base_url.to_lowercase();
-    url.contains("localhost") || url.contains("127.0.0.1") || url.contains("0.0.0.0")
-        || url.starts_with("http://local")
+    url.contains("://localhost") || url.contains("://127.") || url.contains("://0.0.0.0")
 }
 
 /// Estimate token count from message length (rough chars/4 heuristic).
+///
+/// Mirrors Python: `sum(len(str(v)) for v in messages) // 4` — counts all
+/// string fields in each message, not just `content`, so tool calls and
+/// metadata are included in the estimate.
 fn estimate_tokens(messages: &[Value]) -> usize {
     let mut total = 0;
     for msg in messages {
-        if let Some(content) = msg.get("content").and_then(Value::as_str) {
-            total += content.len() / 4;
+        if let Some(obj) = msg.as_object() {
+            for value in obj.values() {
+                if let Some(s) = value.as_str() {
+                    total += s.len() / 4;
+                } else if let Some(arr) = value.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            total += s.len() / 4;
+                        }
+                    }
+                }
+            }
         }
     }
     total
@@ -135,9 +148,9 @@ fn build_failure_hint(classification: &hermes_llm::error_classifier::ClassifiedE
                 _ => format!("billing or rate limit (402, {:.1}s)", api_duration),
             }
         }
-        Some(500) | Some(502) => format!("upstream server error (code {}, {:.0}s)", classification.status_code.unwrap(), api_duration),
-        Some(503) | Some(529) => format!("upstream provider overloaded ({})", classification.status_code.unwrap()),
-        Some(code) => format!("upstream error (code {}, {:.1}s)", code, api_duration),
+        Some(code @ 500) | Some(code @ 502) => format!("upstream server error (code {code}, {:.0}s)", api_duration),
+        Some(code @ 503) | Some(code @ 529) => format!("upstream provider overloaded ({code})"),
+        Some(code) => format!("upstream error (code {code}, {:.1}s)", api_duration),
         None => {
             // No status code — use response time and reason as hint
             match classification.reason {
@@ -1553,9 +1566,11 @@ mod tests {
         assert!(is_local_endpoint("http://localhost:8080"));
         assert!(is_local_endpoint("http://127.0.0.1:11434"));
         assert!(is_local_endpoint("http://0.0.0.0:8000"));
-        assert!(is_local_endpoint("http://local.something"));
+        assert!(is_local_endpoint("https://127.0.0.1/v1"));
         assert!(!is_local_endpoint("https://api.openai.com/v1"));
         assert!(!is_local_endpoint("https://api.openrouter.ai/v1"));
+        // http://local.something should NOT match anymore (too broad)
+        assert!(!is_local_endpoint("http://local.example.com/v1"));
     }
 
     #[test]
@@ -1565,8 +1580,9 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "hi there"}),
         ];
         let tokens = estimate_tokens(&messages);
-        // "hello" + "hi there" = ~13 chars / 4 ≈ 3 tokens
-        assert!(tokens >= 2 && tokens <= 5);
+        // Now counts role strings too: "user" + "hello" + "assistant" + "hi there"
+        // = ~23 chars / 4 ≈ 5 tokens, so range is wider
+        assert!(tokens >= 4 && tokens <= 10);
     }
 
     #[test]
