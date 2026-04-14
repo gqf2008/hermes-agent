@@ -1,3 +1,38 @@
+[package]
+name = "hermes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[[bin]]
+name = "hermes-agent"
+path = "src/hermes_agent/main.rs"
+
+[[bin]]
+name = "hermes-acp"
+path = "src/hermes_acp/main.rs"
+
+[dependencies]
+hermes-cli.workspace = true
+hermes-core.workspace = true
+hermes-state.workspace = true
+hermes-agent-engine.workspace = true
+hermes-tools.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+parking_lot.workspace = true
+dirs.workspace = true
+
 [workspace]
 members = [
     "crates/hermes-core",
@@ -11,9 +46,6 @@ members = [
     "crates/hermes-batch",
     "crates/hermes-compress",
     "crates/hermes-gateway",
-    "binaries/hermes",
-    "binaries/hermes-agent",
-    "binaries/hermes-acp",
 ]
 default-members = [
     "crates/hermes-core",
@@ -46,9 +78,6 @@ hermes-cron = { path = "crates/hermes-cron" }
 hermes-batch = { path = "crates/hermes-batch" }
 hermes-compress = { path = "crates/hermes-compress" }
 hermes-gateway = { path = "crates/hermes-gateway" }
-hermes-bin-hermes = { path = "binaries/hermes", package = "hermes" }
-hermes-bin-agent = { path = "binaries/hermes-agent", package = "hermes-agent-bin" }
-hermes-bin-acp = { path = "binaries/hermes-acp", package = "hermes-acp" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
