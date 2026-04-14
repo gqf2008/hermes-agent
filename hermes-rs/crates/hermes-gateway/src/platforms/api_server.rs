@@ -505,4 +505,35 @@ mod tests {
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].id, "hermes-agent");
     }
+
+    #[test]
+    fn test_stream_chunk_serializes_cleanly() {
+        // Ensure StreamChunk serializes to valid JSON without extra wrapping
+        let chunk = StreamChunk {
+            id: "test-id".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "hermes-agent".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: Some("assistant".to_string()),
+                    content: Some("Hello".to_string()),
+                },
+                finish_reason: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&chunk).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Verify structure matches OpenAI format
+        assert_eq!(parsed["id"], "test-id");
+        assert_eq!(parsed["object"], "chat.completion.chunk");
+        assert_eq!(parsed["model"], "hermes-agent");
+        assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+
+        // The JSON should NOT contain double-wrapped "data: " prefix
+        assert!(!json.contains("data: data:"));
+    }
 }
