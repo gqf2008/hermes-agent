@@ -22,12 +22,17 @@ use axum::{
     response::Json,
     routing::post,
 };
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, oneshot};
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Deduplication cache for inbound messages.
 struct DedupCache {
@@ -106,6 +111,11 @@ pub struct DingtalkMessageEvent {
     pub session_webhook: String,
 }
 
+/// Truncate text to at most `max_chars` characters (UTF-8 safe).
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 /// Webhook callback payload from Dingtalk.
 #[derive(Debug, Deserialize)]
 pub struct WebhookPayload {
@@ -171,16 +181,24 @@ impl WebhookCache {
     }
 }
 
+/// Cached access token with expiry time.
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
 /// Dingtalk platform adapter.
 #[derive(Clone)]
 pub struct DingtalkAdapter {
     config: DingtalkConfig,
     client: Client,
     dedup: Arc<DedupCache>,
-    /// Access token cached from Dingtalk API.
-    access_token: Arc<RwLock<Option<String>>>,
+    /// Access token cached from Dingtalk API (with TTL).
+    access_token: Arc<RwLock<Option<CachedToken>>>,
     /// Session webhook cache for proactive sends.
     webhook_cache: Arc<WebhookCache>,
+    /// Semaphore to limit concurrent webhook handlers.
+    handler_semaphore: Arc<Semaphore>,
 }
 
 impl DingtalkAdapter {
@@ -193,14 +211,22 @@ impl DingtalkAdapter {
             dedup: Arc::new(DedupCache::new(2048)),
             access_token: Arc::new(RwLock::new(None)),
             webhook_cache: Arc::new(WebhookCache::new(500)),
+            handler_semaphore: Arc::new(Semaphore::new(100)),
             config,
         }
     }
 
     /// Get/refresh the Dingtalk access token.
+    /// Tokens expire after 7200 seconds (2 hours); refreshed on demand.
     async fn get_access_token(&self) -> Result<String, String> {
-        if let Some(token) = self.access_token.read().await.clone() {
-            return Ok(token);
+        // Check cache with expiry
+        {
+            let guard = self.access_token.read().await;
+            if let Some(cached) = guard.as_ref() {
+                if cached.expires_at > Instant::now() {
+                    return Ok(cached.token.clone());
+                }
+            }
         }
 
         let resp = self
@@ -225,7 +251,16 @@ impl DingtalkAdapter {
             .ok_or_else(|| format!("Missing accessToken in response: {body}"))?
             .to_string();
 
-        *self.access_token.write().await = Some(token.clone());
+        let expires_in = body
+            .get("expireIn")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7200);
+
+        let cached = CachedToken {
+            token: token.clone(),
+            expires_at: Instant::now() + Duration::from_secs(expires_in - 300), // 5min buffer
+        };
+        *self.access_token.write().await = Some(cached);
         Ok(token)
     }
 
@@ -245,7 +280,7 @@ impl DingtalkAdapter {
                 "msgtype": "markdown",
                 "markdown": {
                     "title": "Hermes",
-                    "text": &text[..text.len().min(20000)],
+                    "text": truncate_text(text, 20000),
                 },
             }))
             .send()
@@ -282,7 +317,7 @@ impl DingtalkAdapter {
                 "msgKey": "sampleMarkdown",
                 "msgParam": serde_json::json!({
                     "title": "Hermes",
-                    "text": &text[..text.len().min(20000)],
+                    "text": truncate_text(text, 20000),
                 }).to_string(),
             }))
             .send()
@@ -467,11 +502,54 @@ impl DingtalkAdapter {
 
 // ── Webhook Route Handler ─────────────────────────────────────────
 
+/// Verify Dingtalk webhook signature to prevent message injection.
+fn verify_webhook_signature(
+    payload: &serde_json::Value,
+    client_secret: &str,
+) -> Result<(), String> {
+    let timestamp = payload
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("create_at").and_then(|v| v.as_str()))
+        .ok_or_else(|| "Missing timestamp in webhook payload".to_string())?;
+
+    let signature = payload
+        .get("sign")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing signature in webhook payload".to_string())?;
+
+    let mut mac = HmacSha256::new_from_slice(client_secret.as_bytes())
+        .map_err(|_| "Invalid HMAC key length".to_string())?;
+    mac.update(timestamp.as_bytes());
+    let expected = hex::encode(mac.finalize().into_bytes());
+
+    if signature != expected {
+        return Err(format!(
+            "Webhook signature mismatch: received={}, expected={}",
+            signature, expected
+        ));
+    }
+    Ok(())
+}
+
 async fn webhook_handler(
     State(state): State<WebhookState>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, Json<WebhookResponse>) {
     debug!("Dingtalk webhook received: {payload}");
+
+    // Verify webhook signature if client_secret is configured
+    if !state.adapter.config.client_secret.is_empty() {
+        if let Err(e) = verify_webhook_signature(&payload, &state.adapter.config.client_secret) {
+            warn!("Dingtalk webhook signature verification failed: {e}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(WebhookResponse {
+                    ret: "signature_failed".to_string(),
+                }),
+            );
+        }
+    }
 
     let Some(event) = state.adapter.handle_inbound(&payload) else {
         // Deduped or empty
@@ -492,54 +570,65 @@ async fn webhook_handler(
         );
     }
 
-    // Process agent handler in background to avoid Dingtalk's 5s timeout.
+    // Process agent handler in background with concurrency limit.
     // Dingtalk expects a 200 response quickly; the reply is sent separately
     // via the session_webhook URL after the agent responds.
+    // The semaphore limits concurrent handlers to prevent resource exhaustion.
     let adapter = state.adapter.clone();
     let handler = state.handler.clone();
-    tokio::spawn(async move {
-        info!(
-            "Dingtalk message from {} ({}) via {}: {}",
-            event.sender_nick,
-            event.sender_id,
-            event.chat_id,
-            event.content.chars().take(50).collect::<String>(),
-        );
+    let permit = state.adapter.handler_semaphore.clone()
+        .try_acquire_owned()
+        .map_err(|_| "Too many concurrent webhook handlers")
+        .ok();
 
-        let handler_guard = handler.lock().await;
-        if let Some(handler) = handler_guard.as_ref() {
-            match handler
-                .handle_message(
-                    crate::config::Platform::Dingtalk,
-                    &event.chat_id,
-                    &event.content,
-                )
-                .await
-            {
-                Ok(response) => {
-                    if !response.is_empty() {
-                        if let Err(e) = adapter
-                            .send_text(&event.session_webhook, &response)
-                            .await
-                        {
-                            error!("Dingtalk send failed: {e}");
+    if let Some(_permit) = permit {
+        tokio::spawn(async move {
+            // permit is dropped here, releasing the semaphore after handler completes
+            info!(
+                "Dingtalk message from {} ({}) via {}: {}",
+                event.sender_nick,
+                event.sender_id,
+                event.chat_id,
+                event.content.chars().take(50).collect::<String>(),
+            );
+
+            let handler_guard = handler.lock().await;
+            if let Some(handler) = handler_guard.as_ref() {
+                match handler
+                    .handle_message(
+                        crate::config::Platform::Dingtalk,
+                        &event.chat_id,
+                        &event.content,
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        if !response.is_empty() {
+                            if let Err(e) = adapter
+                                .send_text(&event.session_webhook, &response)
+                                .await
+                            {
+                                error!("Dingtalk send failed: {e}");
+                            }
                         }
                     }
+                    Err(e) => {
+                        error!("Agent handler failed for Dingtalk message: {e}");
+                        let _ = adapter
+                            .send_text(
+                                &event.session_webhook,
+                                "Sorry, I encountered an error processing your message.",
+                            )
+                            .await;
+                    }
                 }
-                Err(e) => {
-                    error!("Agent handler failed for Dingtalk message: {e}");
-                    let _ = adapter
-                        .send_text(
-                            &event.session_webhook,
-                            "Sorry, I encountered an error processing your message.",
-                        )
-                        .await;
-                }
+            } else {
+                warn!("No message handler registered for Dingtalk messages");
             }
-        } else {
-            warn!("No message handler registered for Dingtalk messages");
-        }
-    });
+        });
+    } else {
+        warn!("Dingtalk webhook rejected: too many concurrent handlers");
+    }
 
     (
         StatusCode::OK,

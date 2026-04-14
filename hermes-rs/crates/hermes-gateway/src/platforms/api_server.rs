@@ -18,7 +18,8 @@ use axum::{
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info};
 
 use crate::config::Platform;
@@ -182,15 +183,16 @@ impl ApiServerAdapter {
     /// Build the axum router with all API endpoints.
     pub fn build_router(&self, state: ApiServerState) -> Router {
         let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
+            .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]);
 
         Router::new()
             .route("/health", get(health_handler))
             .route("/v1/models", get(models_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .layer(cors)
+            .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1MB max request body
             .with_state(state)
     }
 
@@ -402,14 +404,16 @@ fn build_sse_stream(
             }],
         };
         let event = axum::response::sse::Event::default()
-            .data(format!("data: {}\n\n", serde_json::to_string(&role_chunk).unwrap()));
+            .json_data(&role_chunk).unwrap();
         yield Ok::<_, std::convert::Infallible>(event);
 
         // Split response into character chunks (3 chars per chunk for pacing)
-        let chars: Vec<char> = response.chars().collect();
-        let chunk_size = 3;
-        for chunk in chars.chunks(chunk_size) {
-            let text: String = chunk.iter().collect();
+        let mut chars = response.chars().peekable();
+        while chars.peek().is_some() {
+            let text: String = chars.by_ref().take(3).collect();
+            if text.is_empty() {
+                break;
+            }
             let content_chunk = StreamChunk {
                 id: chat_id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -425,7 +429,7 @@ fn build_sse_stream(
                 }],
             };
             let event = axum::response::sse::Event::default()
-                .data(format!("data: {}\n\n", serde_json::to_string(&content_chunk).unwrap()));
+                .json_data(&content_chunk).unwrap();
             yield Ok(event);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -446,8 +450,13 @@ fn build_sse_stream(
             }],
         };
         let event = axum::response::sse::Event::default()
-            .data(format!("data: {}\n\ndata: [DONE]\n\n", serde_json::to_string(&finish_chunk).unwrap()));
+            .json_data(&finish_chunk).unwrap();
         yield Ok(event);
+
+        // Send [DONE] marker
+        let done_event = axum::response::sse::Event::default()
+            .data("[DONE]");
+        yield Ok(done_event);
     });
 
     Sse::new(stream)

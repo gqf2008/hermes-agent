@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, info, warn};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+use tracing::{debug, error, info, warn};
 
 /// Deduplication cache for inbound messages.
 struct DedupCache {
@@ -48,6 +48,11 @@ impl DedupCache {
         }
         set.insert(key);
     }
+}
+
+/// Truncate text to at most `max_chars` characters (UTF-8 safe).
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 /// WeCom platform configuration.
@@ -264,12 +269,14 @@ impl WeComAdapter {
 
     /// Get/refresh the WeCom access token (HTTP fallback).
     async fn get_access_token(&self) -> Result<String, String> {
+        // Use POST with JSON body to avoid leaking credentials in URL query strings
         let resp = self
             .client
-            .get(format!(
-                "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={}&corpsecret={}",
-                self.config.bot_id, self.config.secret
-            ))
+            .post("https://qyapi.weixin.qq.com/cgi-bin/gettoken")
+            .json(&serde_json::json!({
+                "corpid": &self.config.bot_id,
+                "corpsecret": &self.config.secret,
+            }))
             .send()
             .await
             .map_err(|e| format!("Failed to get access token: {e}"))?;
@@ -462,6 +469,42 @@ impl WeComAdapter {
         !self.config.bot_id.is_empty() && !self.config.secret.is_empty()
     }
 
+    /// Send a reply via WebSocket, trying respond_msg first then falling back to send_msg.
+    async fn send_reply(
+        ws_state: &WsState,
+        req_id: &str,
+        chat_id: &str,
+        response: String,
+    ) {
+        if !req_id.is_empty() {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if ws_state
+                .cmd_tx
+                .send(WsCommand::RespondText {
+                    req_id: req_id.to_string(),
+                    text: response.clone(),
+                    reply_tx,
+                })
+                .await
+                .is_ok()
+            {
+                if let Ok(Ok(_)) = reply_rx.await {
+                    return; // respond_msg succeeded
+                }
+            }
+        }
+        // Fallback: proactive send
+        let (reply_tx, _) = oneshot::channel();
+        let _ = ws_state
+            .cmd_tx
+            .send(WsCommand::SendText {
+                chat_id: chat_id.to_string(),
+                text: response,
+                reply_tx,
+            })
+            .await;
+    }
+
     /// Run the WeCom WebSocket connection loop.
     ///
     /// Connects to the WeCom WebSocket endpoint, authenticates with
@@ -609,73 +652,196 @@ impl WeComAdapter {
 
         *self.ws_state.lock().await = Some(ws_state.clone());
 
-        // Spawn send loop (handles outbound commands and heartbeat)
-        let send_running = running.clone();
-        tokio::spawn(async move {
-            Self::send_loop(
-                write_half,
-                &mut cmd_rx,
-                send_running,
-            )
-            .await;
-        });
+        // Unified select! loop: read, send, event — all in one task.
+        // This avoids leaking spawned tasks on reconnect.
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Spawn event handler loop
-        let handler_clone = handler.clone();
-        let event_handler_running = running.clone();
-        let event_ws_state = ws_state.clone();
-        tokio::spawn(async move {
-            Self::event_loop(
-                &mut event_rx,
-                handler_clone,
-                event_ws_state,
-                event_handler_running,
-            )
-            .await;
-        });
-
-        // Main read loop: process inbound WebSocket messages
         loop {
-            match tokio::time::timeout(
-                Duration::from_secs(60),
-                reader.next(),
-            )
-            .await
-            {
-                Ok(Some(Ok(Message::Text(text)))) => {
-                    if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) {
-                        self.dispatch_frame(
-                            &frame,
-                            &event_tx,
-                            &reply_req_ids,
-                        )
-                        .await;
+            tokio::select! {
+                // Read inbound WebSocket messages
+                result = tokio::time::timeout(Duration::from_secs(60), reader.next()) => {
+                    match result {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) {
+                                // Dispatch message to event channel
+                                self.dispatch_frame(
+                                    &frame,
+                                    &event_tx,
+                                    &reply_req_ids,
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            info!("WeCom WebSocket closed by server");
+                            return Err("WebSocket closed by server".to_string());
+                        }
+                        Ok(Some(Ok(Message::Ping(_)))) => {
+                            debug!("WeCom ping received");
+                        }
+                        Ok(Some(Ok(_))) => {
+                            // Binary, Pong: ignore
+                        }
+                        Ok(Some(Err(e))) => {
+                            return Err(format!("WebSocket read error: {e}"));
+                        }
+                        Ok(None) => {
+                            return Err("WebSocket stream ended".to_string());
+                        }
+                        Err(_) => {
+                            // 60s read timeout
+                            if !running.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            debug!("WeCom read timeout, reconnecting");
+                            return Err("Read timeout".to_string());
+                        }
                     }
                 }
-                Ok(Some(Ok(Message::Close(_)))) => {
-                    info!("WeCom WebSocket closed by server");
-                    return Err("WebSocket closed by server".to_string());
+                // Handle outbound commands
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(WsCommand::SendText { chat_id, text, reply_tx }) => {
+                            let req_id = format!("send-{}-{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4().simple());
+                            let frame = serde_json::json!({
+                                "cmd": "aibot_send_msg",
+                                "headers": {"req_id": &req_id},
+                                "body": {
+                                    "chatid": chat_id,
+                                    "msgtype": "markdown",
+                                    "markdown": {
+                                        "content": truncate_text(&text, 4000),
+                                    },
+                                },
+                            });
+
+                            match write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
+                                Ok(()) => {
+                                    debug!("WeCom aibot_send_msg sent");
+                                    let _ = reply_tx.send(Ok("ok".to_string()));
+                                }
+                                Err(e) => {
+                                    let _ = reply_tx.send(Err(format!("WebSocket send error: {e}")));
+                                }
+                            }
+                        }
+                        Some(WsCommand::RespondText { req_id, text, reply_tx }) => {
+                            let stream_id = format!("stream-{}", uuid::Uuid::new_v4().simple());
+                            let frame = serde_json::json!({
+                                "cmd": "aibot_respond_msg",
+                                "headers": {"req_id": &req_id},
+                                "body": {
+                                    "msgtype": "stream",
+                                    "stream": {
+                                        "id": stream_id,
+                                        "finish": true,
+                                        "content": truncate_text(&text, 4000),
+                                    },
+                                },
+                            });
+
+                            match write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
+                                Ok(()) => {
+                                    debug!("WeCom aibot_respond_msg sent");
+                                    let _ = reply_tx.send(Ok("ok".to_string()));
+                                }
+                                Err(e) => {
+                                    let _ = reply_tx.send(Err(format!("WebSocket respond error: {e}")));
+                                }
+                            }
+                        }
+                        None => {
+                            info!("WeCom command channel closed");
+                            return Err("Command channel closed".to_string());
+                        }
+                    }
                 }
-                Ok(Some(Ok(Message::Ping(_)))) => {
-                    // Pong automatically handled by tungstenite
-                    debug!("WeCom ping received");
+                // Handle inbound events (route to agent handler)
+                event = event_rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            if event.content.is_empty() {
+                                continue;
+                            }
+
+                            info!(
+                                "WeCom message from {} via {}: {}",
+                                event.sender_id,
+                                event.chat_id,
+                                event.content.chars().take(50).collect::<String>(),
+                            );
+
+                            // Clone handler to avoid holding lock across await
+                            let handler_clone = handler.clone();
+                            let event_req_id = event.req_id.clone();
+                            let event_chat_id = event.chat_id.clone();
+                            let ws_state_clone = ws_state.clone();
+
+                            // Spawn handler task (bounded by agent engine's own limits)
+                            tokio::spawn(async move {
+                                let handler_guard = handler_clone.lock().await;
+                                if let Some(handler) = handler_guard.as_ref() {
+                                    match handler
+                                        .handle_message(
+                                            crate::config::Platform::Wecom,
+                                            &event_chat_id,
+                                            &event.content,
+                                        )
+                                        .await
+                                    {
+                                        Ok(response) => {
+                                            if !response.is_empty() {
+                                                Self::send_reply(
+                                                    &ws_state_clone,
+                                                    &event_req_id,
+                                                    &event_chat_id,
+                                                    response,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Agent handler failed for WeCom message: {e}");
+                                            let (reply_tx, _) = oneshot::channel();
+                                            let _ = ws_state_clone
+                                                .cmd_tx
+                                                .send(WsCommand::SendText {
+                                                    chat_id: event_chat_id.clone(),
+                                                    text: "Sorry, I encountered an error processing your message.".to_string(),
+                                                    reply_tx,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                } else {
+                                    warn!("No message handler registered for WeCom messages");
+                                }
+                            });
+                        }
+                        None => {
+                            info!("WeCom event channel closed");
+                            return Err("Event channel closed".to_string());
+                        }
+                    }
                 }
-                Ok(Some(Ok(_))) => {
-                    // Binary, Pong, Frame: ignore
+                // Application-level heartbeat
+                _ = heartbeat_interval.tick() => {
+                    let ping_id = format!("ping-{}", uuid::Uuid::new_v4().simple());
+                    let frame = serde_json::json!({
+                        "cmd": "ping",
+                        "headers": {"req_id": &ping_id},
+                        "body": {},
+                    });
+                    if let Err(e) = write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
+                        warn!("WeCom heartbeat failed: {e}");
+                    }
                 }
-                Ok(Some(Err(e))) => {
-                    return Err(format!("WebSocket read error: {e}"));
-                }
-                Ok(None) => {
-                    return Err("WebSocket stream ended".to_string());
-                }
-                Err(_) => {
-                    // 60s read timeout - could be network issue
+                // Check running flag periodically
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     if !running.load(Ordering::SeqCst) {
                         return Ok(());
                     }
-                    debug!("WeCom read timeout, reconnecting");
-                    return Err("Read timeout".to_string());
                 }
             }
         }
@@ -725,183 +891,6 @@ impl WeComAdapter {
         }
     }
 
-    /// Send loop: handles outbound commands and heartbeat.
-    async fn send_loop(
-        mut write_half: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-        cmd_rx: &mut mpsc::Receiver<WsCommand>,
-        running: Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
-
-        while running.load(Ordering::SeqCst) {
-            tokio::select! {
-                // Handle outbound commands
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(WsCommand::SendText { chat_id, text, reply_tx }) => {
-                            let req_id = format!("send-{}-{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4().simple());
-                            let frame = serde_json::json!({
-                                "cmd": "aibot_send_msg",
-                                "headers": {"req_id": &req_id},
-                                "body": {
-                                    "chatid": chat_id,
-                                    "msgtype": "markdown",
-                                    "markdown": {
-                                        "content": &text[..text.len().min(4000)],
-                                    },
-                                },
-                            });
-
-                            match write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
-                                Ok(()) => {
-                                    debug!("WeCom aibot_send_msg sent");
-                                    let _ = reply_tx.send(Ok("ok".to_string()));
-                                }
-                                Err(e) => {
-                                    let _ = reply_tx.send(Err(format!("WebSocket send error: {e}")));
-                                }
-                            }
-                        }
-                        Some(WsCommand::RespondText { req_id, text, reply_tx }) => {
-                            let stream_id = format!("stream-{}", uuid::Uuid::new_v4().simple());
-                            let frame = serde_json::json!({
-                                "cmd": "aibot_respond_msg",
-                                "headers": {"req_id": &req_id},
-                                "body": {
-                                    "msgtype": "stream",
-                                    "stream": {
-                                        "id": stream_id,
-                                        "finish": true,
-                                        "content": &text[..text.len().min(4000)],
-                                    },
-                                },
-                            });
-
-                            match write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
-                                Ok(()) => {
-                                    debug!("WeCom aibot_respond_msg sent");
-                                    let _ = reply_tx.send(Ok("ok".to_string()));
-                                }
-                                Err(e) => {
-                                    let _ = reply_tx.send(Err(format!("WebSocket respond error: {e}")));
-                                }
-                            }
-                        }
-                        None => break, // Channel closed
-                    }
-                }
-                // Application-level heartbeat
-                _ = heartbeat_interval.tick() => {
-                    let ping_id = format!("ping-{}", uuid::Uuid::new_v4().simple());
-                    let frame = serde_json::json!({
-                        "cmd": "ping",
-                        "headers": {"req_id": &ping_id},
-                        "body": {},
-                    });
-                    if let Err(e) = write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
-                        warn!("WeCom heartbeat failed: {e}");
-                    }
-                }
-            }
-        }
-
-        info!("WeCom send loop stopped");
-    }
-
-    /// Event handler loop: routes inbound events to the agent.
-    async fn event_loop(
-        event_rx: &mut mpsc::Receiver<WeComMessageEvent>,
-        handler: Arc<tokio::sync::Mutex<Option<Arc<dyn crate::runner::MessageHandler>>>>,
-        ws_state: Arc<WsState>,
-        running: Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        while running.load(Ordering::SeqCst) {
-            if let Some(event) = event_rx.recv().await {
-                if event.content.is_empty() {
-                    continue;
-                }
-
-                info!(
-                    "WeCom message from {} via {}: {}",
-                    event.sender_id,
-                    event.chat_id,
-                    event.content.chars().take(50).collect::<String>(),
-                );
-
-                let handler_guard = handler.lock().await;
-                if let Some(handler) = handler_guard.as_ref() {
-                    match handler
-                        .handle_message(
-                            crate::config::Platform::Wecom,
-                            &event.chat_id,
-                            &event.content,
-                        )
-                        .await
-                    {
-                        Ok(response) => {
-                            if !response.is_empty() {
-                                // Try to reply via WebSocket respond_msg if we have the req_id
-                                if !event.req_id.is_empty() {
-                                    let (reply_tx, reply_rx) = oneshot::channel();
-                                    let _ = ws_state
-                                        .cmd_tx
-                                        .send(WsCommand::RespondText {
-                                            req_id: event.req_id.clone(),
-                                            text: response.clone(),
-                                            reply_tx,
-                                        })
-                                        .await;
-
-                                    if let Ok(result) = reply_rx.await {
-                                        if result.is_err() {
-                                            // Fallback: proactive send
-                                            let (reply_tx2, _) = oneshot::channel();
-                                            let _ = ws_state
-                                                .cmd_tx
-                                                .send(WsCommand::SendText {
-                                                    chat_id: event.chat_id.clone(),
-                                                    text: response,
-                                                    reply_tx: reply_tx2,
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                } else {
-                                    // No req_id, use proactive send
-                                    let (reply_tx, _) = oneshot::channel();
-                                    let _ = ws_state
-                                        .cmd_tx
-                                        .send(WsCommand::SendText {
-                                            chat_id: event.chat_id.clone(),
-                                            text: response,
-                                            reply_tx,
-                                        })
-                                        .await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Agent handler failed for WeCom message: {e}");
-                            let (reply_tx, _) = oneshot::channel();
-                            let _ = ws_state
-                                .cmd_tx
-                                .send(WsCommand::SendText {
-                                    chat_id: event.chat_id.clone(),
-                                    text: "Sorry, I encountered an error processing your message."
-                                        .to_string(),
-                                    reply_tx,
-                                })
-                                .await;
-                        }
-                    }
-                } else {
-                    warn!("No message handler registered for WeCom messages");
-                }
-            }
-        }
-
-        info!("WeCom event loop stopped");
-    }
 }
 
 #[cfg(test)]
