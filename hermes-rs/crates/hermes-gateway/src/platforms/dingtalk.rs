@@ -754,4 +754,65 @@ mod tests {
         let event = adapter.handle_inbound(&payload).unwrap();
         assert_eq!(event.content, "raw string message");
     }
+
+    #[test]
+    fn test_truncate_text_utf8_safe() {
+        // Emoji is 4 bytes in UTF-8
+        let text = "Hello 😀 World";
+        assert_eq!(truncate_text(text, 3), "Hel");
+        assert_eq!(truncate_text(text, 7), "Hello 😀");
+        assert_eq!(truncate_text(text, 100), text);
+    }
+
+    #[test]
+    fn test_webhook_signature_verification() {
+        let secret = "test_secret_123";
+        let timestamp = "1700000000";
+
+        // Compute valid signature
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(timestamp.as_bytes());
+        let valid_sig = hex::encode(mac.finalize().into_bytes());
+
+        let payload = serde_json::json!({
+            "timestamp": timestamp,
+            "sign": valid_sig,
+        });
+        assert!(verify_webhook_signature(&payload, secret).is_ok());
+
+        // Wrong signature
+        let payload_bad = serde_json::json!({
+            "timestamp": timestamp,
+            "sign": "invalid_signature",
+        });
+        assert!(verify_webhook_signature(&payload_bad, secret).is_err());
+
+        // Missing timestamp
+        let payload_no_ts = serde_json::json!({
+            "sign": valid_sig,
+        });
+        assert!(verify_webhook_signature(&payload_no_ts, secret).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cached_token_expiry() {
+        let config = DingtalkConfig::default();
+        let adapter = DingtalkAdapter::new(config);
+
+        // Token cache is empty initially
+        assert!(adapter.access_token.read().await.is_none());
+        // get_access_token would fail without real credentials, so test the
+        // CachedToken struct directly
+        let token = CachedToken {
+            token: "test_token".to_string(),
+            expires_at: std::time::Instant::now() + Duration::from_secs(3600),
+        };
+        *adapter.access_token.write().await = Some(token);
+
+        // Token should be present and not expired
+        let guard = adapter.access_token.read().await;
+        let cached = guard.as_ref().unwrap();
+        assert_eq!(cached.token, "test_token");
+        assert!(cached.expires_at > std::time::Instant::now());
+    }
 }

@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tracing::{debug, error, info, warn};
 
@@ -131,6 +131,8 @@ pub struct WeComAdapter {
     ws_state: Mutex<Option<Arc<WsState>>>,
     /// Counter for generating unique req_ids.
     seq: AtomicUsize,
+    /// Semaphore to limit concurrent event handler tasks.
+    handler_semaphore: Arc<Semaphore>,
 }
 
 impl WeComAdapter {
@@ -144,6 +146,7 @@ impl WeComAdapter {
             config,
             ws_state: Mutex::new(None),
             seq: AtomicUsize::new(0),
+            handler_semaphore: Arc::new(Semaphore::new(100)),
         }
     }
 
@@ -772,14 +775,27 @@ impl WeComAdapter {
                                 event.content.chars().take(50).collect::<String>(),
                             );
 
+                            // Acquire semaphore permit (limits concurrent handlers to 100)
+                            let permit = self.handler_semaphore.clone()
+                                .try_acquire_owned()
+                                .map_err(|_| "Too many concurrent handlers")
+                                .ok();
+
+                            if permit.is_none() {
+                                warn!("WeCom event rejected: too many concurrent handlers");
+                                continue;
+                            }
+
                             // Clone handler to avoid holding lock across await
                             let handler_clone = handler.clone();
                             let event_req_id = event.req_id.clone();
                             let event_chat_id = event.chat_id.clone();
                             let ws_state_clone = ws_state.clone();
 
-                            // Spawn handler task (bounded by agent engine's own limits)
+                            // Spawn handler task (permit released when task completes)
                             tokio::spawn(async move {
+                                // _permit is dropped here, releasing the semaphore
+                                let _permit = permit;
                                 let handler_guard = handler_clone.lock().await;
                                 if let Some(handler) = handler_guard.as_ref() {
                                     match handler
@@ -837,8 +853,8 @@ impl WeComAdapter {
                         warn!("WeCom heartbeat failed: {e}");
                     }
                 }
-                // Check running flag periodically
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                // Check running flag periodically (200ms for responsive shutdown)
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
                     if !running.load(Ordering::SeqCst) {
                         return Ok(());
                     }

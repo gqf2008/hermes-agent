@@ -133,7 +133,6 @@ ipnet = "2"
 shellexpand = "3"
 sha2 = "0.10"
 hmac = "0.12"
-hex = "0.4"
 dirs = "5"
 
 # Token / JWT
