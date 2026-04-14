@@ -9,11 +9,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 use crate::config::{Platform, PlatformConfig};
+use crate::platforms::api_server::{ApiServerAdapter, ApiServerConfig, ApiServerState};
+use crate::platforms::dingtalk::{DingtalkAdapter, DingtalkConfig};
 use crate::platforms::feishu::{FeishuAdapter, FeishuConfig};
+use crate::platforms::wecom::{WeComAdapter, WeComConfig};
 use crate::platforms::weixin::{WeixinAdapter, WeixinConfig, WeixinMessageEvent};
 
 /// Gateway configuration.
@@ -49,6 +53,11 @@ pub struct GatewayRunner {
     config: GatewayConfig,
     feishu_adapter: Option<Arc<FeishuAdapter>>,
     weixin_adapter: Option<Arc<WeixinAdapter>>,
+    api_server_adapter: Option<Arc<ApiServerAdapter>>,
+    dingtalk_adapter: Option<Arc<DingtalkAdapter>>,
+    wecom_adapter: Option<Arc<WeComAdapter>>,
+    api_server_shutdown_tx: Vec<oneshot::Sender<()>>,
+    dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
 }
@@ -59,6 +68,11 @@ impl GatewayRunner {
             config,
             feishu_adapter: None,
             weixin_adapter: None,
+            api_server_adapter: None,
+            dingtalk_adapter: None,
+            wecom_adapter: None,
+            api_server_shutdown_tx: Vec::new(),
+            dingtalk_shutdown_tx: Vec::new(),
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
         }
@@ -95,6 +109,39 @@ impl GatewayRunner {
                         warn!("Weixin enabled but not configured (missing WEIXIN_SESSION_KEY)");
                     }
                 }
+                Platform::ApiServer => {
+                    let api_config = ApiServerConfig::from_env();
+                    info!(
+                        "Initializing API Server adapter on {}:{}...",
+                        api_config.host, api_config.port
+                    );
+                    self.api_server_adapter = Some(Arc::new(ApiServerAdapter::new(api_config)));
+                }
+                Platform::Dingtalk => {
+                    let dingtalk_config = DingtalkConfig::from_env();
+                    if !dingtalk_config.client_id.is_empty() && !dingtalk_config.client_secret.is_empty() {
+                        info!("Initializing Dingtalk adapter...");
+                        self.dingtalk_adapter =
+                            Some(Arc::new(DingtalkAdapter::new(dingtalk_config)));
+                    } else {
+                        warn!(
+                            "Dingtalk enabled but not configured \
+                             (missing DINGTALK_CLIENT_ID/SECRET)"
+                        );
+                    }
+                }
+                Platform::Wecom => {
+                    let wecom_config = WeComConfig::from_env();
+                    if !wecom_config.bot_id.is_empty() && !wecom_config.secret.is_empty() {
+                        info!("Initializing WeCom adapter...");
+                        self.wecom_adapter = Some(Arc::new(WeComAdapter::new(wecom_config)));
+                    } else {
+                        warn!(
+                            "WeCom enabled but not configured \
+                             (missing WECOM_BOT_ID/SECRET)"
+                        );
+                    }
+                }
                 _ => {
                     warn!("Platform {} not yet implemented in Rust", entry.platform.as_str());
                 }
@@ -103,19 +150,22 @@ impl GatewayRunner {
 
         let feishu_count = self.feishu_adapter.is_some() as usize;
         let weixin_count = self.weixin_adapter.is_some() as usize;
+        let api_server_count = self.api_server_adapter.is_some() as usize;
+        let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
+        let wecom_count = self.wecom_adapter.is_some() as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
-            feishu_count + weixin_count
+            feishu_count + weixin_count + api_server_count + dingtalk_count + wecom_count
         );
     }
 
     /// Start the gateway main loop.
-    pub async fn run(&self) -> Result<(), String> {
+    pub async fn run(&mut self) -> Result<(), String> {
         self.running.store(true, Ordering::SeqCst);
         info!("Gateway starting...");
 
         // Spawn platform-specific polling tasks
-        let mut handles = Vec::new();
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         if let Some(adapter) = &self.weixin_adapter {
             let adapter = adapter.clone();
@@ -132,6 +182,50 @@ impl GatewayRunner {
             info!("Feishu adapter ready (WebSocket/Webhook mode requires separate setup)");
         }
 
+        // API Server: start HTTP server
+        if let Some(adapter) = &self.api_server_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let api_key = adapter.config.api_key.clone();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let state = ApiServerState {
+                    handler,
+                    api_key,
+                };
+                if let Err(e) = adapter.run(state, shutdown_rx).await {
+                    error!("API Server error: {e}");
+                }
+            });
+            self.api_server_shutdown_tx.push(shutdown_tx);
+            handles.push(handle);
+        }
+
+        // WeCom: start WebSocket connection
+        if let Some(adapter) = &self.wecom_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let running = self.running.clone();
+            let handle = tokio::spawn(async move {
+                adapter.run(handler, running).await;
+            });
+            handles.push(handle);
+        }
+
+        // Dingtalk: start webhook HTTP server
+        if let Some(adapter) = &self.dingtalk_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = adapter.run(handler, shutdown_rx).await {
+                    error!("Dingtalk webhook error: {e}");
+                }
+            });
+            self.dingtalk_shutdown_tx.push(shutdown_tx);
+            handles.push(handle);
+        }
+
         // Wait for all platform tasks
         for handle in handles {
             if let Err(e) = handle.await {
@@ -144,7 +238,17 @@ impl GatewayRunner {
     }
 
     /// Stop the gateway gracefully.
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
+        // Trigger API server graceful shutdown
+        let senders = std::mem::take(&mut self.api_server_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
+        // Trigger Dingtalk webhook graceful shutdown
+        let senders = std::mem::take(&mut self.dingtalk_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
         self.running.store(false, Ordering::SeqCst);
         info!("Gateway stop requested");
     }
@@ -160,6 +264,9 @@ impl GatewayRunner {
             running: self.is_running(),
             feishu_configured: self.feishu_adapter.is_some(),
             weixin_configured: self.weixin_adapter.is_some(),
+            api_server_configured: self.api_server_adapter.is_some(),
+            dingtalk_configured: self.dingtalk_adapter.is_some(),
+            wecom_configured: self.wecom_adapter.is_some(),
             platform_count: self.config.platforms.iter().filter(|p| p.enabled).count(),
         }
     }
@@ -171,6 +278,9 @@ pub struct GatewayStatus {
     pub running: bool,
     pub feishu_configured: bool,
     pub weixin_configured: bool,
+    pub api_server_configured: bool,
+    pub dingtalk_configured: bool,
+    pub wecom_configured: bool,
     pub platform_count: usize,
 }
 
@@ -285,6 +395,7 @@ pub fn load_gateway_config() -> GatewayConfig {
                                     "wecom" => Platform::Wecom,
                                     "telegram" => Platform::Telegram,
                                     "discord" => Platform::Discord,
+                                    "api_server" => Platform::ApiServer,
                                     _ => Platform::Local,
                                 };
                                 let cfg = PlatformConfig::default();
@@ -313,6 +424,27 @@ pub fn load_gateway_config() -> GatewayConfig {
         if std::env::var("WEIXIN_SESSION_KEY").is_ok() {
             platforms.push(PlatformConfigEntry {
                 platform: Platform::Weixin,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
+        if std::env::var("API_SERVER_PORT").is_ok() || std::env::var("API_SERVER_KEY").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::ApiServer,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
+        if std::env::var("DINGTALK_CLIENT_ID").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Dingtalk,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
+        if std::env::var("WECOM_BOT_ID").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Wecom,
                 enabled: true,
                 config: PlatformConfig::default(),
             });
@@ -347,5 +479,8 @@ mod tests {
         assert!(!status.running);
         assert!(!status.feishu_configured);
         assert!(!status.weixin_configured);
+        assert!(!status.api_server_configured);
+        assert!(!status.dingtalk_configured);
+        assert!(!status.wecom_configured);
     }
 }

@@ -20,6 +20,17 @@ uuid.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
+futures = "0.3"
+async-stream = "0.3"
+
+# API Server adapter
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# WeCom WebSocket adapter
+tokio-tungstenite = "0.26"
 
 [dev-dependencies]
 tempfile.workspace = true
