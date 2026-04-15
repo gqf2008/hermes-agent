@@ -11,7 +11,7 @@ fn get_store() -> Option<JobStore> {
 }
 
 /// List all cron jobs.
-pub fn cmd_cron_list() -> anyhow::Result<()> {
+pub fn cmd_cron_list(all: bool) -> anyhow::Result<()> {
     let cyan = Style::new().cyan();
     let green = Style::new().green();
     let dim = Style::new().dim();
@@ -30,7 +30,7 @@ pub fn cmd_cron_list() -> anyhow::Result<()> {
         }
     };
 
-    let jobs = store.list(false);
+    let jobs = store.list(!all);
 
     println!();
     println!("{}", cyan.apply_to("◆ Scheduled Jobs"));
@@ -68,6 +68,7 @@ pub fn cmd_cron_create(
     name: &str,
     schedule: &str,
     command: &str,
+    prompt: Option<&str>,
     delivery: &str,
     enabled: bool,
 ) -> anyhow::Result<()> {

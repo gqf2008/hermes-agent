@@ -98,6 +98,12 @@ enum Commands {
         /// Include session database
         #[arg(long)]
         include_sessions: bool,
+        /// Quick snapshot (critical state only)
+        #[arg(short, long)]
+        quick: bool,
+        /// Snapshot label
+        #[arg(short, long)]
+        label: Option<String>,
     },
     /// Restore from a backup
     Restore {
@@ -114,7 +120,7 @@ enum Commands {
     /// Generate and share debug report
     DebugShare {
         /// Number of log lines to include
-        #[arg(short = 'n', long, default_value_t = 100)]
+        #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
         /// Expiration in days
         #[arg(long, default_value_t = 7)]
@@ -127,6 +133,9 @@ enum Commands {
     Dump {
         /// Session ID or prefix
         session_id: Option<String>,
+        /// Show redacted API key prefixes
+        #[arg(long)]
+        show_keys: bool,
     },
     /// Manage tool configurations
     Tools {
@@ -144,7 +153,11 @@ enum Commands {
         action: Option<GatewayAction>,
     },
     /// Diagnose common configuration issues
-    Doctor,
+    Doctor {
+        /// Auto-fix detected issues
+        #[arg(long)]
+        fix: bool,
+    },
     /// List available models
     Models,
     /// Manage profiles
@@ -877,7 +890,11 @@ enum GatewayAction {
 enum CronAction {
     /// List scheduled jobs
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Include disabled jobs
+        #[arg(long)]
+        all: bool,
+    },
     /// Create a new scheduled job
     #[command(alias = "add")]
     Create {
@@ -889,6 +906,9 @@ enum CronAction {
         /// Command or URL to execute
         #[arg(short, long)]
         command: String,
+        /// Task instruction / prompt for the agent
+        #[arg(long)]
+        prompt: Option<String>,
         /// Delivery platform (e.g., telegram, discord, webhook)
         #[arg(long, default_value = "local")]
         delivery: Option<String>,
@@ -1026,8 +1046,8 @@ fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!(e))?;
             }
         }
-        Some(Commands::Backup { output, include_sessions }) => {
-            hermes_cli::backup_cmd::cmd_backup(output.as_deref(), include_sessions)?;
+        Some(Commands::Backup { output, include_sessions, quick, label }) => {
+            hermes_cli::backup_cmd::cmd_backup_extended(output.as_deref(), include_sessions, quick, label.as_deref())?;
         }
         Some(Commands::Restore { path, force }) => {
             hermes_cli::backup_cmd::cmd_restore(&path, force)?;
@@ -1041,13 +1061,13 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::DebugShare { lines, expire_days, local_only }) => {
             hermes_cli::debug_share_cmd::cmd_debug_share(lines, expire_days, local_only)?;
         }
-        Some(Commands::Dump { session_id }) => {
+        Some(Commands::Dump { session_id, show_keys }) => {
             match session_id {
                 Some(sid) => {
-                    hermes_cli::debug_cmd::cmd_dump_session(&sid)?;
+                    hermes_cli::debug_cmd::cmd_dump_session(&sid, show_keys)?;
                 }
                 None => {
-                    hermes_cli::debug_cmd::cmd_dump_all()?;
+                    hermes_cli::debug_cmd::cmd_dump_all(show_keys)?;
                 }
             }
         }
@@ -1173,8 +1193,12 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Commands::Doctor) => {
-            app.run_doctor()?;
+        Some(Commands::Doctor { fix }) => {
+            if fix {
+                app.run_doctor_fix()?;
+            } else {
+                app.run_doctor()?;
+            }
         }
         Some(Commands::Models) => {
             app.list_models()?;
@@ -1294,11 +1318,11 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Cron { action }) => {
             match action {
-                Some(CronAction::List) => {
-                    hermes_cli::cron_cmd::cmd_cron_list()?;
+                Some(CronAction::List { all }) => {
+                    hermes_cli::cron_cmd::cmd_cron_list(all)?;
                 }
-                Some(CronAction::Create { name, schedule, command, delivery, paused }) => {
-                    hermes_cli::cron_cmd::cmd_cron_create(&name, &schedule, &command, &delivery.unwrap_or_else(|| "local".to_string()), !paused)?;
+                Some(CronAction::Create { name, schedule, command, prompt, delivery, paused }) => {
+                    hermes_cli::cron_cmd::cmd_cron_create(&name, &schedule, &command, prompt.as_deref(), &delivery.unwrap_or_else(|| "local".to_string()), !paused)?;
                 }
                 Some(CronAction::Delete { job_id, force }) => {
                     hermes_cli::cron_cmd::cmd_cron_delete(&job_id, force)?;

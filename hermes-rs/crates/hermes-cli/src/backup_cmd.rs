@@ -24,6 +24,11 @@ fn red() -> Style { Style::new().red() }
 
 /// Create a backup of Hermes state.
 pub fn cmd_backup(output: Option<&str>, include_sessions: bool) -> anyhow::Result<()> {
+    cmd_backup_extended(output, include_sessions, false, None)
+}
+
+/// Extended backup with quick mode and custom label.
+pub fn cmd_backup_extended(output: Option<&str>, include_sessions: bool, quick: bool, label: Option<&str>) -> anyhow::Result<()> {
     let home = get_hermes_home();
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!("hermes_backup_{timestamp}");

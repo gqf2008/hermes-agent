@@ -952,6 +952,90 @@ impl HermesApp {
         Ok(())
     }
 
+    /// Run doctor in auto-fix mode — attempt to resolve detected issues.
+    pub fn run_doctor_fix(&self) -> Result<()> {
+        use console::Style;
+
+        let green = Style::new().green();
+        let yellow = Style::new().yellow();
+        let red = Style::new().red();
+        let cyan = Style::new().cyan();
+        let dim = Style::new().dim();
+
+        let hermes_home = hermes_core::hermes_home::get_hermes_home();
+        let mut fixed = 0;
+        let mut failed = Vec::new();
+
+        println!();
+        println!("{}", cyan.apply_to("┌─────────────────────────────────────────────────────────┐"));
+        println!("{}", cyan.apply_to("│              Hermes Doctor — Auto-Fix                  │"));
+        println!("{}", cyan.apply_to("└─────────────────────────────────────────────────────────┘"));
+
+        // Ensure HERMES_HOME exists
+        if !hermes_home.exists() {
+            print!("  {} Creating HERMES_HOME... ", yellow.apply_to("→"));
+            match std::fs::create_dir_all(&hermes_home) {
+                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
+                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create HERMES_HOME".to_string()); }
+            }
+        }
+
+        // Create missing subdirectories
+        let expected_subdirs = ["cron", "sessions", "logs", "skills", "memories"];
+        for subdir_name in &expected_subdirs {
+            let subdir_path = hermes_home.join(subdir_name);
+            if !subdir_path.exists() {
+                print!("  {} Creating {subdir_name}/... ", yellow.apply_to("→"));
+                match std::fs::create_dir_all(&subdir_path) {
+                    Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
+                    Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push(format!("create {subdir_name}/")); }
+                }
+            }
+        }
+
+        // Create default .env if missing
+        let env_path = hermes_home.join(".env");
+        if !env_path.exists() {
+            print!("  {} Creating .env template... ", yellow.apply_to("→"));
+            match std::fs::write(&env_path, "# API keys for Hermes Agent\n# Get yours at openrouter.ai or nousresearch.com\n") {
+                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
+                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create .env".to_string()); }
+            }
+        }
+
+        // Create default config.yaml if missing
+        let config_path = hermes_home.join("config.yaml");
+        if !config_path.exists() {
+            print!("  {} Creating config.yaml... ", yellow.apply_to("→"));
+            match std::fs::write(&config_path, "# Hermes Agent configuration\nmodel:\n  name: anthropic/claude-opus-4.6\n") {
+                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
+                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create config.yaml".to_string()); }
+            }
+        }
+
+        // Create default SOUL.md if missing
+        let soul_path = hermes_home.join("SOUL.md");
+        if !soul_path.exists() {
+            print!("  {} Creating SOUL.md template... ", yellow.apply_to("→"));
+            match std::fs::write(&soul_path, "# SOUL.md — Custom personality for Hermes Agent\n# Edit this file to customize your agent's behavior\n") {
+                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
+                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create SOUL.md".to_string()); }
+            }
+        }
+
+        println!();
+        println!("  {} {} issue(s) auto-fixed", green.apply_to("✓"), fixed);
+        if !failed.is_empty() {
+            println!("  {} {} issue(s) require manual action:", red.apply_to("✗"), failed.len());
+            for f in &failed {
+                println!("    - {f}");
+            }
+        }
+        println!();
+
+        Ok(())
+    }
+
     pub fn list_models(&self) -> Result<()> {
         use console::Style;
 
