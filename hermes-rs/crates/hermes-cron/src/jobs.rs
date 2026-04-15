@@ -11,6 +11,63 @@ use serde::{Deserialize, Serialize};
 
 use hermes_core::{HermesError, Result};
 
+/// Grace window for recovering missed one-shot jobs (seconds).
+const ONESHOT_GRACE_SECONDS: i64 = 120;
+
+/// Minimum grace window for recurring jobs (seconds).
+const MIN_GRACE: i64 = 120;
+
+/// Maximum grace window for recurring jobs (seconds).
+const MAX_GRACE: i64 = 7200; // 2 hours
+
+/// Compute grace seconds for a schedule — half the period, clamped.
+fn compute_grace_seconds(schedule: &Schedule) -> i64 {
+    match schedule {
+        Schedule::Interval { minutes } => {
+            let period = (*minutes as i64) * 60;
+            let grace = period / 2;
+            grace.clamp(MIN_GRACE, MAX_GRACE)
+        }
+        Schedule::Cron { expr } => {
+            // Estimate period from cron expression
+            if let Ok(parsed) = cron::Schedule::from_str(expr) {
+                let now = Utc::now();
+                let mut iter = parsed.after(&now);
+                if let (Some(first), Some(second)) = (iter.next(), iter.next()) {
+                    let period = (second - first).num_seconds();
+                    return (period / 2).clamp(MIN_GRACE, MAX_GRACE);
+                }
+            }
+            MIN_GRACE
+        }
+        Schedule::Once { .. } => ONESHOT_GRACE_SECONDS,
+    }
+}
+
+/// Check if a one-shot job is still recoverable within grace window.
+fn recoverable_oneshot_run_at(
+    schedule: &Schedule,
+    now: DateTime<Utc>,
+    last_run_at: Option<&str>,
+) -> Option<String> {
+    // Only applies to one-shot jobs that haven't run yet
+    if !matches!(schedule, Schedule::Once { .. }) || last_run_at.is_some() {
+        return None;
+    }
+
+    if let Schedule::Once { run_at: Some(run_at) } = schedule {
+        if let Ok(run_at_dt) = DateTime::parse_from_rfc3339(run_at) {
+            let run_at_dt = run_at_dt.with_timezone(&Utc);
+            // Within grace window?
+            if (now - run_at_dt).num_seconds() <= ONESHOT_GRACE_SECONDS {
+                return Some(run_at.clone());
+            }
+        }
+    }
+
+    None
+}
+
 /// A single cron job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
@@ -241,6 +298,9 @@ impl JobStore {
         if let Some(skills) = updates.skills {
             job.skills = skills;
         }
+        if let Some(next_run) = updates.next_run_override {
+            job.next_run_at = Some(next_run);
+        }
 
         self.save()
     }
@@ -335,20 +395,114 @@ impl JobStore {
     /// Get jobs that are due to run now.
     pub fn get_due_jobs(&self) -> Vec<&CronJob> {
         let now = Utc::now();
-        self.jobs
-            .values()
-            .filter(|job| {
-                if !job.enabled || job.state == "paused" || job.state == "completed" {
-                    return false;
+        let mut due = Vec::new();
+
+        for job in self.jobs.values() {
+            if !job.enabled || job.state == "paused" || job.state == "completed" {
+                continue;
+            }
+
+            let Some(next) = &job.next_run_at else {
+                // One-shot with no next_run — check recoverable grace
+                if let Some(recovered) = recoverable_oneshot_run_at(&job.schedule, now, job.last_run_at.as_deref()) {
+                    // Job is still within grace window, treat as due
+                    let mut recovered_job = job.clone();
+                    recovered_job.next_run_at = Some(recovered);
+                    due.push(self.jobs.get(&recovered_job.id).unwrap());
                 }
-                let Some(next) = &job.next_run_at else {
-                    return false;
-                };
-                DateTime::parse_from_rfc3339(next)
-                    .map(|dt| dt.with_timezone(&Utc) <= now)
-                    .unwrap_or(false)
-            })
-            .collect()
+                continue;
+            };
+
+            let Ok(next_dt) = DateTime::parse_from_rfc3339(next) else {
+                continue;
+            };
+            let next_dt = next_dt.with_timezone(&Utc);
+
+            if next_dt <= now {
+                // For recurring jobs, check if past grace window (stale miss)
+                let grace = compute_grace_seconds(&job.schedule);
+                let is_recurring = matches!(job.schedule, Schedule::Interval { .. } | Schedule::Cron { .. });
+                let elapsed = (now - next_dt).num_seconds();
+
+                if is_recurring && elapsed > grace {
+                    // Missed the grace window — fast-forward to next occurrence
+                    // Don't fire this run, just skip it
+                    continue;
+                }
+
+                due.push(job);
+            }
+        }
+
+        due
+    }
+
+    /// Get jobs that are due to run now, and return a list of jobs that
+    /// need to be fast-forwarded (missed grace).
+    pub fn get_due_jobs_with_fast_forward(&mut self) -> (Vec<&CronJob>, Vec<String>) {
+        let now = Utc::now();
+        let mut due = Vec::new();
+        let mut fast_forwarded = Vec::new();
+
+        // Clone job IDs to avoid borrow issues
+        let job_ids: Vec<String> = self.jobs.keys().cloned().collect();
+
+        for id in job_ids {
+            let job = self.jobs.get(&id).unwrap();
+            if !job.enabled || job.state == "paused" || job.state == "completed" {
+                continue;
+            }
+
+            let Some(next) = &job.next_run_at else {
+                // One-shot with no next_run — check recoverable grace
+                if let Some(recovered) = recoverable_oneshot_run_at(&job.schedule, now, job.last_run_at.as_deref()) {
+                    // Update in storage
+                    if let Some(job_mut) = self.jobs.get_mut(&id) {
+                        job_mut.next_run_at = Some(recovered.clone());
+                    }
+                    due.push(id);
+                }
+                continue;
+            };
+
+            let Ok(next_dt) = DateTime::parse_from_rfc3339(next) else {
+                continue;
+            };
+            let next_dt = next_dt.with_timezone(&Utc);
+
+            if next_dt <= now {
+                // For recurring jobs, check if past grace window (stale miss)
+                let grace = compute_grace_seconds(&job.schedule);
+                let is_recurring = matches!(job.schedule, Schedule::Interval { .. } | Schedule::Cron { .. });
+                let elapsed = (now - next_dt).num_seconds();
+
+                if is_recurring && elapsed > grace {
+                    // Fast-forward to next occurrence
+                    if let Some(new_next) = compute_next_run(&job.schedule, Some(now)) {
+                        tracing::info!(
+                            "Job '{}' missed scheduled time ({}, grace={}). Fast-forwarding to {}",
+                            job.name, next, grace, new_next
+                        );
+                        if let Some(job_mut) = self.jobs.get_mut(&id) {
+                            job_mut.next_run_at = Some(new_next);
+                        }
+                        fast_forwarded.push(id.clone());
+                    }
+                    continue;
+                }
+
+                due.push(id);
+            }
+        }
+
+        // Save if any fast-forward happened
+        if !fast_forwarded.is_empty() {
+            let _ = self.save();
+        }
+
+        // Convert IDs back to references
+        let due_refs = due.iter().filter_map(|id| self.jobs.get(id)).collect();
+        (due_refs, fast_forwarded)
     }
 }
 
@@ -361,6 +515,8 @@ pub struct JobUpdates {
     pub deliver: Option<String>,
     pub enabled: Option<bool>,
     pub skills: Option<Vec<String>>,
+    /// Override next_run_at directly (used by trigger_job).
+    pub next_run_override: Option<String>,
 }
 
 /// Load jobs from a JSON file.
@@ -476,11 +632,47 @@ pub fn parse_schedule(s: &str) -> Option<Schedule> {
 }
 
 /// Parse a duration string: "30m", "2h", "1d" → minutes.
+/// Supports aliases: min/minute/minutes, hr/hrs/hour/hours, day/days.
 fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
     if s.is_empty() {
         return None;
     }
 
+    // Single-char suffix (fast path)
+    if let Some(minutes) = parse_duration_suffix(s) {
+        return Some(minutes);
+    }
+
+    // Multi-char aliases
+    let lower = s.to_lowercase();
+    if let Some(num_str) = lower.strip_suffix("min")
+        .or_else(|| lower.strip_suffix("minute"))
+        .or_else(|| lower.strip_suffix("minutes"))
+    {
+        return num_str.parse::<u64>().ok();
+    }
+    if let Some(num_str) = lower.strip_suffix("hr")
+        .or_else(|| lower.strip_suffix("hrs"))
+        .or_else(|| lower.strip_suffix("hour"))
+        .or_else(|| lower.strip_suffix("hours"))
+    {
+        return num_str.parse::<u64>().ok().map(|n| n * 60);
+    }
+    if let Some(num_str) = lower.strip_suffix("day")
+        .or_else(|| lower.strip_suffix("days"))
+    {
+        return num_str.parse::<u64>().ok().map(|n| n * 24 * 60);
+    }
+
+    None
+}
+
+/// Parse duration with single-char suffix: "30m", "2h", "1d" → minutes.
+fn parse_duration_suffix(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
     let last_char = s.chars().last()?;
     let num_str = &s[..s.len() - 1];
     let num: u64 = num_str.parse().ok()?;
@@ -768,5 +960,78 @@ mod tests {
 
         std::env::remove_var("HERMES_CRON_TEST_DIR");
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_compute_grace_seconds_interval() {
+        // 30min interval → grace = 15min = 900s
+        let schedule = Schedule::Interval { minutes: 30 };
+        let grace = compute_grace_seconds(&schedule);
+        assert_eq!(grace, 900);
+
+        // 5min interval → grace = 2.5min = 150s (above MIN_GRACE=120)
+        let schedule = Schedule::Interval { minutes: 5 };
+        let grace = compute_grace_seconds(&schedule);
+        assert_eq!(grace, 150);
+
+        // 1min interval → grace = 30s → clamped to MIN_GRACE=120
+        let schedule = Schedule::Interval { minutes: 1 };
+        let grace = compute_grace_seconds(&schedule);
+        assert_eq!(grace, 120);
+
+        // Daily interval → grace = 12h = 43200s → clamped to MAX_GRACE=7200
+        let schedule = Schedule::Interval { minutes: 1440 };
+        let grace = compute_grace_seconds(&schedule);
+        assert_eq!(grace, 7200);
+    }
+
+    #[test]
+    fn test_recoverable_oneshot_run_at() {
+        let now = Utc::now();
+
+        // One-shot within grace window → recoverable
+        let schedule = Schedule::Once {
+            run_at: Some((now - chrono::Duration::seconds(60)).to_rfc3339()),
+        };
+        let result = recoverable_oneshot_run_at(&schedule, now, None);
+        assert!(result.is_some());
+
+        // One-shot past grace window → not recoverable
+        let schedule = Schedule::Once {
+            run_at: Some((now - chrono::Duration::seconds(300)).to_rfc3339()),
+        };
+        let result = recoverable_oneshot_run_at(&schedule, now, None);
+        assert!(result.is_none());
+
+        // One-shot already run → not recoverable
+        let schedule = Schedule::Once {
+            run_at: Some((now - chrono::Duration::seconds(60)).to_rfc3339()),
+        };
+        let result = recoverable_oneshot_run_at(&schedule, now, Some("2026-01-01T00:00:00Z"));
+        assert!(result.is_none());
+
+        // Non-one-shot → not recoverable
+        let schedule = Schedule::Interval { minutes: 30 };
+        let result = recoverable_oneshot_run_at(&schedule, now, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_duration_aliases() {
+        // Single-char
+        assert_eq!(parse_duration("30m"), Some(30));
+        assert_eq!(parse_duration("2h"), Some(120));
+        assert_eq!(parse_duration("1d"), Some(1440));
+        // Multi-char aliases
+        assert_eq!(parse_duration("30min"), Some(30));
+        assert_eq!(parse_duration("1minute"), Some(1));
+        assert_eq!(parse_duration("5minutes"), Some(5));
+        assert_eq!(parse_duration("2hr"), Some(120));
+        assert_eq!(parse_duration("1hour"), Some(60));
+        assert_eq!(parse_duration("3hours"), Some(180));
+        assert_eq!(parse_duration("1day"), Some(1440));
+        assert_eq!(parse_duration("2days"), Some(2880));
+        // Invalid
+        assert_eq!(parse_duration("invalid"), None);
     }
 }

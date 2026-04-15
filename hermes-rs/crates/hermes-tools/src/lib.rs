@@ -47,6 +47,7 @@ pub mod session_search;
 pub mod homeassistant;
 pub mod send_message;
 pub mod checkpoint;
+pub mod shell_file_ops;
 pub mod credentials;
 pub mod rl_training;
 pub mod skills_guard;

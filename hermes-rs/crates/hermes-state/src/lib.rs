@@ -9,4 +9,4 @@ pub mod schema;
 pub mod session_db;
 
 pub use insights::InsightsEngine;
-pub use session_db::{SessionDB, StateError};
+pub use session_db::{now_epoch, SessionDB, StateError};

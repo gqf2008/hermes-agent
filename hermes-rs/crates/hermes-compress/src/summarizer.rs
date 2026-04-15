@@ -33,11 +33,18 @@ Questions that were answered during this turn.
 ## Pending User Asks
 Requests from the user that have not yet been addressed.";
 
+/// Summary failure cooldown in seconds.
+const SUMMARY_FAILURE_COOLDOWN_SECS: u64 = 600;
+
 /// Summarizer that generates summaries of compressed trajectory regions.
 pub struct Summarizer {
     model: String,
     temperature: f64,
     max_retries: usize,
+    /// Previous summary for iterative updates.
+    previous_summary: Option<String>,
+    /// Cooldown until which to skip summary attempts.
+    summary_failure_cooldown_until: Option<std::time::Instant>,
 }
 
 impl Summarizer {
@@ -47,6 +54,8 @@ impl Summarizer {
             model: "openai/gpt-4o-mini".to_string(),
             temperature: 0.3,
             max_retries: 3,
+            previous_summary: None,
+            summary_failure_cooldown_until: None,
         }
     }
 
@@ -56,6 +65,8 @@ impl Summarizer {
             model: model.to_string(),
             temperature: 0.3,
             max_retries: 3,
+            previous_summary: None,
+            summary_failure_cooldown_until: None,
         }
     }
 
@@ -103,12 +114,34 @@ impl Summarizer {
     /// Generate a summary of the compressed turns using the LLM client.
     ///
     /// Falls back to a default summary on failure.
+    /// Supports iterative updates when a previous summary exists.
     pub async fn generate_summary(
-        &self,
+        &mut self,
         content: &str,
         metrics: &mut TrajectoryMetrics,
     ) -> String {
-        let prompt = Self::build_prompt(content, 750); // Default summary target
+        // Check failure cooldown (mirrors Python: 600s cooldown)
+        if let Some(cooldown_until) = self.summary_failure_cooldown_until {
+            if std::time::Instant::now() < cooldown_until {
+                tracing::debug!("Summary generation skipped: still in failure cooldown");
+                return Self::fallback_summary(metrics);
+            }
+            // Cooldown expired — clear it
+            self.summary_failure_cooldown_until = None;
+        }
+
+        // Compute dynamic summary budget: max(2000, min(content_tokens * 0.20, 12000))
+        let content_tokens = content.len() / 4; // rough estimate
+        let summary_budget = (content_tokens as f64 * 0.20) as usize;
+        let summary_budget = summary_budget.max(2000).min(12_000);
+
+        let prompt = if let Some(ref previous) = self.previous_summary {
+            // Iterative update path
+            Self::build_iterative_prompt(previous, content, summary_budget)
+        } else {
+            // First compaction
+            Self::build_prompt(content, summary_budget)
+        };
 
         for attempt in 0..self.max_retries {
             metrics.summarization_api_calls += 1;
@@ -119,6 +152,10 @@ impl Summarizer {
                 Ok(response) => {
                     if let Some(content_str) = response.content {
                         let summary = Self::coerce_summary_content(&content_str);
+                        // Store for iterative updates
+                        self.previous_summary = Some(summary.clone());
+                        // Reset cooldown on success
+                        self.summary_failure_cooldown_until = None;
                         return Self::ensure_summary_prefix(&summary);
                     }
                 }
@@ -137,8 +174,35 @@ impl Summarizer {
             }
         }
 
-        // Fallback: create a basic summary
-        "[CONTEXT SUMMARY]: [Summary generation failed - previous turns contained tool calls and responses that have been compressed to save context space.]".to_string()
+        // Fallback: set cooldown and return default summary
+        self.summary_failure_cooldown_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(SUMMARY_FAILURE_COOLDOWN_SECS));
+        Self::fallback_summary(metrics)
+    }
+
+    /// Build an iterative update prompt that includes the previous summary.
+    fn build_iterative_prompt(previous: &str, content: &str, budget: usize) -> String {
+        format!(
+            "{SUMMARY_PREAMBLE}\n\n\
+You are updating a context compaction summary. A previous compaction \
+produced the summary below. New conversation turns have occurred since then \
+and need to be incorporated.\n\n\
+PREVIOUS SUMMARY:\n{previous}\n\n\
+NEW TURNS TO INCORPORATE:\n{content}\n\n\
+Update the summary using this exact structure. PRESERVE all existing \
+information that is still relevant. ADD new progress.\n\n\
+{SUMMARY_TEMPLATE}\n\n\
+Keep the summary factual and informative. Target approximately {budget} tokens.\n\n\
+Write only the summary, starting with \"{SUMMARY_PREFIX}\" prefix."
+        )
+    }
+
+    /// Fallback summary when LLM calls fail.
+    fn fallback_summary(_metrics: &TrajectoryMetrics) -> String {
+        format!(
+            "{SUMMARY_PREFIX} [Summary generation failed — previous turns contained \
+            tool calls and responses that have been compressed to save context space.]"
+        )
     }
 
     /// Call the LLM with retry logic.
@@ -151,7 +215,7 @@ impl Summarizer {
             })],
             tools: None,
             temperature: Some(self.temperature),
-            max_tokens: Some(1500), // ~2x summary_target_tokens
+            max_tokens: Some(24_000), // generous ceiling for summary output
             base_url: None,
             api_key: None,
             timeout_secs: Some(60),

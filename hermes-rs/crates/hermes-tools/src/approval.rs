@@ -117,6 +117,17 @@ static SESSION_ALLOWLIST: std::sync::LazyLock<
     parking_lot::Mutex<HashSet<String>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
 
+/// Permanent allowlist (persists across sessions, stored on disk).
+static PERMANENT_ALLOWLIST: std::sync::LazyLock<
+    parking_lot::Mutex<HashSet<String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
+
+/// Session-scoped yolo mode tracking.
+/// Mirrors Python: contextvars-based session yolo.
+static SESSION_YOLO: std::sync::LazyLock<
+    parking_lot::Mutex<HashSet<String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashSet::new()));
+
 // ---------------------------------------------------------------------------
 // Detection logic
 // ---------------------------------------------------------------------------
@@ -149,11 +160,120 @@ pub fn clear_allowlist() {
     SESSION_ALLOWLIST.lock().clear();
 }
 
+// ---------------------------------------------------------------------------
+// Session-scoped yolo mode
+// ---------------------------------------------------------------------------
+
+/// Enable yolo mode for a specific session.
+pub fn enable_session_yolo(session_id: &str) {
+    SESSION_YOLO.lock().insert(session_id.to_string());
+    tracing::debug!("YOLO mode enabled for session {session_id}");
+}
+
+/// Disable yolo mode for a specific session.
+pub fn disable_session_yolo(session_id: &str) {
+    SESSION_YOLO.lock().remove(session_id);
+    tracing::debug!("YOLO mode disabled for session {session_id}");
+}
+
+/// Check if yolo mode is enabled for a session.
+pub fn is_session_yolo_enabled(session_id: &str) -> bool {
+    SESSION_YOLO.lock().contains(session_id)
+}
+
+// ---------------------------------------------------------------------------
+// Permanent allowlist
+// ---------------------------------------------------------------------------
+
+/// Add a command to the permanent allowlist.
+pub fn permanent_allowlist_command(cmd: &str) {
+    PERMANENT_ALLOWLIST.lock().insert(cmd.to_string());
+    save_permanent_allowlist();
+}
+
+/// Remove a command from the permanent allowlist.
+pub fn permanent_unallowlist_command(cmd: &str) {
+    PERMANENT_ALLOWLIST.lock().remove(cmd);
+    save_permanent_allowlist();
+}
+
+/// Check if a command is in the permanent allowlist.
+pub fn is_command_permanently_allowlisted(cmd: &str) -> bool {
+    PERMANENT_ALLOWLIST.lock().contains(cmd)
+}
+
+/// List all permanently allowlisted commands.
+pub fn list_permanent_allowlist() -> Vec<String> {
+    PERMANENT_ALLOWLIST.lock().iter().cloned().collect()
+}
+
+/// Clear the permanent allowlist.
+pub fn clear_permanent_allowlist() {
+    PERMANENT_ALLOWLIST.lock().clear();
+    save_permanent_allowlist();
+}
+
+/// Save permanent allowlist to disk (atomic write: temp file + rename).
+fn save_permanent_allowlist() {
+    let path = hermes_core::get_hermes_home();
+    let allowlist_path = path.join(".approval_allowlist.json");
+    let list: Vec<String> = PERMANENT_ALLOWLIST.lock().iter().cloned().collect();
+    if let Ok(json) = serde_json::to_string_pretty(&list) {
+        // Write to temp file first, then atomically rename
+        let tmp_path = path.join(".approval_allowlist.json.tmp");
+        if std::fs::write(&tmp_path, json).is_ok() {
+            // On Windows, rename over existing file fails, so remove first
+            if allowlist_path.exists() {
+                let _ = std::fs::remove_file(&allowlist_path);
+            }
+            let _ = std::fs::rename(&tmp_path, &allowlist_path);
+        }
+    }
+}
+
+/// Load permanent allowlist from disk.
+pub fn load_permanent_allowlist() {
+    let path = hermes_core::get_hermes_home();
+    let allowlist_path = path.join(".approval_allowlist.json");
+    if let Ok(content) = std::fs::read_to_string(&allowlist_path) {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&content) {
+            let mut store = PERMANENT_ALLOWLIST.lock();
+            store.clear();
+            for cmd in list {
+                store.insert(cmd);
+            }
+        }
+    }
+}
+
 /// Evaluate a command against the current approval mode.
+///
+/// Also checks session-scoped yolo mode and permanent allowlist.
 pub fn evaluate_command(
     cmd: &str,
     mode: ApprovalMode,
+    session_id: Option<&str>,
 ) -> CommandEvaluation {
+    // Session-scoped yolo mode overrides everything
+    if let Some(sid) = session_id {
+        if is_session_yolo_enabled(sid) {
+            return CommandEvaluation {
+                approved: true,
+                reason: Some("Session yolo mode — all commands auto-approved".to_string()),
+                dangerous: false,
+            };
+        }
+    }
+
+    // Permanent allowlist
+    if is_command_permanently_allowlisted(cmd) {
+        return CommandEvaluation {
+            approved: true,
+            reason: Some("Command is in permanent allowlist".to_string()),
+            dangerous: false,
+        };
+    }
+
     match mode {
         ApprovalMode::Off => CommandEvaluation {
             approved: true,
@@ -230,7 +350,8 @@ pub fn handle_approval(args: Value) -> Result<String, hermes_core::HermesError> 
                 .unwrap_or("smart");
 
             let mode = ApprovalMode::parse(mode_str).unwrap_or(ApprovalMode::Smart);
-            let eval = evaluate_command(cmd, mode);
+            let session_id = args.get("session_id").and_then(Value::as_str);
+            let eval = evaluate_command(cmd, mode, session_id);
 
             Ok(serde_json::json!({
                 "action": "check",
@@ -297,8 +418,49 @@ pub fn handle_approval(args: Value) -> Result<String, hermes_core::HermesError> 
             })
             .to_string())
         }
+        "session_yolo" => {
+            let session_id = args.get("session_id").and_then(Value::as_str)
+                .ok_or_else(|| hermes_core::HermesError::new(
+                    hermes_core::errors::ErrorCategory::ToolError,
+                    "session_yolo action requires 'session_id' parameter",
+                ))?;
+            let enable = args.get("enable").and_then(Value::as_bool).unwrap_or(true);
+            if enable {
+                enable_session_yolo(session_id);
+            } else {
+                disable_session_yolo(session_id);
+            }
+            Ok(serde_json::json!({
+                "action": "session_yolo",
+                "session_id": session_id,
+                "enabled": enable,
+            })
+            .to_string())
+        }
+        "permanent_allowlist" => {
+            let cmd = args.get("command").and_then(Value::as_str)
+                .ok_or_else(|| hermes_core::HermesError::new(
+                    hermes_core::errors::ErrorCategory::ToolError,
+                    "permanent_allowlist action requires 'command' parameter",
+                ))?;
+            permanent_allowlist_command(cmd);
+            Ok(serde_json::json!({
+                "action": "permanent_allowlist",
+                "command": cmd,
+                "status": "added",
+            })
+            .to_string())
+        }
+        "list_permanent_allowlist" => {
+            let list = list_permanent_allowlist();
+            Ok(serde_json::json!({
+                "action": "list_permanent_allowlist",
+                "commands": list,
+            })
+            .to_string())
+        }
         _ => Ok(tool_error(format!(
-            "Unknown action: {}. Use check, detect, allowlist, or clear_allowlist.",
+            "Unknown action: {}. Use check, detect, allowlist, clear_allowlist, session_yolo, permanent_allowlist, or list_permanent_allowlist.",
             action
         ))),
     }
@@ -308,13 +470,15 @@ pub fn handle_approval(args: Value) -> Result<String, hermes_core::HermesError> 
 pub fn register_approval_tool(registry: &mut ToolRegistry) {
     let schema = serde_json::json!({
         "name": "check_dangerous_command",
-        "description": "Check if a command is dangerous before execution. Supports three approval modes: manual (all commands require approval), smart (auto-approve safe commands, flag dangerous ones), off (no checks, YOLO mode). Detects 40+ dangerous patterns including recursive deletes, fork bombs, pipe-to-shell, git destructive ops, reverse shells, and privilege escalation.",
+        "description": "Check if a command is dangerous before execution. Supports three approval modes: manual (all commands require approval), smart (auto-approve safe commands, flag dangerous ones), off (no checks, YOLO mode). Detects 40+ dangerous patterns including recursive deletes, fork bombs, pipe-to-shell, git destructive ops, reverse shells, and privilege escalation. Also supports session-scoped yolo mode and permanent allowlists.",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["check", "detect", "allowlist", "clear_allowlist"], "description": "Action: check (evaluate with mode), detect (just check danger), allowlist (approve command), clear_allowlist", "default": "check" },
+                "action": { "type": "string", "enum": ["check", "detect", "allowlist", "clear_allowlist", "session_yolo", "permanent_allowlist", "list_permanent_allowlist"], "description": "Action to perform", "default": "check" },
                 "command": { "type": "string", "description": "The command to check for dangerous patterns" },
-                "mode": { "type": "string", "enum": ["manual", "smart", "off"], "description": "Approval mode for check action", "default": "smart" }
+                "mode": { "type": "string", "enum": ["manual", "smart", "off"], "description": "Approval mode for check action", "default": "smart" },
+                "session_id": { "type": "string", "description": "Session ID for session_yolo action or check action" },
+                "enable": { "type": "boolean", "description": "Whether to enable or disable yolo mode for session_yolo action", "default": true }
             },
             "required": []
         }
@@ -422,26 +586,26 @@ mod tests {
 
     #[test]
     fn test_approval_mode_off() {
-        let eval = evaluate_command("rm -rf /", ApprovalMode::Off);
+        let eval = evaluate_command("rm -rf /", ApprovalMode::Off, None);
         assert!(eval.approved);
     }
 
     #[test]
     fn test_approval_mode_manual() {
-        let eval = evaluate_command("ls -la", ApprovalMode::Manual);
+        let eval = evaluate_command("ls -la", ApprovalMode::Manual, None);
         assert!(!eval.approved);
     }
 
     #[test]
     fn test_approval_mode_smart_dangerous() {
-        let eval = evaluate_command("rm -rf /", ApprovalMode::Smart);
+        let eval = evaluate_command("rm -rf /", ApprovalMode::Smart, None);
         assert!(!eval.approved);
         assert!(eval.dangerous);
     }
 
     #[test]
     fn test_approval_mode_smart_safe() {
-        let eval = evaluate_command("ls -la", ApprovalMode::Smart);
+        let eval = evaluate_command("ls -la", ApprovalMode::Smart, None);
         assert!(eval.approved);
         assert!(!eval.dangerous);
     }
@@ -449,7 +613,7 @@ mod tests {
     #[test]
     fn test_allowlist_flow() {
         clear_allowlist();
-        let eval1 = evaluate_command("dangerous_cmd", ApprovalMode::Smart);
+        let eval1 = evaluate_command("dangerous_cmd", ApprovalMode::Smart, None);
         // If it's not in danger patterns, it's auto-approved in smart mode
         assert!(eval1.approved);
     }
@@ -487,5 +651,82 @@ mod tests {
         }));
         assert!(result.is_ok());
         assert!(is_command_allowlisted("my_cmd"));
+    }
+
+    #[test]
+    fn test_session_yolo_overrides_dangerous() {
+        let session_id = "yolo_test_session";
+        enable_session_yolo(session_id);
+        let eval = evaluate_command("rm -rf /", ApprovalMode::Smart, Some(session_id));
+        assert!(eval.approved, "yolo mode should approve dangerous commands");
+        disable_session_yolo(session_id);
+    }
+
+    #[test]
+    fn test_session_yolo_disabled() {
+        let session_id = "no_yolo_session";
+        let eval = evaluate_command("rm -rf /", ApprovalMode::Smart, Some(session_id));
+        assert!(!eval.approved, "without yolo, dangerous commands should be flagged");
+    }
+
+    #[serial_test::serial(permanent_allowlist)]
+    #[test]
+    fn test_permanent_allowlist() {
+        let cmd = "permanent_test_cmd";
+        clear_permanent_allowlist();
+        permanent_allowlist_command(cmd);
+        assert!(is_command_permanently_allowlisted(cmd));
+
+        let eval = evaluate_command(cmd, ApprovalMode::Smart, None);
+        assert!(eval.approved, "permanent allowlisted commands should be auto-approved");
+
+        permanent_unallowlist_command(cmd);
+        assert!(!is_command_permanently_allowlisted(cmd));
+    }
+
+    #[test]
+    fn test_handler_session_yolo() {
+        let session_id = "handler_yolo_test";
+        let result = handle_approval(serde_json::json!({
+            "action": "session_yolo",
+            "session_id": session_id,
+            "enable": true
+        }));
+        assert!(result.is_ok());
+        assert!(is_session_yolo_enabled(session_id));
+
+        // Disable it
+        let result = handle_approval(serde_json::json!({
+            "action": "session_yolo",
+            "session_id": session_id,
+            "enable": false
+        }));
+        assert!(result.is_ok());
+        assert!(!is_session_yolo_enabled(session_id));
+    }
+
+    #[serial_test::serial(permanent_allowlist)]
+    #[test]
+    fn test_handler_permanent_allowlist() {
+        clear_permanent_allowlist();
+        let result = handle_approval(serde_json::json!({
+            "action": "permanent_allowlist",
+            "command": "perm_handler_cmd"
+        }));
+        assert!(result.is_ok());
+        assert!(is_command_permanently_allowlisted("perm_handler_cmd"));
+    }
+
+    #[serial_test::serial(permanent_allowlist)]
+    #[test]
+    fn test_handler_list_permanent_allowlist() {
+        clear_permanent_allowlist();
+        permanent_allowlist_command("list_test_cmd");
+        let result = handle_approval(serde_json::json!({
+            "action": "list_permanent_allowlist"
+        }));
+        assert!(result.is_ok());
+        let json: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert!(json["commands"].as_array().is_some());
     }
 }

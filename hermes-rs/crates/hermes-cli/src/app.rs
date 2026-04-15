@@ -330,6 +330,72 @@ impl HermesApp {
         Ok(())
     }
 
+    pub fn list_tools_for_platform(&self, platform: &str) -> Result<()> {
+        use console::Style;
+        let dim = Style::new().dim();
+
+        let mut registry = ToolRegistry::new();
+        register_all_tools(&mut registry);
+
+        println!("Tools for platform: {}", platform);
+        println!();
+
+        let tools = registry.list_tools();
+        let mut enabled_count = 0;
+        let mut disabled_count = 0;
+
+        // Get disabled tools from config
+        let home = if let Ok(h) = std::env::var("HERMES_HOME") {
+            std::path::PathBuf::from(h)
+        } else if let Some(dir) = dirs::home_dir() {
+            dir.join(".hermes")
+        } else {
+            std::path::PathBuf::from(".hermes")
+        };
+        let config_path = home.join("config.yaml");
+        let disabled_tools: std::collections::HashSet<String> = if config_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                if let Ok(config) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                    config.get("tools")
+                        .and_then(|t| t.get(platform))
+                        .and_then(|p| p.as_sequence())
+                        .map(|seq| seq.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| {
+                                if s.starts_with('!') { s[1..].to_string() }
+                                else if s.starts_with("mcp:") { s.to_string() }
+                                else { s.to_string() }
+                            })
+                            .collect())
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                }
+            } else {
+                Default::default()
+            }
+        } else {
+            Default::default()
+        };
+
+        for tool_name in &tools {
+            let is_disabled = disabled_tools.contains(tool_name)
+                || disabled_tools.iter().any(|d| d.starts_with("mcp:"));
+            if is_disabled {
+                println!("  {} {}", dim.apply_to("○"), tool_name);
+                disabled_count += 1;
+            } else {
+                println!("  ✓ {}", tool_name);
+                enabled_count += 1;
+            }
+        }
+
+        println!();
+        println!("  {} enabled, {} disabled", enabled_count, disabled_count);
+
+        Ok(())
+    }
+
     pub fn list_skills(&self) -> Result<()> {
         use console::Style;
         let green = Style::new().green();
@@ -971,6 +1037,200 @@ impl HermesApp {
 
         Ok(())
     }
+}
+
+/// Delete a profile.
+pub fn cmd_profile_delete(name: &str, force: bool) -> anyhow::Result<()> {
+    use console::Style;
+    let yellow = Style::new().yellow();
+    let green = Style::new().green();
+
+    let profiles_dir = get_profiles_dir();
+    let profile_dir = profiles_dir.join(name);
+
+    if !profile_dir.exists() {
+        println!("  {} Profile '{name}' not found.", yellow.apply_to("✗"));
+        return Ok(());
+    }
+
+    if !force {
+        println!("  This will delete profile '{}' and all its data.", name);
+        print!("  Continue? [y/N]: ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
+            println!("  {}", Style::new().dim().apply_to("Delete cancelled."));
+            return Ok(());
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    println!("  {} Profile '{name}' deleted.", green.apply_to("✓"));
+    Ok(())
+}
+
+/// Show profile details.
+pub fn cmd_profile_show(name: &str) -> anyhow::Result<()> {
+    use console::Style;
+    let cyan = Style::new().cyan();
+    let yellow = Style::new().yellow();
+
+    let profiles_dir = get_profiles_dir();
+    let profile_dir = profiles_dir.join(name);
+
+    if !profile_dir.exists() {
+        println!("  {} Profile '{name}' not found.", yellow.apply_to("✗"));
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", cyan.apply_to("◆ Profile: {name}"));
+    println!("  Path: {}", profile_dir.display());
+    println!();
+
+    if profile_dir.join("config.yaml").exists() {
+        println!("  Config: present");
+    }
+    if profile_dir.join(".env").exists() {
+        println!("  Env: present");
+    }
+    println!();
+
+    Ok(())
+}
+
+/// Manage profile wrapper scripts.
+pub fn cmd_profile_alias(name: &str) -> anyhow::Result<()> {
+    use console::Style;
+    let cyan = Style::new().cyan();
+    let dim = Style::new().dim();
+
+    let profiles_dir = get_profiles_dir();
+    let profile_dir = profiles_dir.join(name);
+
+    if !profile_dir.exists() {
+        println!("  {} Profile '{name}' not found.", Style::new().yellow().apply_to("✗"));
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", cyan.apply_to("◆ Profile Alias: {name}"));
+    println!();
+    println!("  {}", dim.apply_to("Create a shell alias to quickly switch to this profile:"));
+    println!();
+    println!("  bash/zsh: alias hermes-{name}='HERMES_HOME={} hermes'", profile_dir.display());
+    println!("  fish:     alias hermes-{name}='env HERMES_HOME={} hermes'", profile_dir.display());
+    println!();
+
+    Ok(())
+}
+
+/// Rename a profile.
+pub fn cmd_profile_rename(old_name: &str, new_name: &str) -> anyhow::Result<()> {
+    use console::Style;
+    let green = Style::new().green();
+    let yellow = Style::new().yellow();
+
+    let profiles_dir = get_profiles_dir();
+    let old_dir = profiles_dir.join(old_name);
+    let new_dir = profiles_dir.join(new_name);
+
+    if !old_dir.exists() {
+        println!("  {} Profile '{old_name}' not found.", yellow.apply_to("✗"));
+        return Ok(());
+    }
+    if new_dir.exists() {
+        println!("  {} Profile '{new_name}' already exists.", yellow.apply_to("✗"));
+        return Ok(());
+    }
+
+    std::fs::rename(&old_dir, &new_dir)?;
+    println!("  {} Profile renamed: {old_name} → {new_name}", green.apply_to("✓"));
+    Ok(())
+}
+
+/// Export a profile to archive.
+pub fn cmd_profile_export(name: &str, output: Option<&str>) -> anyhow::Result<()> {
+    use console::Style;
+    let green = Style::new().green();
+    let yellow = Style::new().yellow();
+
+    let profiles_dir = get_profiles_dir();
+    let profile_dir = profiles_dir.join(name);
+
+    if !profile_dir.exists() {
+        println!("  {} Profile '{name}' not found.", yellow.apply_to("✗"));
+        return Ok(());
+    }
+
+    let default_out = format!("{name}.tar.gz");
+    let out_path = output.unwrap_or(&default_out);
+    println!("  Exporting profile '{name}' to {out_path}...");
+
+    // Use tar on Unix, zip fallback on Windows
+    let result = if cfg!(unix) {
+        std::process::Command::new("tar")
+            .args(["-czf", out_path, "-C", &profiles_dir.to_string_lossy(), name])
+            .output()
+    } else {
+        std::process::Command::new("tar")
+            .args(["-cf", out_path, "-C", &profiles_dir.to_string_lossy(), name])
+            .output()
+    };
+
+    match result {
+        Ok(out) if out.status.success() => {
+            println!("  {} Exported to: {out_path}", green.apply_to("✓"));
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            println!("  {} Export failed: {}", yellow.apply_to("⚠"), err.trim());
+        }
+        Err(e) => {
+            println!("  {} Failed: {e}", yellow.apply_to("⚠"));
+        }
+    }
+    Ok(())
+}
+
+/// Import a profile from archive.
+pub fn cmd_profile_import(path: &str) -> anyhow::Result<()> {
+    use console::Style;
+    let green = Style::new().green();
+    let yellow = Style::new().yellow();
+
+    let archive = std::path::Path::new(path);
+    if !archive.exists() {
+        println!("  {} Archive not found: {path}", yellow.apply_to("✗"));
+        return Ok(());
+    }
+
+    let profiles_dir = get_profiles_dir();
+    std::fs::create_dir_all(&profiles_dir)?;
+
+    let output = std::process::Command::new("tar")
+        .args(["-xf", path, "-C", &profiles_dir.to_string_lossy()])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            println!("  {} Profile imported to: {}", green.apply_to("✓"), profiles_dir.display());
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            println!("  {} Import failed: {}", yellow.apply_to("⚠"), err.trim());
+        }
+        Err(e) => {
+            println!("  {} Failed: {e}", yellow.apply_to("⚠"));
+        }
+    }
+    Ok(())
+}
+
+fn get_profiles_dir() -> std::path::PathBuf {
+    let hermes_home = hermes_core::get_hermes_home();
+    hermes_home.join("profiles")
 }
 
 fn yellow_style() -> console::Style {

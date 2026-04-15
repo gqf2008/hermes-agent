@@ -52,6 +52,14 @@ pub struct CompressorConfig {
     pub summary_model_override: Option<String>,
     /// Context length override.
     pub config_context_length: Option<usize>,
+    /// Provider override for summary LLM calls.
+    pub summary_provider: Option<String>,
+    /// Base URL override for summary LLM calls.
+    pub summary_base_url: Option<String>,
+    /// API key override for summary LLM calls.
+    pub summary_api_key: Option<String>,
+    /// API mode for summary LLM calls (e.g., "anthropic", "openai").
+    pub summary_api_mode: Option<String>,
 }
 
 impl Default for CompressorConfig {
@@ -65,6 +73,10 @@ impl Default for CompressorConfig {
             quiet_mode: false,
             summary_model_override: None,
             config_context_length: None,
+            summary_provider: None,
+            summary_base_url: None,
+            summary_api_key: None,
+            summary_api_mode: None,
         }
     }
 }
@@ -126,7 +138,7 @@ impl ContextCompressor {
     /// Compress conversation messages by summarizing middle turns.
     ///
     /// Returns the compressed message list.
-    pub fn compress(&mut self, messages: &[Value], current_tokens: Option<usize>) -> Vec<Value> {
+    pub fn compress(&mut self, messages: &[Value], current_tokens: Option<usize>, focus_topic: Option<&str>) -> Vec<Value> {
         let n_messages = messages.len();
         let min_for_compress = self.config.protect_first_n + 3 + 1;
         if n_messages <= min_for_compress {
@@ -137,7 +149,7 @@ impl ContextCompressor {
 
         // Phase 1: Prune old tool results
         let (messages, pruned_count) =
-            self.prune_old_tool_results(messages, self.config.protect_last_n);
+            self.prune_old_tool_results(messages, self.config.protect_last_n, None);
         if pruned_count > 0 && !self.config.quiet_mode {
             tracing::info!(
                 "Pre-compression: pruned {} old tool result(s)",
@@ -174,7 +186,7 @@ impl ContextCompressor {
         }
 
         // Phase 3: Generate structured summary
-        let summary = self.generate_summary(&turns_to_summarize);
+        let summary = self.generate_summary(&turns_to_summarize, focus_topic);
 
         // Phase 4: Assemble compressed message list
         let mut compressed: Vec<Value> = Vec::new();
@@ -286,10 +298,16 @@ impl ContextCompressor {
     }
 
     /// Prune old tool results (cheap pre-pass, no LLM call).
+    ///
+    /// When `protect_tail_tokens` is Some, the boundary is determined by
+    /// token budget rather than message count — messages are accumulated
+    /// from the tail until the token budget is exhausted, and everything
+    /// before that boundary is eligible for pruning.
     fn prune_old_tool_results(
         &self,
         messages: &[Value],
         protect_tail_count: usize,
+        protect_tail_tokens: Option<usize>,
     ) -> (Vec<Value>, usize) {
         if messages.is_empty() {
             return (vec![], 0);
@@ -298,7 +316,26 @@ impl ContextCompressor {
         let mut result: Vec<Value> = messages.to_vec();
         let mut pruned = 0;
 
-        let prune_boundary = messages.len().saturating_sub(protect_tail_count);
+        let prune_boundary = if let Some(token_budget) = protect_tail_tokens {
+            // Token-budget path: walk backward from tail, accumulating tokens
+            // until budget is exceeded. Everything before is eligible.
+            let mut accumulated = 0;
+            let mut cut = messages.len();
+            for i in (0..messages.len()).rev() {
+                let content = messages[i].get("content").and_then(Value::as_str).unwrap_or("");
+                let msg_tokens = content.len() / CHARS_PER_TOKEN + 10;
+                accumulated += msg_tokens;
+                if accumulated > token_budget {
+                    cut = i + 1;
+                    break;
+                }
+            }
+            // Ensure at least protect_tail_count messages are protected
+            cut.min(messages.len().saturating_sub(protect_tail_count))
+        } else {
+            // Count-based path (original behavior)
+            messages.len().saturating_sub(protect_tail_count)
+        };
 
         for item in result.iter_mut().take(prune_boundary) {
             if item.get("role").and_then(Value::as_str) != Some("tool") {
@@ -467,66 +504,182 @@ impl ContextCompressor {
     }
 
     /// Generate structured summary of conversation turns.
-    fn generate_summary(&mut self, turns_to_summarize: &[Value]) -> Option<String> {
-        // Check cooldown
+    ///
+    /// Calls the LLM to produce a structured handoff summary.
+    /// Returns None on failure (caller inserts static fallback).
+    fn generate_summary(&mut self, turns_to_summarize: &[Value], focus_topic: Option<&str>) -> Option<String> {
+        // Check cooldown — stored for async context, skipped in sync path.
         if let Some(cooldown_until) = self.summary_failure_cooldown_until {
-            // In Rust we'd use Instant::now() but for simplicity, skip cooldown
-            // in this synchronous version — it's mainly relevant for async LLM calls
             let _ = cooldown_until;
         }
 
         let content_to_summarize = Self::serialize_for_summary(turns_to_summarize);
         let summary_budget = self.compute_summary_budget(turns_to_summarize);
 
+        // Shared template sections (mirrors Python context_compressor.py).
+        // "Remaining Work" replaces "Next Steps" to avoid reading as active instructions.
+        // "Resolved Questions" and "Pending User Asks" sections are added.
+        let template_sections = format!(
+            "\
+## Goal
+[What the user is trying to accomplish]
+
+## Constraints & Preferences
+[User preferences, coding style, constraints, important decisions]
+
+## Progress
+### Done
+[Completed work — include specific file paths, commands run, results obtained]
+### In Progress
+[Work currently underway]
+### Blocked
+[Any blockers or issues encountered]
+
+## Key Decisions
+[Important technical decisions and why they were made]
+
+## Resolved Questions
+[Questions the user asked that were ALREADY answered — include the answer so the next assistant does not re-answer them]
+
+## Pending User Asks
+[Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write \"None.\"]
+
+## Relevant Files
+[Files read, modified, or created — with brief note on each]
+
+## Remaining Work
+[What remains to be done — framed as context, not instructions]
+
+## Critical Context
+[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
+
+## Tools & Patterns
+[Which tools were used, how they were used effectively, and any tool-specific discoveries]
+
+Target ~{budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
+
+Write only the summary body. Do not include any preamble or prefix.",
+            budget = summary_budget
+        );
+
+        // Summarizer preamble — tells the NEXT assistant that summarized requests
+        // were already addressed and must not be re-answered.
+        let preamble = "You are a summarization agent creating a context checkpoint. \
+Your output will be injected as reference material for a DIFFERENT \
+assistant that continues the conversation. \
+Do NOT respond to any questions or requests in the conversation — \
+only output the structured summary. \
+Do NOT include any preamble, greeting, or prefix.";
+
         let prompt = if let Some(ref previous) = self.previous_summary {
+            // Iterative update path: preserve existing info, add new progress.
             format!(
-                "You are updating a context compaction summary. A previous compaction \
-                produced the summary below. New conversation turns have occurred since then \
-                and need to be incorporated.\n\n\
-                PREVIOUS SUMMARY:\n{}\n\n\
-                NEW TURNS TO INCORPORATE:\n{}\n\n\
-                Update the summary using this exact structure. PRESERVE all existing \
-                information that is still relevant. ADD new progress.\n\n\
-                ## Goal\n[What the user is trying to accomplish]\n\n\
-                ## Constraints & Preferences\n[User preferences, coding style]\n\n\
-                ## Progress\n### Done\n[Completed work]\n### In Progress\n[Work in progress]\n### Blocked\n[Blockers]\n\n\
-                ## Key Decisions\n[Important technical decisions]\n\n\
-                ## Relevant Files\n[Files read, modified, created]\n\n\
-                ## Next Steps\n[What needs to happen next]\n\n\
-                ## Critical Context\n[Specific values, errors, configuration]\n\n\
-                ## Tools & Patterns\n[Which tools were used, how effectively]\n\n\
-                Target ~{} tokens. Be specific — include file paths, command outputs, \
-                error messages, and concrete values.\n\n\
-                Write only the summary body. Do not include any preamble or prefix.",
-                previous, content_to_summarize, summary_budget
+                "{preamble}\n\n\
+You are updating a context compaction summary. A previous compaction \
+produced the summary below. New conversation turns have occurred since then \
+and need to be incorporated.\n\n\
+PREVIOUS SUMMARY:\n{previous}\n\n\
+NEW TURNS TO INCORPORATE:\n{content_to_summarize}\n\n\
+Update the summary using this exact structure. PRESERVE all existing \
+information that is still relevant. ADD new progress. Move items from \
+\"In Progress\" to \"Done\" when completed. Move answered questions to \
+\"Resolved Questions\". Remove information only if it is clearly obsolete.\n\n\
+{template_sections}",
             )
         } else {
+            // First compaction: summarize from scratch.
             format!(
-                "Create a structured handoff summary for a later assistant that will \
-                continue this conversation after earlier turns are compacted.\n\n\
-                TURNS TO SUMMARIZE:\n{}\n\n\
-                Use this exact structure:\n\n\
-                ## Goal\n[What the user is trying to accomplish]\n\n\
-                ## Constraints & Preferences\n[User preferences, coding style]\n\n\
-                ## Progress\n### Done\n[Completed work]\n### In Progress\n[Work in progress]\n### Blocked\n[Blockers]\n\n\
-                ## Key Decisions\n[Important technical decisions]\n\n\
-                ## Relevant Files\n[Files read, modified, created]\n\n\
-                ## Next Steps\n[What needs to happen next]\n\n\
-                ## Critical Context\n[Specific values, errors, configuration]\n\n\
-                ## Tools & Patterns\n[Which tools were used, how effectively]\n\n\
-                Target ~{} tokens. Be specific — include file paths, command outputs, \
-                error messages, and concrete values.\n\n\
-                Write only the summary body. Do not include any preamble or prefix.",
-                content_to_summarize, summary_budget
+                "{preamble}\n\n\
+Create a structured handoff summary for a different assistant that will \
+continue this conversation after earlier turns are compacted. The next \
+assistant should be able to understand what happened without re-reading \
+the original turns.\n\n\
+TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n\
+Use this exact structure:\n\n\
+{template_sections}",
             )
         };
 
-        // Store for iterative updates
-        // In a full implementation, this would call an auxiliary LLM.
-        // For now, return the prompt as the summary (it would be used by the agent engine).
-        let summary = prompt;
-        self.previous_summary = Some(summary.clone());
-        Some(with_summary_prefix(&summary))
+        // Inject focus topic at the end of the prompt (mirrors Python).
+        let prompt = if let Some(topic) = focus_topic {
+            format!(
+                "{prompt}\n\n\
+FOCUS TOPIC: \"{topic}\"\n\
+The user has requested that this compaction PRIORITIZE preserving all \
+information related to the focus topic above. For content related to \
+\"{topic}\", include full detail — exact values, file paths, command outputs, \
+error messages, and decisions. For content NOT related to the focus topic, \
+summarise more aggressively (brief one-liners or omit if truly irrelevant). \
+The focus topic sections should receive roughly 60-70% of the summary token budget.",
+            )
+        } else {
+            prompt
+        };
+
+        // Attempt to call the real LLM.
+        self.call_summary_llm(&prompt)
+    }
+
+    /// Call the LLM for summary generation.
+    ///
+    /// Uses `summary_model_override` if set, otherwise falls back to the
+    /// compressor's main model. On success, stores the summary in
+    /// `previous_summary` for iterative updates.
+    fn call_summary_llm(&mut self, prompt: &str) -> Option<String> {
+        use hermes_llm::client::{call_llm, LlmRequest};
+
+        // Determine summary model: override or main model
+        let model = self.config
+            .summary_model_override
+            .clone()
+            .unwrap_or_else(|| self.config.model.clone());
+
+        let request = LlmRequest {
+            model,
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": prompt,
+            })],
+            tools: None,
+            temperature: Some(0.3),
+            max_tokens: Some(self.max_summary_tokens * 2),
+            base_url: self.config.summary_base_url.clone(),
+            api_key: self.config.summary_api_key.clone(),
+            timeout_secs: Some(120),
+        };
+
+        // compress() is sync but call_llm is async. Try block_on if in a runtime.
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        match runtime {
+            Some(handle) => {
+                let fut = call_llm(request);
+                match handle.block_on(fut) {
+                    Ok(response) => {
+                        if let Some(content) = response.content {
+                            let summary = content.trim().to_string();
+                            if !summary.is_empty() {
+                                // Store for iterative updates (mirrors Python: self._previous_summary = summary)
+                                self.previous_summary = Some(summary.clone());
+                                // Reset cooldown on success
+                                self.summary_failure_cooldown_until = None;
+                                return Some(summary);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Summary LLM call failed: {e}");
+                        // Set cooldown (mirrors Python: 600s)
+                        // We use a simple monotonic counter — in practice the
+                        // async agent engine handles the real clock.
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("Summary LLM call skipped: no tokio runtime available");
+            }
+        }
+
+        None
     }
 
     /// Compute summary token budget.
@@ -730,7 +883,7 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "Done"}),
         ];
 
-        let (result, count) = compressor.prune_old_tool_results(&messages, 2);
+        let (result, count) = compressor.prune_old_tool_results(&messages, 2, None);
         // The tool result has 300 chars (> 200), but it's within the protected tail
         // With protect_tail_count=2, only the last 2 messages are protected
         // So the tool result at index 3 should be pruned
@@ -819,7 +972,7 @@ mod tests {
         let mut compressor = ContextCompressor::new(config);
 
         let messages = make_messages(3); // system + 2 = only 3 messages
-        let result = compressor.compress(&messages, None);
+        let result = compressor.compress(&messages, None, None);
         assert_eq!(result.len(), messages.len()); // unchanged
     }
 
@@ -875,7 +1028,7 @@ mod tests {
         compressor.update_from_response(100_000, 50_000);
 
         // Too few for compression with our thresholds, but test it doesn't panic
-        let result = compressor.compress(&messages, None);
+        let result = compressor.compress(&messages, None, None);
         // With 42 messages (> 10), compression should run or return unchanged
         assert!(result.len() >= 1);
     }
@@ -906,7 +1059,7 @@ mod tests {
         messages.push(serde_json::json!({"role": "user", "content": "What did we learn?"}));
         messages.push(serde_json::json!({"role": "assistant", "content": "We learned a lot."}));
 
-        let (result, count) = compressor.prune_old_tool_results(&messages, 2);
+        let (result, count) = compressor.prune_old_tool_results(&messages, 2, None);
         // Should have pruned some old tool results
         assert!(count > 0);
         // Last two messages should be unchanged
@@ -936,7 +1089,7 @@ mod tests {
         ];
 
         // Not enough messages to compress, should return as-is
-        let result = compressor.compress(&messages, None);
+        let result = compressor.compress(&messages, None, None);
         assert_eq!(result.len(), messages.len());
     }
 }

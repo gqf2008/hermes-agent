@@ -611,6 +611,21 @@ impl SessionDB {
         Ok(Some(serde_json::Value::Object(obj)))
     }
 
+    /// Export all sessions (with messages) as a list of dicts.
+    /// Suitable for writing to a JSONL file for backup/analysis.
+    pub fn export_all(&self, source: Option<&str>) -> Result<Vec<serde_json::Value>, StateError> {
+        let sessions = self.search_sessions(source, 100000, 0)?;
+        let mut results = Vec::new();
+        for session in sessions {
+            if let Some(messages) = self.get_messages(&session.id).ok() {
+                let mut obj = serde_json::to_value(&session)?.as_object().cloned().unwrap_or_default();
+                obj.insert("messages".into(), serde_json::to_value(messages)?);
+                results.push(serde_json::Value::Object(obj));
+            }
+        }
+        Ok(results)
+    }
+
     pub fn delete_session(&self, session_id: &str) -> Result<bool, StateError> {
         let sid = session_id.to_string();
         self.with_write(move |conn| {
@@ -619,6 +634,18 @@ impl SessionDB {
             conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id=?1", params![sid])?;
             conn.execute("DELETE FROM messages WHERE session_id=?1", params![sid])?;
             conn.execute("DELETE FROM sessions WHERE id=?1", params![sid])?;
+            Ok(true)
+        })
+    }
+
+    /// Rename a session's title.
+    pub fn rename_session(&self, session_id: &str, new_title: &str) -> Result<bool, StateError> {
+        let sid = session_id.to_string();
+        let title = new_title.to_string();
+        self.with_write(move |conn| {
+            let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)", params![sid], |r| r.get(0))?;
+            if !exists { return Ok(false); }
+            conn.execute("UPDATE sessions SET title=?1 WHERE id=?2", params![title, sid])?;
             Ok(true)
         })
     }
@@ -645,6 +672,38 @@ impl SessionDB {
             } else {
                 Ok(conn.execute(sql, params![cutoff])?)
             }
+        })
+    }
+
+    /// Delete sessions and their messages older than a given number of days.
+    /// Returns the number of sessions deleted.
+    pub fn prune_old_sessions(&self, older_than_days: i64, source: Option<&str>) -> Result<usize, StateError> {
+        let cutoff = now_epoch() - (older_than_days as f64 * 86400.0);
+        self.with_write(move |conn| {
+            // Get session IDs to delete
+            let ids: Vec<String> = if let Some(s) = source {
+                let mut stmt = conn.prepare("SELECT id FROM sessions WHERE started_at<?1 AND source=?2")?;
+                let rows = stmt.query_map(params![cutoff, s], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?;
+                rows
+            } else {
+                let mut stmt = conn.prepare("SELECT id FROM sessions WHERE started_at<?1")?;
+                let rows = stmt.query_map(params![cutoff], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+
+            let count = ids.len();
+            if count == 0 {
+                return Ok(0);
+            }
+
+            // Delete messages and sessions for each old session
+            for id in &ids {
+                conn.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
+                conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id=?1", params![id])?;
+                conn.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
+            }
+
+            Ok(count)
         })
     }
 }
@@ -696,7 +755,8 @@ fn init_schema(conn: &mut Connection) -> Result<(), StateError> {
 
 // ── Helpers ──
 
-fn now_epoch() -> f64 {
+/// Current time as a Unix epoch timestamp (seconds).
+pub fn now_epoch() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64()
 }
 

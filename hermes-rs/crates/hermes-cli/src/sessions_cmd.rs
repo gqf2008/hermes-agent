@@ -198,6 +198,77 @@ pub fn cmd_sessions_stats(db: &SessionDB, source: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+/// Rename a session's title.
+pub fn cmd_sessions_rename(
+    db: &SessionDB,
+    session_id: &str,
+    title: &str,
+) -> anyhow::Result<()> {
+    match db.rename_session(session_id, title)? {
+        true => {
+            println!("  {} Session '{}' renamed to: {}", style("✓").green(), session_id, style(title).cyan());
+        }
+        false => {
+            println!("  {} Session '{}' not found.", style("✗").red(), session_id);
+        }
+    }
+    Ok(())
+}
+
+/// Prune (delete) old sessions.
+pub fn cmd_sessions_prune(
+    db: &SessionDB,
+    older_than_days: i64,
+    source: Option<&str>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let cyan = style("◆").cyan();
+    let green = style("✓").green();
+    let yellow = style("⚠").yellow();
+
+    // Show what would be deleted
+    let cutoff_sessions = db.list_sessions_rich(source, None, 1000, 0, false)?;
+    let cutoff_count = cutoff_sessions.iter()
+        .filter(|sp| {
+            let age_days = (hermes_state::now_epoch() - sp.session.started_at) / 86400.0;
+            age_days >= older_than_days as f64
+        })
+        .count();
+
+    println!();
+    println!("{} Prune Old Sessions", cyan);
+    println!();
+    println!("  Criteria: older than {older_than_days} days");
+    if let Some(s) = source {
+        println!("  Source: {s}");
+    }
+    println!("  Sessions to delete: {cutoff_count}");
+    println!();
+
+    if !force && cutoff_count > 0 {
+        print!("  Delete these sessions? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("  Cancelled.");
+            return Ok(());
+        }
+    }
+
+    if cutoff_count == 0 {
+        println!("  {} No sessions older than {older_than_days} days.", yellow);
+        println!();
+        return Ok(());
+    }
+
+    let deleted = db.prune_old_sessions(older_than_days, source)?;
+    println!("  {} Deleted {deleted} old session(s)", green);
+    println!();
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

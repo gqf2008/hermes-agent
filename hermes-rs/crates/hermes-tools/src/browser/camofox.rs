@@ -277,6 +277,52 @@ impl CamofoxClient {
             }
         }
     }
+
+    /// Drop session — clear in-memory state and close the browser session.
+    /// Mirrors Python: `_drop_session` + API close.
+    pub async fn drop_session(&self, user_id: &str, session_info: &mut CamofoxSession) {
+        // Clear tab tracking
+        session_info.tab_id = None;
+        // Call the API to close
+        let _ = self.close_session(user_id).await;
+        tracing::debug!("Camofox: dropped session for user {user_id}");
+    }
+
+    /// Close browser and drop session. Returns status message.
+    /// Mirrors Python: `camofox_close`.
+    pub async fn camofox_close(&self, session: &mut CamofoxSession) -> String {
+        let user_id = session.user_id.clone();
+        if let Some(ref tab_id) = session.tab_id {
+            // Close tab first
+            let _ = self.close_session(tab_id).await;
+        }
+        self.drop_session(&user_id, session).await;
+        format!("Camofox session closed for user {user_id}")
+    }
+
+    /// Get screenshots as base64 images.
+    /// Mirrors Python: `camofox_get_images`.
+    pub async fn camofox_get_images(&self, tab_id: &str, user_id: &str) -> Result<String, String> {
+        let bytes = self.screenshot(tab_id, user_id).await?;
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        Ok(format!("data:image/png;base64,{encoded}"))
+    }
+
+    /// Print session state for debugging.
+    /// Mirrors Python: `camofox_console`.
+    pub fn camofox_console(&self, session: &CamofoxSession) -> String {
+        format!(
+            "Camofox Session:\n\
+             \tUser ID:    {}\n\
+             \tTab ID:     {}\n\
+             \tSession Key: {}\n\
+             \tConfig URL:  {}",
+            session.user_id,
+            session.tab_id.as_deref().unwrap_or("(none)"),
+            session.session_key,
+            self.config.url,
+        )
+    }
 }
 
 /// Health check response.
@@ -351,5 +397,38 @@ mod tests {
         let config = CamofoxConfig::default();
         let client = CamofoxClient::new(config);
         assert!(client.is_configured()); // default URL is non-empty
+    }
+
+    #[test]
+    fn test_camofox_console_format() {
+        let session = CamofoxSession {
+            user_id: "test_user".to_string(),
+            tab_id: Some("tab_123".to_string()),
+            session_key: "key_abc".to_string(),
+        };
+        let config = CamofoxConfig::default();
+        let client = CamofoxClient::new(config);
+        let output = client.camofox_console(&session);
+        assert!(output.contains("test_user"));
+        assert!(output.contains("tab_123"));
+        assert!(output.contains("key_abc"));
+    }
+
+    #[test]
+    fn test_drop_session_clears_tab() {
+        let mut session = CamofoxSession {
+            user_id: "drop_test".to_string(),
+            tab_id: Some("tab_456".to_string()),
+            session_key: "key_xyz".to_string(),
+        };
+        // Run async code on a tokio runtime
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let config = CamofoxConfig::default();
+            let client = CamofoxClient::new(config);
+            let user_id = session.user_id.clone();
+            let _ = client.drop_session(&user_id, &mut session).await;
+        });
+        assert!(session.tab_id.is_none(), "drop_session should clear tab_id");
     }
 }

@@ -210,25 +210,74 @@ fn handle_kill(args: &Value) -> Result<String, hermes_core::HermesError> {
         None => return Ok(tool_error("kill requires 'session_id' parameter")),
     };
 
-    let mut registry = PROCESS_REGISTRY.lock();
-    let Some(p) = registry.get_mut(&session_id) else {
-        return Ok(tool_error(format!("Process not found: {session_id}")));
+    // First: try to kill the actual OS process if we have a PID
+    let pid = {
+        let registry = PROCESS_REGISTRY.lock();
+        let Some(p) = registry.get(&session_id) else {
+            return Ok(tool_error(format!("Process not found: {session_id}")));
+        };
+        if !p.running {
+            return Ok(tool_error(format!("Process already finished: {session_id}")));
+        }
+        p.pid
     };
 
-    if !p.running {
-        return Ok(tool_error(format!("Process already finished: {session_id}")));
-    }
+    let signal_sent = if let Some(pid) = pid {
+        kill_process_by_pid(pid)
+    } else {
+        false
+    };
 
-    p.running = false;
-    p.exit_code = Some(-1);
+    // Mark as finished in registry regardless of signal result
+    let mut registry = PROCESS_REGISTRY.lock();
+    if let Some(p) = registry.get_mut(&session_id) {
+        p.running = false;
+        p.exit_code = Some(-1);
+    }
 
     Ok(serde_json::json!({
         "success": true,
         "action": "kill",
         "session_id": session_id,
         "signal": "SIGTERM",
+        "pid_sent": pid,
+        "signal_sent": signal_sent,
     })
     .to_string())
+}
+
+/// Actually kill a process by PID.
+#[cfg(unix)]
+fn kill_process_by_pid(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if result == 0 {
+        true
+    } else {
+        tracing::warn!("Failed to send SIGTERM to PID {pid}: errno {}", unsafe { libc::errno() });
+        false
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_by_pid(pid: u32) -> bool {
+    let output = std::process::Command::new("taskkill")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .output();
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                true
+            } else {
+                tracing::warn!("taskkill failed for PID {pid}: {}", String::from_utf8_lossy(&out.stderr));
+                false
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to run taskkill for PID {pid}: {e}");
+            false
+        }
+    }
 }
 
 fn handle_write(args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -483,6 +532,37 @@ mod tests {
         }));
         assert!(result.is_ok());
 
+        let result = handle_process(serde_json::json!({
+            "action": "wait",
+            "session_id": id
+        }));
+        let json: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["already_finished"], true);
+
+        cleanup();
+    }
+
+    #[test]
+    #[serial]
+    fn test_kill_with_pid() {
+        cleanup();
+        let id = "kill_with_pid_test";
+        // Register with a fake PID — the kill will attempt to send a signal
+        // but the PID won't exist, so the signal will fail gracefully
+        register_process(id.to_string(), "sleep 10".to_string(), Some(999999));
+
+        let result = handle_process(serde_json::json!({
+            "action": "kill",
+            "session_id": id
+        }));
+        assert!(result.is_ok());
+
+        let json: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        // Verify the response includes pid_sent and signal_sent fields
+        assert_eq!(json["pid_sent"], 999999);
+        assert!(json.get("signal_sent").is_some());
+
+        // Process should be marked as finished in registry
         let result = handle_process(serde_json::json!({
             "action": "wait",
             "session_id": id

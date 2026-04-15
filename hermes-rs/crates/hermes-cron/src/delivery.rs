@@ -11,19 +11,28 @@ pub enum DeliveryTarget {
     Origin {
         platform: String,
         chat_id: String,
+        thread_id: Option<String>,
     },
     /// Deliver to a specific platform channel.
     Platform {
         platform: String,
         channel: String,
+        thread_id: Option<String>,
     },
 }
+
+/// Known delivery platforms for validation.
+const KNOWN_PLATFORMS: &[&str] = &[
+    "telegram", "discord", "slack", "whatsapp", "signal",
+    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
+];
 
 /// Resolve the delivery target from a job's delivery config.
 ///
 /// Supported formats:
 /// - `"local"` → Local
-/// - `"origin"` → Origin { platform, chat_id } from job.origin
+/// - `"origin"` → Origin { platform, chat_id, thread_id } from job.origin
 /// - `"platform:target"` → Platform { platform, channel: target }
 /// - `"telegram"` → Platform { platform: "telegram", channel: TELEGRAM_HOME_CHANNEL }
 pub fn resolve_delivery_target(deliver: &str, origin: Option<&serde_json::Value>) -> DeliveryTarget {
@@ -33,25 +42,49 @@ pub fn resolve_delivery_target(deliver: &str, origin: Option<&serde_json::Value>
             if let Some(o) = origin {
                 let platform = o.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let chat_id = o.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let thread_id = o.get("thread_id").and_then(|v| v.as_str()).map(String::from);
                 if !platform.is_empty() && !chat_id.is_empty() {
-                    return DeliveryTarget::Origin { platform, chat_id };
+                    return DeliveryTarget::Origin { platform, chat_id, thread_id };
+                }
+            }
+            // Origin missing — try platform home channels as fallback
+            for platform_name in &["matrix", "telegram", "discord", "slack", "bluebubbles"] {
+                let env_key = format!("{}_HOME_CHANNEL", platform_name.to_uppercase());
+                if let Ok(chat_id) = std::env::var(&env_key) {
+                    if !chat_id.is_empty() {
+                        return DeliveryTarget::Platform {
+                            platform: platform_name.to_string(),
+                            channel: chat_id,
+                            thread_id: None,
+                        };
+                    }
                 }
             }
             DeliveryTarget::Local
         }
         other => {
-            if let Some((platform, channel)) = other.split_once(':') {
+            if let Some((platform, rest)) = other.split_once(':') {
                 DeliveryTarget::Platform {
                     platform: platform.to_string(),
-                    channel: channel.to_string(),
+                    channel: rest.to_string(),
+                    thread_id: None,
                 }
             } else {
-                // Platform name alone — use HOME_CHANNEL env var
+                // Validate platform name
+                let lower = other.to_lowercase();
+                if !KNOWN_PLATFORMS.contains(&lower.as_str()) {
+                    return DeliveryTarget::Local;
+                }
+                // Use HOME_CHANNEL env var
                 let env_key = format!("{}_HOME_CHANNEL", other.to_uppercase());
-                let channel = std::env::var(&env_key).unwrap_or_else(|_| "default".to_string());
+                let channel = std::env::var(&env_key).unwrap_or_default();
+                if channel.is_empty() {
+                    return DeliveryTarget::Local;
+                }
                 DeliveryTarget::Platform {
-                    platform: other.to_string(),
+                    platform: lower,
                     channel,
+                    thread_id: None,
                 }
             }
         }
@@ -63,15 +96,12 @@ pub fn resolve_delivery_target(deliver: &str, origin: Option<&serde_json::Value>
 /// Returns None on success, or an error string on failure.
 pub async fn deliver_result(target: &DeliveryTarget, job_name: &str, content: &str) -> Option<String> {
     match target {
-        DeliveryTarget::Local => {
-            // No delivery needed — output is saved locally
-            None
+        DeliveryTarget::Local => None,
+        DeliveryTarget::Origin { platform, chat_id, thread_id } => {
+            deliver_to_platform(platform, chat_id, thread_id.as_deref(), job_name, content).await
         }
-        DeliveryTarget::Origin { platform, chat_id } => {
-            deliver_to_platform(platform, chat_id, job_name, content).await
-        }
-        DeliveryTarget::Platform { platform, channel } => {
-            deliver_to_platform(platform, channel, job_name, content).await
+        DeliveryTarget::Platform { platform, channel, thread_id } => {
+            deliver_to_platform(platform, channel, thread_id.as_deref(), job_name, content).await
         }
     }
 }
@@ -80,32 +110,43 @@ pub async fn deliver_result(target: &DeliveryTarget, job_name: &str, content: &s
 async fn deliver_to_platform(
     platform: &str,
     channel: &str,
+    thread_id: Option<&str>,
     job_name: &str,
     content: &str,
 ) -> Option<String> {
-    let message = format!("Cronjob Response: {job_name}\n\n{content}");
+    // Optionally wrap the content with a header/footer (configurable via env)
+    let wrap = std::env::var("HERMES_CRON_WRAP_RESPONSE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    let message = if wrap {
+        format!("Cronjob Response: {job_name}\n-------------\n\n{content}\n\nNote: The agent cannot see this message, and therefore cannot respond to it.")
+    } else {
+        content.to_string()
+    };
 
     // Extract MEDIA: tags for native file attachments
     let (media_paths, text_content) = extract_media(&message);
 
     match platform {
-        "telegram" => deliver_telegram(channel, &text_content, &media_paths).await,
-        "discord" => deliver_discord(channel, &text_content, &media_paths).await,
-        "slack" => deliver_slack(channel, &text_content, &media_paths).await,
+        "telegram" => deliver_telegram(channel, &text_content, &media_paths, thread_id).await,
+        "discord" => deliver_discord(channel, &text_content, &media_paths, thread_id).await,
+        "slack" => deliver_slack(channel, &text_content, &media_paths, thread_id).await,
         "signal" => deliver_signal(channel, &text_content, &media_paths).await,
         "whatsapp" => deliver_whatsapp(channel, &text_content, &media_paths).await,
-        "matrix" => deliver_matrix(channel, &text_content, &media_paths).await,
-        "mattermost" => deliver_mattermost(channel, &text_content, &media_paths).await,
+        "matrix" => deliver_matrix(channel, &text_content, &media_paths, thread_id).await,
+        "mattermost" => deliver_mattermost(channel, &text_content, &media_paths, thread_id).await,
         "homeassistant" => deliver_homeassistant(channel, &text_content, &media_paths).await,
         "dingtalk" => deliver_dingtalk(channel, &text_content, &media_paths).await,
         "feishu" => deliver_feishu(channel, &text_content, &media_paths).await,
-        "wecom" => deliver_wecom(channel, &text_content, &media_paths).await,
+        "wecom" | "wecom_callback" => deliver_wecom(channel, &text_content, &media_paths).await,
         "weixin" => deliver_weixin(channel, &text_content, &media_paths).await,
         "bluebubbles" => deliver_bluebubbles(channel, &text_content, &media_paths).await,
-        _ => {
-            // Generic HTTP POST delivery
-            deliver_generic(platform, channel, &text_content).await
-        }
+        "sms" => deliver_sms(channel, &text_content).await,
+        "email" => deliver_email(channel, job_name, &text_content).await,
+        "webhook" => deliver_generic(platform, channel, &text_content).await,
+        _ => deliver_generic(platform, channel, &text_content).await,
     }
 }
 
@@ -133,7 +174,7 @@ fn extract_media(content: &str) -> (Vec<String>, String) {
 }
 
 /// Deliver to Telegram via Bot API.
-async fn deliver_telegram(chat_id: &str, content: &str, media: &[String]) -> Option<String> {
+async fn deliver_telegram(chat_id: &str, content: &str, media: &[String], _thread_id: Option<&str>) -> Option<String> {
     let bot_token = match std::env::var("TELEGRAM_BOT_TOKEN") {
         Ok(t) => t,
         Err(_) => return Some("TELEGRAM_BOT_TOKEN not set".to_string()),
@@ -200,7 +241,7 @@ async fn send_telegram_document(
 }
 
 /// Deliver to Discord via webhook.
-async fn deliver_discord(webhook_url: &str, content: &str, _media: &[String]) -> Option<String> {
+async fn deliver_discord(webhook_url: &str, content: &str, _media: &[String], _thread_id: Option<&str>) -> Option<String> {
     // Discord webhook URLs contain the token, so no separate auth needed
     if !webhook_url.starts_with("http") {
         return Some("Invalid Discord webhook URL".to_string());
@@ -223,7 +264,7 @@ async fn deliver_discord(webhook_url: &str, content: &str, _media: &[String]) ->
 }
 
 /// Deliver to Slack via webhook.
-async fn deliver_slack(webhook_url: &str, content: &str, _media: &[String]) -> Option<String> {
+async fn deliver_slack(webhook_url: &str, content: &str, _media: &[String], _thread_id: Option<&str>) -> Option<String> {
     if !webhook_url.starts_with("http") {
         return Some("Invalid Slack webhook URL".to_string());
     }
@@ -303,7 +344,7 @@ async fn deliver_whatsapp(phone_number_id: &str, content: &str, _media: &[String
 }
 
 /// Deliver to Matrix via Synapse Client-Server API.
-async fn deliver_matrix(room_id: &str, content: &str, _media: &[String]) -> Option<String> {
+async fn deliver_matrix(room_id: &str, content: &str, _media: &[String], _thread_id: Option<&str>) -> Option<String> {
     let homeserver = match std::env::var("MATRIX_HOMESERVER_URL") {
         Ok(u) => u,
         Err(_) => return Some("MATRIX_HOMESERVER_URL not set".to_string()),
@@ -336,7 +377,7 @@ async fn deliver_matrix(room_id: &str, content: &str, _media: &[String]) -> Opti
 }
 
 /// Deliver to Mattermost via incoming webhook.
-async fn deliver_mattermost(webhook_url: &str, content: &str, _media: &[String]) -> Option<String> {
+async fn deliver_mattermost(webhook_url: &str, content: &str, _media: &[String], _thread_id: Option<&str>) -> Option<String> {
     if !webhook_url.starts_with("http") {
         return Some("Invalid Mattermost webhook URL".to_string());
     }
@@ -514,6 +555,94 @@ async fn deliver_bluebubbles(chat_id: &str, content: &str, _media: &[String]) ->
     }
 }
 
+/// Deliver SMS via Twilio API.
+async fn deliver_sms(phone_number: &str, content: &str) -> Option<String> {
+    let account_sid = match std::env::var("TWILIO_ACCOUNT_SID") {
+        Ok(s) => s,
+        Err(_) => return Some("TWILIO_ACCOUNT_SID not set".to_string()),
+    };
+    let auth_token = match std::env::var("TWILIO_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => return Some("TWILIO_AUTH_TOKEN not set".to_string()),
+    };
+    let from = match std::env::var("TWILIO_FROM") {
+        Ok(f) => f,
+        Err(_) => return Some("TWILIO_FROM not set".to_string()),
+    };
+
+    let url = format!("https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .basic_auth(&account_sid, Some(&auth_token))
+        .form(&serde_json::json!({
+            "From": from,
+            "To": phone_number,
+            "Body": content,
+        }))
+        .send()
+        .await;
+
+    if let Err(e) = resp {
+        Some(format!("Twilio API error: {e}"))
+    } else {
+        None
+    }
+}
+
+/// Deliver email via SMTP relay or API.
+async fn deliver_email(to: &str, job_name: &str, content: &str) -> Option<String> {
+    let from = match std::env::var("EMAIL_FROM") {
+        Ok(f) => f,
+        Err(_) => return Some("EMAIL_FROM not set".to_string()),
+    };
+
+    // Try SendGrid first
+    if let Ok(api_key) = std::env::var("SENDGRID_API_KEY") {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post("https://api.sendgrid.com/v3/mail/send")
+            .bearer_auth(&api_key)
+            .json(&serde_json::json!({
+                "personalizations": [{"to": [{"email": to}]}],
+                "from": {"email": from},
+                "subject": format!("Cronjob Response: {job_name}"),
+                "content": [{"type": "text/plain", "value": content}],
+            }))
+            .send()
+            .await;
+        return if let Err(e) = resp {
+            Some(format!("SendGrid API error: {e}"))
+        } else {
+            None
+        };
+    }
+
+    // Fallback: generic SMTP via Mailgun
+    if let (Ok(domain), Ok(api_key)) = (std::env::var("MAILGUN_DOMAIN"), std::env::var("MAILGUN_API_KEY")) {
+        let url = format!("https://api.mailgun.net/v3/{domain}/messages");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .basic_auth("api", Some(&api_key))
+            .form(&serde_json::json!({
+                "from": from,
+                "to": to,
+                "subject": format!("Cronjob Response: {job_name}"),
+                "text": content,
+            }))
+            .send()
+            .await;
+        return if let Err(e) = resp {
+            Some(format!("Mailgun API error: {e}"))
+        } else {
+            None
+        };
+    }
+
+    Some("No email provider configured (SENDGRID_API_KEY or MAILGUN_*)".to_string())
+}
+
 /// Generic HTTP POST delivery.
 async fn deliver_generic(platform: &str, channel: &str, content: &str) -> Option<String> {
     // Try common webhook patterns
@@ -541,9 +670,9 @@ async fn deliver_generic(platform: &str, channel: &str, content: &str) -> Option
     }
 }
 
-/// Check if a response contains the SILENT marker.
+/// Check if a response contains the SILENT marker (case-insensitive).
 pub fn is_silent(content: &str) -> bool {
-    content.contains("[SILENT]")
+    content.trim().to_uppercase().contains("[SILENT]")
 }
 
 #[cfg(test)]
@@ -564,7 +693,7 @@ mod tests {
         });
         let target = resolve_delivery_target("origin", Some(&origin));
         match target {
-            DeliveryTarget::Origin { platform, chat_id } => {
+            DeliveryTarget::Origin { platform, chat_id, .. } => {
                 assert_eq!(platform, "telegram");
                 assert_eq!(chat_id, "12345");
             }
@@ -576,7 +705,7 @@ mod tests {
     fn test_resolve_platform_colon() {
         let target = resolve_delivery_target("telegram:67890", None);
         match target {
-            DeliveryTarget::Platform { platform, channel } => {
+            DeliveryTarget::Platform { platform, channel, .. } => {
                 assert_eq!(platform, "telegram");
                 assert_eq!(channel, "67890");
             }
@@ -589,7 +718,7 @@ mod tests {
         std::env::set_var("SLACK_HOME_CHANNEL", "#cron-alerts");
         let target = resolve_delivery_target("slack", None);
         match target {
-            DeliveryTarget::Platform { platform, channel } => {
+            DeliveryTarget::Platform { platform, channel, .. } => {
                 assert_eq!(platform, "slack");
                 assert_eq!(channel, "#cron-alerts");
             }

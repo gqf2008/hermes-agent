@@ -92,6 +92,7 @@ async-openai = "0.27"
 
 # CLI / TUI
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 reedline = "0.38"
 crossterm = "0.28"
 console = "0.15"

@@ -445,7 +445,7 @@ impl TrajectoryCompressor {
     ///
     /// Returns (compressed_trajectory, metrics).
     pub async fn compress_trajectory(
-        &self,
+        &mut self,
         trajectory: Vec<Turn>,
     ) -> (Vec<Turn>, TrajectoryMetrics) {
         let mut metrics = TrajectoryMetrics {
@@ -555,7 +555,7 @@ impl TrajectoryCompressor {
     ///
     /// Returns aggregate metrics.
     pub async fn process_file(
-        &self,
+        &mut self,
         input_path: &Path,
         output_path: &Path,
         sample_percent: Option<f64>,
@@ -637,7 +637,7 @@ impl TrajectoryCompressor {
     /// Finds all `.jsonl` files in the directory, compresses each, and
     /// writes to `{input}_compressed.jsonl`.
     pub async fn process_directory(
-        &self,
+        &mut self,
         input_dir: &Path,
         sample_percent: Option<f64>,
     ) -> Result<AggregateMetrics, std::io::Error> {
@@ -914,7 +914,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.target_max_tokens = 100_000; // Very high, no compression needed
         cfg.skip_under_target = true;
-        let compressor = TrajectoryCompressor::new(cfg);
+        let mut compressor = TrajectoryCompressor::new(cfg);
 
         let trajectory = vec![
             make_turn("system", 100),
@@ -934,7 +934,7 @@ mod tests {
         cfg.target_max_tokens = 500; // Low enough to trigger compression
         cfg.summary_target_tokens = 100;
         cfg.skip_under_target = false;
-        let compressor = TrajectoryCompressor::new(cfg);
+        let mut compressor = TrajectoryCompressor::new(cfg);
 
         let trajectory = vec![
             make_turn("system", 50),
@@ -1151,7 +1151,7 @@ mod tests {
         cfg.protect_last_n_turns = 0;
         cfg.skip_under_target = false;
         cfg.save_over_limit = true;
-        let compressor = TrajectoryCompressor::new(cfg);
+        let mut compressor = TrajectoryCompressor::new(cfg);
 
         // Small trajectory where all turns are "first" of their role
         // and there's nothing left to compress

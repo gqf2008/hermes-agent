@@ -14,6 +14,7 @@ pub mod ssh;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 /// Result of executing a command.
 #[derive(Debug, Clone)]
@@ -62,14 +63,14 @@ pub struct EnvConfig {
 }
 
 /// Create an environment from configuration.
-pub fn create_environment(config: &EnvConfig) -> Box<dyn Environment> {
+pub fn create_environment(config: &EnvConfig) -> Arc<dyn Environment> {
     match config.env_type.as_str() {
         "local" => {
             let env = match &config.cwd {
                 Some(dir) => LocalEnvironment::new().with_cwd(dir),
                 None => LocalEnvironment::new(),
             };
-            Box::new(env)
+            Arc::new(env)
         }
         "ssh" => {
             let ssh_config = ssh::SshConfig {
@@ -82,7 +83,7 @@ pub fn create_environment(config: &EnvConfig) -> Box<dyn Environment> {
                 Some(dir) => ssh::SshEnvironment::new(ssh_config).with_cwd(dir),
                 None => ssh::SshEnvironment::new(ssh_config),
             };
-            Box::new(env)
+            Arc::new(env)
         }
         "docker" => {
             let docker_config = docker_env::DockerConfig {
@@ -91,7 +92,7 @@ pub fn create_environment(config: &EnvConfig) -> Box<dyn Environment> {
                 ..Default::default()
             };
             let env = docker_env::DockerEnvironment::new(docker_config);
-            Box::new(env)
+            Arc::new(env)
         }
         "daytona" => {
             let daytona_config = daytona::DaytonaConfig {
@@ -100,7 +101,7 @@ pub fn create_environment(config: &EnvConfig) -> Box<dyn Environment> {
                 ..Default::default()
             };
             let env = daytona::DaytonaEnvironment::new(daytona_config);
-            Box::new(env)
+            Arc::new(env)
         }
         "modal" => {
             let modal_config = modal::ModalConfig {
@@ -109,7 +110,7 @@ pub fn create_environment(config: &EnvConfig) -> Box<dyn Environment> {
                 ..Default::default()
             };
             let env = modal::ModalEnvironment::new(modal_config);
-            Box::new(env)
+            Arc::new(env)
         }
         "singularity" => {
             let singularity_config = singularity::SingularityConfig {
@@ -118,10 +119,10 @@ pub fn create_environment(config: &EnvConfig) -> Box<dyn Environment> {
                 ..Default::default()
             };
             let env = singularity::SingularityEnvironment::new(singularity_config);
-            Box::new(env)
+            Arc::new(env)
         }
         _other => {
-            Box::new(LocalEnvironment::new())
+            Arc::new(LocalEnvironment::new())
         }
     }
 }
@@ -296,5 +297,6 @@ mod tests {
         fn assert_send<T: Send + Sync>() {}
         assert_send::<LocalEnvironment>();
         assert_send::<Box<dyn Environment>>();
+        assert_send::<Arc<dyn Environment>>();
     }
 }

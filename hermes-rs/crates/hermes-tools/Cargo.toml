@@ -40,6 +40,9 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 unicode-normalization = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serde_yaml.workspace = true
 serial_test = "3"

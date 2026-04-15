@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 hermes-core.workspace = true
+anyhow.workspace = true
 hermes-llm.workspace = true
 hermes-tools.workspace = true
 hermes-prompt.workspace = true
@@ -21,3 +22,5 @@ async-trait.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 chrono.workspace = true
+walkdir.workspace = true
+serde_yaml.workspace = true

@@ -621,7 +621,7 @@ impl AIAgent {
                         // Check context compression
                         if let Some(ref mut compressor) = self.compressor {
                             if compressor.should_compress(None) {
-                                messages = compressor.compress(&messages, None);
+                                messages = compressor.compress(&messages, None, None);
                                 // Rebuild system prompt after compression
                                 self.cached_system_prompt = None;
                                 let _ = self.build_system_prompt(system_message);
@@ -713,7 +713,7 @@ impl AIAgent {
                                 compression_attempts, max_compression_attempts
                             );
                             if let Some(ref mut compressor) = self.compressor {
-                                messages = compressor.compress(&messages, None);
+                                messages = compressor.compress(&messages, None, None);
                                 self.cached_system_prompt = None;
                                 let _ = self.build_system_prompt(system_message);
                                 // Retry the LLM call with compressed context
