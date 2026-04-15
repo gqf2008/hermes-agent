@@ -215,11 +215,13 @@ impl GatewayRunner {
             let adapter = adapter.clone();
             let handler = self.message_handler.clone();
             let api_key = adapter.config.api_key.clone();
+            let model_name = adapter.config.model_name.clone();
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
             let handle = tokio::spawn(async move {
                 let state = ApiServerState {
                     handler,
                     api_key,
+                    model_name,
                 };
                 if let Err(e) = adapter.run(state, shutdown_rx).await {
                     error!("API Server error: {e}");

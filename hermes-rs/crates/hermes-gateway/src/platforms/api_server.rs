@@ -33,6 +33,9 @@ pub struct ApiServerConfig {
     pub port: u16,
     pub host: String,
     pub api_key: String,
+    /// Model name advertised in /v1/models and responses.
+    /// Mirrors Python `extra.model_name` / `API_SERVER_MODEL_NAME`.
+    pub model_name: String,
 }
 
 impl Default for ApiServerConfig {
@@ -47,6 +50,10 @@ impl Default for ApiServerConfig {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
             api_key: std::env::var("API_SERVER_KEY").unwrap_or_default(),
+            model_name: std::env::var("API_SERVER_MODEL_NAME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "hermes-agent".to_string()),
         }
     }
 }
@@ -62,6 +69,8 @@ impl ApiServerConfig {
 pub struct ApiServerState {
     pub handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     pub api_key: String,
+    /// Model name advertised in responses and /v1/models.
+    pub model_name: String,
 }
 
 /// OpenAI-style chat completion request.
@@ -122,11 +131,17 @@ pub struct HistoryMessageInput {
 }
 
 /// Deserialize content that may be a string or an array of content parts.
+/// Mirrors Python `_normalize_chat_content` — flattens typed content parts
+/// into a plain string so the agent pipeline (which expects strings) works.
+/// Enforces depth, size, and length limits to prevent abuse.
 fn deserialize_content<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::{self, Visitor};
+    // Limits mirroring Python: 64 KB text cap, 1000 items, depth 10.
+    const MAX_TEXT_LENGTH: usize = 65_536;
+    const MAX_ITEMS: usize = 1_000;
     struct ContentVisitor;
     impl<'de> Visitor<'de> for ContentVisitor {
         type Value = String;
@@ -137,18 +152,41 @@ where
         where
             E: de::Error,
         {
-            Ok(v.to_string())
+            if v.len() > MAX_TEXT_LENGTH {
+                Ok(v.chars().take(MAX_TEXT_LENGTH).collect())
+            } else {
+                Ok(v.to_string())
+            }
         }
         fn visit_seq<A>(self, mut seq: A) -> Result<String, A::Error>
         where
             A: de::SeqAccess<'de>,
         {
             let mut parts: Vec<String> = Vec::new();
-            while let Some(part) = seq.next_element::<serde_json::Value>()? {
-                if let Some(text) = part.get("text").and_then(|v| v.as_str().map(String::from)) {
-                    parts.push(text);
-                } else if let Some(text) = part.as_str() {
-                    parts.push(text.to_string());
+            let mut total_len: usize = 0;
+            let limit = std::cmp::min(seq.size_hint().unwrap_or(MAX_ITEMS), MAX_ITEMS);
+            for _ in 0..limit {
+                if let Some(part) = seq.next_element::<serde_json::Value>()? {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str().map(String::from)) {
+                        let capped = if text.len() > MAX_TEXT_LENGTH {
+                            text.chars().take(MAX_TEXT_LENGTH).collect()
+                        } else {
+                            text
+                        };
+                        total_len += capped.len();
+                        parts.push(capped);
+                    } else if let Some(text) = part.as_str() {
+                        let capped = if text.len() > MAX_TEXT_LENGTH {
+                            text.chars().take(MAX_TEXT_LENGTH).collect()
+                        } else {
+                            text.to_string()
+                        };
+                        total_len += capped.len();
+                        parts.push(capped);
+                    }
+                    if total_len >= MAX_TEXT_LENGTH {
+                        break;
+                    }
                 }
             }
             Ok(parts.join("\n"))
@@ -245,10 +283,18 @@ impl ResponseStore {
         }
         self.entries.insert(response_id.clone(), entry);
         self.order.push(response_id);
-        // LRU eviction
+        // LRU eviction — clean up conversation mappings to avoid stale lookups
         while self.entries.len() > RESPONSE_STORE_MAX {
             if let Some(oldest) = self.order.first().cloned() {
-                self.entries.remove(&oldest);
+                if let Some(entry) = self.entries.remove(&oldest) {
+                    if let Some(ref conv) = entry.conversation {
+                        if let Some(existing) = self.conversations.get(conv) {
+                            if existing == &oldest {
+                                self.conversations.remove(conv);
+                            }
+                        }
+                    }
+                }
                 self.order.remove(0);
             } else {
                 break;
@@ -257,8 +303,16 @@ impl ResponseStore {
     }
 
     fn delete(&mut self, response_id: &str) -> bool {
-        if self.entries.remove(response_id).is_some() {
+        if let Some(entry) = self.entries.remove(response_id) {
             self.order.retain(|id| id != response_id);
+            // Clean up conversation mapping to avoid stale lookups
+            if let Some(ref conv) = entry.conversation {
+                if let Some(existing) = self.conversations.get(conv) {
+                    if existing == response_id {
+                        self.conversations.remove(conv);
+                    }
+                }
+            }
             true
         } else {
             false
@@ -537,8 +591,22 @@ impl ApiServerAdapter {
     pub fn build_router(&self, state: ApiServerState) -> Router {
         let cors = CorsLayer::new()
             .allow_origin(tower_http::cors::Any)
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
-            .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]);
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::DELETE, axum::http::Method::OPTIONS])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderName::from_static("idempotency-key"),
+            ]);
+
+        // Security headers middleware — mirrors Python _SECURITY_HEADERS
+        let security_headers = tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        );
+        let referrer_policy = tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::REFERRER_POLICY,
+            axum::http::HeaderValue::from_static("no-referrer"),
+        );
 
         Router::new()
             .route("/health", get(health_handler))
@@ -553,6 +621,8 @@ impl ApiServerAdapter {
             .route("/v1/runs/{run_id}/events", get(run_events_handler))
             .layer(cors)
             .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1MB max request body
+            .layer(security_headers)
+            .layer(referrer_policy)
             .with_state(state)
     }
 
@@ -606,7 +676,7 @@ async fn health_detailed_handler(
 
     Json(DetailedHealthResponse {
         status: "ok".to_string(),
-        platform: "hermes-agent".to_string(),
+        platform: state.model_name.clone(),
         gateway_state: Some("running".to_string()),
         platforms: vec!["api_server".to_string()],
         active_agents,
@@ -617,11 +687,13 @@ async fn health_detailed_handler(
     })
 }
 
-async fn models_handler() -> Json<ModelsResponse> {
+async fn models_handler(
+    State(state): State<ApiServerState>,
+) -> Json<ModelsResponse> {
     Json(ModelsResponse {
         object: "list".to_string(),
         data: vec![ModelInfo {
-            id: "hermes-agent".to_string(),
+            id: state.model_name.clone(),
             object: "model".to_string(),
             created: chrono::Utc::now().timestamp(),
             owned_by: "nous-research".to_string(),
@@ -723,7 +795,7 @@ async fn chat_completions_handler(
 
     let response = result.response;
 
-    let model = request.model.clone().unwrap_or_else(|| "hermes-agent".to_string());
+    let model = request.model.clone().unwrap_or_else(|| state.model_name.clone());
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
 
@@ -907,7 +979,7 @@ async fn responses_handler(
         })?;
 
     let response_text = result.response;
-    let model = request.model.clone().unwrap_or_else(|| "hermes-agent".to_string());
+    let model = request.model.clone().unwrap_or_else(|| state.model_name.clone());
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple().to_string().chars().take(28).collect::<String>());
     let created_at = chrono::Utc::now().timestamp();
 
@@ -1055,7 +1127,7 @@ async fn responses_stream_handler(
 
     let session_id = stored_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let store_response = request.store.unwrap_or(true);
-    let model = request.model.clone().unwrap_or_else(|| "hermes-agent".to_string());
+    let model = request.model.clone().unwrap_or_else(|| state.model_name.clone());
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple().to_string().chars().take(28).collect::<String>());
     let created_at = chrono::Utc::now().timestamp();
 
