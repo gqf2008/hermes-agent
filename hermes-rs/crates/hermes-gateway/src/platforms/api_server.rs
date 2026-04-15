@@ -332,8 +332,6 @@ impl ResponseStore {
 
 /// Maximum concurrent runs.
 const MAX_CONCURRENT_RUNS: usize = 20;
-/// TTL for unconsumed run streams (seconds).
-const RUN_STREAM_TTL: u64 = 300;
 
 /// A single run event (structured lifecycle event for SSE streaming).
 #[derive(Debug, Clone, Serialize)]
@@ -389,12 +387,6 @@ impl RunStreamStore {
 
     fn remove(&mut self, run_id: &str) {
         self.senders.remove(run_id);
-    }
-
-    fn sweep_orphaned(&mut self, now: f64) {
-        self.senders.retain(|_, (_, created_at)| {
-            now - *created_at < RUN_STREAM_TTL as f64
-        });
     }
 
     fn len(&self) -> usize {
@@ -1058,7 +1050,7 @@ async fn responses_handler(
 /// callbacks — currently deferred (TODO: wire through agent stream_delta_callback).
 async fn responses_stream_handler(
     state: ApiServerState,
-    api_key: &str,
+    _api_key: &str,
     request: ResponsesRequest,
 ) -> Result<Sse<SseResponsesStreamType>, (StatusCode, String)> {
     // Reuse the same setup logic as batch mode
@@ -1231,7 +1223,7 @@ fn build_responses_sse_stream(
         let agent_result = agent_rx.await;
         let response_text = match agent_result {
             Ok(Ok((text, _))) => text,
-            Ok(Err(e)) => {
+            Ok(Err(_e)) => {
                 // Agent error — emit response.failed (simplified)
                 let error_envelope = SseResponseEnvelope {
                     id: response_id.clone(),
@@ -1575,8 +1567,8 @@ async fn run_and_close(
     run_id: String,
     tx: tokio::sync::broadcast::Sender<RunEvent>,
     user_message: String,
-    mut conversation_history: Vec<HistoryMessage>,
-    instructions: Option<String>,
+    conversation_history: Vec<HistoryMessage>,
+    _instructions: Option<String>,
     session_id: String,
     previous_response_id: Option<String>,
 ) {
@@ -1602,14 +1594,15 @@ async fn run_and_close(
     sequence_number += 1;
 
     // Resolve previous_response_id for conversation chaining
-    if conversation_history.is_empty() {
-        if let Some(ref prev_id) = previous_response_id {
+    // TODO: wire resolved history into handler pipeline
+    let _previous_resolved = if conversation_history.is_empty() {
+        previous_response_id.as_ref().and_then(|prev_id| {
             let store = RESPONSE_STORE.lock().unwrap();
-            if let Some(stored) = store.get(prev_id) {
-                conversation_history = stored.conversation_history.clone();
-            }
-        }
-    }
+            store.get(prev_id).map(|e| e.session_id.clone())
+        })
+    } else {
+        None
+    };
 
     let handler_guard = state.handler.lock().await;
     let result = if let Some(handler) = handler_guard.as_ref() {
@@ -1622,7 +1615,7 @@ async fn run_and_close(
         Ok(handler_result) => {
             // Emit message.delta events
             let response_text = handler_result.response;
-            let mut delta_event = RunEvent {
+            let delta_event = RunEvent {
                 event: "message.delta".to_string(),
                 run_id: run_id.clone(),
                 timestamp: SystemTime::now()
@@ -1639,7 +1632,7 @@ async fn run_and_close(
             sequence_number += 1;
 
             // Emit run.completed
-            let mut completed_event = RunEvent {
+            let completed_event = RunEvent {
                 event: "run.completed".to_string(),
                 run_id: run_id.clone(),
                 timestamp: SystemTime::now()
@@ -1659,7 +1652,7 @@ async fn run_and_close(
             let _ = tx.send(completed_event);
         }
         Err(e) => {
-            let mut failed_event = RunEvent {
+            let failed_event = RunEvent {
                 event: "run.failed".to_string(),
                 run_id: run_id.clone(),
                 timestamp: SystemTime::now()
@@ -1737,7 +1730,7 @@ type SseRunStreamType = Pin<Box<dyn Stream<Item = Result<axum::response::sse::Ev
 /// Build an SSE stream from a run event broadcast channel.
 fn build_run_sse_stream(
     tx: tokio::sync::broadcast::Sender<RunEvent>,
-    run_id: String,
+    _run_id: String,
 ) -> SseRunStreamType {
     Box::pin(async_stream::stream! {
         let mut rx = tx.subscribe();
