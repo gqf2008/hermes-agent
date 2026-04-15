@@ -501,13 +501,33 @@ impl IdempotencyCache {
     }
 
     fn set(&mut self, key: String, fingerprint: String, response: serde_json::Value) {
-        self.purge();
+        // Remove expired entries first
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(IDEM_TTL_SECS);
+        self.store.retain(|_, v| now.duration_since(v.timestamp) <= ttl);
+        // Clean up order
+        while let Some(front) = self.order.front() {
+            if self.store.contains_key(front) {
+                break;
+            }
+            self.order.pop_front();
+        }
+
         self.order.push_back(key.clone());
         self.store.insert(key, IdempotencyEntry {
             response,
             fingerprint,
             timestamp: std::time::Instant::now(),
         });
+
+        // LRU eviction — keep only max items
+        while self.store.len() > IDEM_MAX_ITEMS {
+            if let Some(k) = self.order.pop_front() {
+                self.store.remove(&k);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -937,18 +957,24 @@ async fn chat_completions_handler(
         }
     }
 
-    // Idempotency check for non-streaming requests
-    if !request.stream {
-        if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
-            // Re-serialize request for fingerprinting
+    // Idempotency: extract key + fingerprint early, reuse for both get and set
+    let idem_key_and_fp = if !request.stream {
+        headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()).map(|key| {
             let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
             let fp = make_request_fingerprint(&request_json, &["model", "messages", "tools", "tool_choice", "stream"]);
-            let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
-            if let Some(cached) = cache.get(idem_key, &fp) {
-                if let Ok(resp) = serde_json::from_value::<ChatCompletionResponse>(cached) {
-                    let session_id = resp.id.clone();
-                    return Ok(SseOrJson::Json(Json(resp), session_id));
-                }
+            (key.to_string(), fp)
+        })
+    } else {
+        None
+    };
+
+    // Cache hit — return cached response without running agent
+    if let Some((ref key, ref fp)) = idem_key_and_fp {
+        let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(key, fp) {
+            if let Ok(resp) = serde_json::from_value::<ChatCompletionResponse>(cached) {
+                let session_id = resp.id.clone();
+                return Ok(SseOrJson::Json(Json(resp), session_id));
             }
         }
     }
@@ -1043,12 +1069,10 @@ async fn chat_completions_handler(
         };
 
         // Cache response for idempotency
-        if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
-            let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
-            let fp = make_request_fingerprint(&request_json, &["model", "messages", "tools", "tool_choice", "stream"]);
+        if let Some((ref key, ref fp)) = idem_key_and_fp {
             if let Ok(json) = serde_json::to_value(&resp) {
                 let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
-                cache.set(idem_key.to_string(), fp, json);
+                cache.set(key.clone(), fp.clone(), json);
             }
         }
 
@@ -1165,16 +1189,23 @@ async fn responses_handler(
     let session_id = stored_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let store_response = request.store.unwrap_or(true);
 
-    // Idempotency check for non-streaming requests
-    if !request.stream.unwrap_or(false) {
-        if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+    // Idempotency: extract key + fingerprint early, reuse for both get and set
+    let idem_key_and_fp = if !request.stream.unwrap_or(false) {
+        headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()).map(|key| {
             let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
             let fp = make_request_fingerprint(&request_json, &["input", "instructions", "previous_response_id", "conversation", "model", "tools"]);
-            let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
-            if let Some(cached) = cache.get(idem_key, &fp) {
-                if let Ok(resp) = serde_json::from_value::<ResponseData>(cached) {
-                    return Ok(ResponsesResponse::Json(Json(resp)));
-                }
+            (key.to_string(), fp)
+        })
+    } else {
+        None
+    };
+
+    // Cache hit — return cached response without running agent
+    if let Some((ref key, ref fp)) = idem_key_and_fp {
+        let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(key, fp) {
+            if let Ok(resp) = serde_json::from_value::<ResponseData>(cached) {
+                return Ok(ResponsesResponse::Json(Json(resp)));
             }
         }
     }
@@ -1248,12 +1279,10 @@ async fn responses_handler(
     }
 
     // Cache response for idempotency (non-streaming only)
-    if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
-        let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
-        let fp = make_request_fingerprint(&request_json, &["input", "instructions", "previous_response_id", "conversation", "model", "tools"]);
+    if let Some((ref key, ref fp)) = idem_key_and_fp {
         if let Ok(json) = serde_json::to_value(&response_data) {
             let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
-            cache.set(idem_key.to_string(), fp, json);
+            cache.set(key.clone(), fp.clone(), json);
         }
     }
 
@@ -2412,5 +2441,109 @@ mod tests {
         assert_eq!(parsed["object"], "response");
         assert_eq!(parsed["output"][0]["role"], "assistant");
         assert_eq!(parsed["output"][0]["content"][0]["text"], "Hello world");
+    }
+
+    #[test]
+    fn test_idempotency_cache_set_get() {
+        let mut cache = IdempotencyCache::default();
+        let resp = serde_json::json!({"id": "resp_1"});
+        cache.set("key-1".to_string(), "fp-abc".to_string(), resp.clone());
+        let got = cache.get("key-1", "fp-abc").unwrap();
+        assert_eq!(got["id"], "resp_1");
+    }
+
+    #[test]
+    fn test_idempotency_cache_fingerprint_mismatch() {
+        let mut cache = IdempotencyCache::default();
+        let resp = serde_json::json!({"id": "resp_1"});
+        cache.set("key-1".to_string(), "fp-abc".to_string(), resp.clone());
+        // Same key but different fingerprint → miss
+        assert!(cache.get("key-1", "fp-xyz").is_none());
+    }
+
+    #[test]
+    fn test_idempotency_cache_lru_eviction() {
+        let mut cache = IdempotencyCache::default();
+        // Override max for test — manually insert enough to trigger overflow
+        for i in 0..IDEM_MAX_ITEMS + 10 {
+            let key = format!("key-{i}");
+            cache.set(key, format!("fp-{i}"), serde_json::json!({"i": i}));
+        }
+        assert!(cache.store.len() <= IDEM_MAX_ITEMS);
+    }
+
+    #[test]
+    fn test_idempotency_cache_ttl_expiry() {
+        use std::time::Instant;
+        let mut cache = IdempotencyCache::default();
+        cache.set("ttl-key".to_string(), "fp-ttl".to_string(), serde_json::json!({"ok": true}));
+
+        // Manually backdate the entry to simulate expiry
+        if let Some(entry) = cache.store.get_mut("ttl-key") {
+            entry.timestamp = Instant::now() - Duration::from_secs(IDEM_TTL_SECS + 1);
+        }
+        // Now get() should purge and return None
+        assert!(cache.get("ttl-key", "fp-ttl").is_none());
+    }
+
+    #[test]
+    fn test_make_request_fingerprint_deterministic() {
+        let data = serde_json::json!({"model": "hermes", "messages": [{"role": "user", "content": "hi"}]});
+        let fp1 = make_request_fingerprint(&data, &["model", "messages"]);
+        let fp2 = make_request_fingerprint(&data, &["model", "messages"]);
+        assert_eq!(fp1, fp2); // deterministic
+    }
+
+    #[test]
+    fn test_make_request_fingerprint_different_keys_different_hash() {
+        let data = serde_json::json!({"model": "hermes", "stream": true});
+        let fp1 = make_request_fingerprint(&data, &["model"]);
+        let fp2 = make_request_fingerprint(&data, &["model", "stream"]);
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_extract_output_items_no_tool_calls() {
+        let messages: Vec<serde_json::Value> = vec![];
+        let items = extract_output_items("Hello", &messages);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, "message");
+        assert_eq!(items[0].content.as_ref().unwrap()[0].text.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn test_extract_output_items_with_tool_calls() {
+        let messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc-1",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"NYC\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "tc-1",
+                "content": "Sunny, 72°F"
+            }),
+        ];
+        let items = extract_output_items("It's sunny!", &messages);
+        assert_eq!(items.len(), 3); // function_call + function_call_output + message
+
+        // function_call
+        assert_eq!(items[0].item_type, "function_call");
+        assert_eq!(items[0].call_id.as_deref(), Some("tc-1"));
+        assert_eq!(items[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(items[0].arguments.as_deref(), Some("{\"city\": \"NYC\"}"));
+
+        // function_call_output
+        assert_eq!(items[1].item_type, "function_call_output");
+        assert_eq!(items[1].call_id.as_deref(), Some("tc-1"));
+        assert_eq!(items[1].output.as_deref(), Some("Sunny, 72°F"));
+
+        // final message
+        assert_eq!(items[2].item_type, "message");
+        assert_eq!(items[2].role, "assistant");
     }
 }
