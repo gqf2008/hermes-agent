@@ -74,7 +74,7 @@ pub struct ApiServerState {
 }
 
 /// OpenAI-style chat completion request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -91,7 +91,7 @@ pub struct ChatCompletionRequest {
 }
 
 /// OpenAI-style message.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Message {
     pub role: String,
     #[serde(deserialize_with = "deserialize_content")]
@@ -101,7 +101,7 @@ pub struct Message {
 /// OpenAI Responses API request.
 /// Mirrors Python PR handling of `input`, `instructions`, `previous_response_id`,
 /// `conversation`, `conversation_history`, `store`, `truncation`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResponsesRequest {
     pub input: serde_json::Value,
     #[serde(default)]
@@ -123,7 +123,7 @@ pub struct ResponsesRequest {
 }
 
 /// Input message for Responses API (simpler than chat completions Message).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HistoryMessageInput {
     pub role: String,
     #[serde(deserialize_with = "deserialize_content")]
@@ -196,7 +196,7 @@ where
 }
 
 /// OpenAI-style chat completion response (non-streaming).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
@@ -206,20 +206,20 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Choice {
     pub index: usize,
     pub message: ResponseMessage,
     pub finish_reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResponseMessage {
     pub role: String,
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
@@ -444,6 +444,89 @@ impl ResponseStore {
     }
 }
 
+// ── Idempotency Cache ───────────────────────────────────────────
+
+/// Maximum entries before LRU eviction.
+const IDEM_MAX_ITEMS: usize = 1000;
+/// TTL in seconds for idempotency cache entries.
+const IDEM_TTL_SECS: u64 = 300;
+
+/// In-memory idempotency cache with TTL and LRU eviction.
+/// Mirrors Python `_IdempotencyCache`.
+#[derive(Default)]
+struct IdempotencyCache {
+    store: HashMap<String, IdempotencyEntry>,
+    /// Insertion order for LRU eviction (oldest first).
+    order: std::collections::VecDeque<String>,
+}
+
+struct IdempotencyEntry {
+    response: serde_json::Value,
+    fingerprint: String,
+    timestamp: std::time::Instant,
+}
+
+impl IdempotencyCache {
+    fn purge(&mut self) {
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(IDEM_TTL_SECS);
+        // Remove expired
+        self.store.retain(|_, v| now.duration_since(v.timestamp) <= ttl);
+        // Remove expired from order
+        while let Some(front) = self.order.front() {
+            if self.store.contains_key(front) {
+                break;
+            }
+            self.order.pop_front();
+        }
+        // LRU eviction — keep only max items
+        while self.store.len() > IDEM_MAX_ITEMS {
+            if let Some(k) = self.order.pop_front() {
+                self.store.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get(&mut self, key: &str, fingerprint: &str) -> Option<serde_json::Value> {
+        self.purge();
+        self.store.get(key).and_then(|entry| {
+            if entry.fingerprint == fingerprint {
+                Some(entry.response.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set(&mut self, key: String, fingerprint: String, response: serde_json::Value) {
+        self.purge();
+        self.order.push_back(key.clone());
+        self.store.insert(key, IdempotencyEntry {
+            response,
+            fingerprint,
+            timestamp: std::time::Instant::now(),
+        });
+    }
+}
+
+static IDEMPOTENCY_CACHE: LazyLock<std::sync::Mutex<IdempotencyCache>> =
+    LazyLock::new(|| std::sync::Mutex::new(IdempotencyCache::default()));
+
+/// Compute a SHA-256 fingerprint of selected request fields.
+fn make_request_fingerprint(data: &serde_json::Value, keys: &[&str]) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    for &key in keys {
+        if let Some(v) = data.get(key) {
+            hasher.update(key.as_bytes());
+            hasher.update(serde_json::to_string(v).unwrap_or_default().as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
 // ── Run Streams ─────────────────────────────────────────────────
 
 /// Maximum concurrent runs.
@@ -511,7 +594,7 @@ impl RunStreamStore {
 }
 
 /// OpenAI Responses API response data.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseData {
     pub id: String,
     pub object: String,
@@ -615,7 +698,7 @@ pub struct SseOutputItem {
     pub output: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputItem {
     #[serde(rename = "type")]
     pub item_type: String,
@@ -633,7 +716,7 @@ pub struct OutputItem {
     pub output: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentPart {
     #[serde(rename = "type")]
     pub part_type: String,
@@ -641,7 +724,7 @@ pub struct ContentPart {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseUsage {
     pub input_tokens: usize,
     pub output_tokens: usize,
@@ -854,6 +937,22 @@ async fn chat_completions_handler(
         }
     }
 
+    // Idempotency check for non-streaming requests
+    if !request.stream {
+        if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+            // Re-serialize request for fingerprinting
+            let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+            let fp = make_request_fingerprint(&request_json, &["model", "messages", "tools", "tool_choice", "stream"]);
+            let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+            if let Some(cached) = cache.get(idem_key, &fp) {
+                if let Ok(resp) = serde_json::from_value::<ChatCompletionResponse>(cached) {
+                    let session_id = resp.id.clone();
+                    return Ok(SseOrJson::Json(Json(resp), session_id));
+                }
+            }
+        }
+    }
+
     // Extract the last user message
     let user_message = request
         .messages
@@ -877,6 +976,7 @@ async fn chat_completions_handler(
 
     let session_id = request
         .session_id
+        .clone()
         .or(stored_session_id)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -922,7 +1022,7 @@ async fn chat_completions_handler(
         Ok(SseOrJson::Sse(build_sse_stream(chat_id, model, created, response), session_id))
     } else {
         // Non-streaming mode
-        Ok(SseOrJson::Json(Json(ChatCompletionResponse {
+        let resp = ChatCompletionResponse {
             id: chat_id,
             object: "chat.completion".to_string(),
             created,
@@ -940,7 +1040,19 @@ async fn chat_completions_handler(
                 completion_tokens: 0,
                 total_tokens: 0,
             },
-        }), session_id))
+        };
+
+        // Cache response for idempotency
+        if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+            let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+            let fp = make_request_fingerprint(&request_json, &["model", "messages", "tools", "tool_choice", "stream"]);
+            if let Ok(json) = serde_json::to_value(&resp) {
+                let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+                cache.set(idem_key.to_string(), fp, json);
+            }
+        }
+
+        Ok(SseOrJson::Json(Json(resp), session_id))
     }
 }
 
@@ -1053,6 +1165,20 @@ async fn responses_handler(
     let session_id = stored_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let store_response = request.store.unwrap_or(true);
 
+    // Idempotency check for non-streaming requests
+    if !request.stream.unwrap_or(false) {
+        if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+            let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+            let fp = make_request_fingerprint(&request_json, &["input", "instructions", "previous_response_id", "conversation", "model", "tools"]);
+            let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+            if let Some(cached) = cache.get(idem_key, &fp) {
+                if let Ok(resp) = serde_json::from_value::<ResponseData>(cached) {
+                    return Ok(ResponsesResponse::Json(Json(resp)));
+                }
+            }
+        }
+    }
+
     // Call the agent handler
     let handler_guard = state.handler.lock().await;
     let Some(handler) = handler_guard.as_ref() else {
@@ -1100,7 +1226,7 @@ async fn responses_handler(
         let mut full_history = conversation_history;
         full_history.push(HistoryMessage {
             role: "user".to_string(),
-            content: user_message,
+            content: user_message.clone(),
         });
         full_history.push(HistoryMessage {
             role: "assistant".to_string(),
@@ -1118,6 +1244,16 @@ async fn responses_handler(
         // Update conversation mapping
         if let Some(ref conv) = request.conversation {
             store.set_conversation(conv.clone(), response_id);
+        }
+    }
+
+    // Cache response for idempotency (non-streaming only)
+    if let Some(idem_key) = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+        let request_json = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
+        let fp = make_request_fingerprint(&request_json, &["input", "instructions", "previous_response_id", "conversation", "model", "tools"]);
+        if let Ok(json) = serde_json::to_value(&response_data) {
+            let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+            cache.set(idem_key.to_string(), fp, json);
         }
     }
 
