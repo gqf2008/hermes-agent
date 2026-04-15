@@ -226,6 +226,59 @@ pub struct Usage {
     pub total_tokens: usize,
 }
 
+/// OpenAI-style error envelope. Mirrors Python `_openai_error`.
+#[derive(Debug, Serialize)]
+pub struct OpenAIError {
+    pub error: OpenAIErrorInner,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenAIErrorInner {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "type")]
+    pub error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+}
+
+/// Helper to construct OpenAI error responses.
+fn openai_error(message: &str, code: Option<&str>, error_type: Option<&str>) -> Json<OpenAIError> {
+    Json(OpenAIError {
+        error: OpenAIErrorInner {
+            message: message.to_string(),
+            code: code.map(String::from),
+            error_type: error_type.map(String::from),
+            param: None,
+        },
+    })
+}
+
+/// Result type for API handlers with structured error responses.
+type ApiResult<T> = Result<T, (StatusCode, Json<OpenAIError>)>;
+
+fn unauthorized_error() -> (StatusCode, Json<OpenAIError>) {
+    (StatusCode::UNAUTHORIZED, openai_error("Invalid API key", Some("invalid_api_key"), Some("invalid_request_error")))
+}
+
+fn bad_request_error(message: &str) -> (StatusCode, Json<OpenAIError>) {
+    (StatusCode::BAD_REQUEST, openai_error(message, None, Some("invalid_request_error")))
+}
+
+fn not_found_error(message: &str) -> (StatusCode, Json<OpenAIError>) {
+    (StatusCode::NOT_FOUND, openai_error(message, Some("resource_missing"), Some("not_found")))
+}
+
+fn service_unavailable_error() -> (StatusCode, Json<OpenAIError>) {
+    (StatusCode::SERVICE_UNAVAILABLE, openai_error("No message handler registered", Some("service_unavailable"), Some("server_error")))
+}
+
+fn internal_server_error(message: &str) -> (StatusCode, Json<OpenAIError>) {
+    (StatusCode::INTERNAL_SERVER_ERROR, openai_error(message, None, Some("server_error")))
+}
+
 /// Response store entry — holds full response object for Responses API
 /// chaining / GET retrieval. Mirrors Python ResponseStore class.
 #[derive(Debug, Clone)]
@@ -723,7 +776,7 @@ async fn chat_completions_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
-) -> Result<SseOrJson, (StatusCode, String)> {
+) -> ApiResult<SseOrJson> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -731,7 +784,7 @@ async fn chat_completions_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth != format!("Bearer {}", state.api_key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+            return Err(unauthorized_error());
         }
     }
 
@@ -745,7 +798,7 @@ async fn chat_completions_handler(
         .unwrap_or_default();
 
     if user_message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No user message found".to_string()));
+        return Err(bad_request_error("No user message found"));
     }
 
     // Determine session ID — chain from previous_response_id if available.
@@ -764,10 +817,7 @@ async fn chat_completions_handler(
     // Call the agent handler
     let handler_guard = state.handler.lock().await;
     let Some(handler) = handler_guard.as_ref() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No message handler registered".to_string(),
-        ));
+        return Err(service_unavailable_error());
     };
 
     let result = handler
@@ -779,10 +829,7 @@ async fn chat_completions_handler(
         .await
         .map_err(|e| {
             error!("Agent handler failed for API request: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Agent handler error: {e}"),
-            )
+            internal_server_error(&format!("Agent handler error: {e}"))
         })?;
 
     let response = result.response;
@@ -799,14 +846,14 @@ async fn chat_completions_handler(
             response_data: None,
             conversation_history: vec![],
             instructions: None,
-            session_id,
+            session_id: session_id.clone(),
             conversation: None,
         });
     }
 
     if request.stream {
         // Streaming mode: emit SSE events
-        Ok(SseOrJson::Sse(build_sse_stream(chat_id, model, created, response)))
+        Ok(SseOrJson::Sse(build_sse_stream(chat_id, model, created, response), session_id))
     } else {
         // Non-streaming mode
         Ok(SseOrJson::Json(Json(ChatCompletionResponse {
@@ -827,7 +874,7 @@ async fn chat_completions_handler(
                 completion_tokens: 0,
                 total_tokens: 0,
             },
-        })))
+        }), session_id))
     }
 }
 
@@ -857,7 +904,7 @@ async fn responses_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Json(request): Json<ResponsesRequest>,
-) -> Result<ResponsesResponse, (StatusCode, String)> {
+) -> ApiResult<ResponsesResponse> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -865,20 +912,17 @@ async fn responses_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth != format!("Bearer {}", state.api_key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+            return Err(unauthorized_error());
         }
     }
 
     // Normalize input to message list
     let input_messages = normalize_responses_input(&request.input)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        .map_err(|e| bad_request_error(&e))?;
 
     // conversation and previous_response_id are mutually exclusive
     if request.conversation.is_some() && request.previous_response_id.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Cannot use both 'conversation' and 'previous_response_id'".to_string(),
-        ));
+        return Err(bad_request_error("Cannot use both 'conversation' and 'previous_response_id'"));
     }
 
     // Resolve conversation name to latest response_id
@@ -911,10 +955,7 @@ async fn responses_handler(
             stored_session_id = Some(stored.session_id.clone());
             stored_instructions = stored.instructions.clone();
         } else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("Previous response not found: {}", prev_resp_id),
-            ));
+            return Err(not_found_error(&format!("Previous response not found: {}", prev_resp_id)));
         }
     }
 
@@ -934,7 +975,7 @@ async fn responses_handler(
         .unwrap_or_default();
 
     if user_message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No user message found in input".to_string()));
+        return Err(bad_request_error("No user message found in input"));
     }
 
     // Truncation support: auto-truncate to last 100 messages
@@ -949,10 +990,7 @@ async fn responses_handler(
     // Call the agent handler
     let handler_guard = state.handler.lock().await;
     let Some(handler) = handler_guard.as_ref() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No message handler registered".to_string(),
-        ));
+        return Err(service_unavailable_error());
     };
 
     let result = handler
@@ -964,10 +1002,7 @@ async fn responses_handler(
         .await
         .map_err(|e| {
             error!("Agent handler failed for responses request: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Agent handler error: {e}"),
-            )
+            internal_server_error(&format!("Agent handler error: {e}"))
         })?;
 
     let response_text = result.response;
@@ -1052,16 +1087,13 @@ async fn responses_stream_handler(
     state: ApiServerState,
     _api_key: &str,
     request: ResponsesRequest,
-) -> Result<Sse<SseResponsesStreamType>, (StatusCode, String)> {
+) -> ApiResult<Sse<SseResponsesStreamType>> {
     // Reuse the same setup logic as batch mode
     let input_messages = normalize_responses_input(&request.input)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        .map_err(|e| bad_request_error(&e))?;
 
     if request.conversation.is_some() && request.previous_response_id.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Cannot use both 'conversation' and 'previous_response_id'".to_string(),
-        ));
+        return Err(bad_request_error("Cannot use both 'conversation' and 'previous_response_id'"));
     }
 
     let mut prev_id = request.previous_response_id.clone();
@@ -1090,10 +1122,7 @@ async fn responses_stream_handler(
             stored_session_id = Some(stored.session_id.clone());
             stored_instructions = stored.instructions.clone();
         } else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("Previous response not found: {}", prev_resp_id),
-            ));
+            return Err(not_found_error(&format!("Previous response not found: {}", prev_resp_id)));
         }
     }
 
@@ -1110,7 +1139,7 @@ async fn responses_stream_handler(
         .unwrap_or_default();
 
     if user_message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No user message found in input".to_string()));
+        return Err(bad_request_error("No user message found in input"));
     }
 
     if request.truncation.as_deref() == Some("auto") && conversation_history.len() > 100 {
@@ -1392,7 +1421,7 @@ async fn get_response_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Path(response_id): Path<String>,
-) -> Result<Json<ResponseData>, (StatusCode, String)> {
+) -> ApiResult<Json<ResponseData>> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -1400,23 +1429,17 @@ async fn get_response_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth != format!("Bearer {}", state.api_key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+            return Err(unauthorized_error());
         }
     }
 
     let store = RESPONSE_STORE.lock().unwrap();
     let Some(entry) = store.get(&response_id) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("Response not found: {}", response_id),
-        ));
+        return Err(not_found_error(&format!("Response not found: {}", response_id)));
     };
 
     let Some(ref data) = entry.response_data else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("Response data not available for: {}", response_id),
-        ));
+        return Err(not_found_error(&format!("Response data not available for: {}", response_id)));
     };
 
     Ok(Json(data.clone()))
@@ -1427,7 +1450,7 @@ async fn delete_response_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Path(response_id): Path<String>,
-) -> Result<Json<DeleteResponseResult>, (StatusCode, String)> {
+) -> ApiResult<Json<DeleteResponseResult>> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -1435,16 +1458,13 @@ async fn delete_response_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth != format!("Bearer {}", state.api_key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+            return Err(unauthorized_error());
         }
     }
 
     let deleted = RESPONSE_STORE.lock().unwrap().delete(&response_id);
     if !deleted {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("Response not found: {}", response_id),
-        ));
+        return Err(not_found_error(&format!("Response not found: {}", response_id)));
     }
 
     Ok(Json(DeleteResponseResult {
@@ -1471,7 +1491,7 @@ async fn runs_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> Result<(StatusCode, Json<RunStartResponse>), (StatusCode, String)> {
+) -> ApiResult<(StatusCode, Json<RunStartResponse>)> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -1479,7 +1499,7 @@ async fn runs_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth != format!("Bearer {}", state.api_key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+            return Err(unauthorized_error());
         }
     }
 
@@ -1489,14 +1509,14 @@ async fn runs_handler(
         if store.len() >= MAX_CONCURRENT_RUNS {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("Too many concurrent runs (max {})", MAX_CONCURRENT_RUNS),
+                openai_error(&format!("Too many concurrent runs (max {})", MAX_CONCURRENT_RUNS), Some("rate_limit_exceeded"), Some("server_error")),
             ));
         }
     }
 
     let raw_input = request.get("input").cloned().unwrap_or(serde_json::Value::Null);
     if raw_input.is_null() {
-        return Err((StatusCode::BAD_REQUEST, "Missing 'input' field".to_string()));
+        return Err(bad_request_error("Missing 'input' field"));
     }
 
     // Normalize input to extract user_message and conversation_history
@@ -1521,7 +1541,7 @@ async fn runs_handler(
     };
 
     if user_message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No user message found in input".to_string()));
+        return Err(bad_request_error("No user message found in input"));
     }
 
     let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
@@ -1679,7 +1699,7 @@ async fn run_events_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
-) -> Result<Sse<SseRunStreamType>, (StatusCode, String)> {
+) -> ApiResult<Sse<SseRunStreamType>> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -1687,7 +1707,7 @@ async fn run_events_handler(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if auth != format!("Bearer {}", state.api_key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+            return Err(unauthorized_error());
         }
     }
 
@@ -1709,10 +1729,7 @@ async fn run_events_handler(
     };
 
     let Some(tx) = tx else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("Run not found: {}", run_id),
-        ));
+        return Err(not_found_error(&format!("Run not found: {}", run_id)));
     };
 
     let stream = build_run_sse_stream(tx, run_id);
@@ -1846,16 +1863,28 @@ type SseStreamType = Pin<Box<dyn Stream<Item = Result<axum::response::sse::Event
 
 /// Union type for streaming or non-streaming response.
 enum SseOrJson {
-    Sse(Sse<SseStreamType>),
-    Json(Json<ChatCompletionResponse>),
+    Sse(Sse<SseStreamType>, String),
+    Json(Json<ChatCompletionResponse>, String),
 }
 
 #[async_trait::async_trait]
 impl axum::response::IntoResponse for SseOrJson {
     fn into_response(self) -> axum::response::Response {
         match self {
-            SseOrJson::Sse(sse) => sse.into_response(),
-            SseOrJson::Json(json) => json.into_response(),
+            SseOrJson::Sse(sse, session_id) => {
+                let mut resp = sse.into_response();
+                if let Ok(val) = axum::http::HeaderValue::from_str(&session_id) {
+                    resp.headers_mut().insert("X-Hermes-Session-Id", val);
+                }
+                resp
+            }
+            SseOrJson::Json(json, session_id) => {
+                let mut resp = json.into_response();
+                if let Ok(val) = axum::http::HeaderValue::from_str(&session_id) {
+                    resp.headers_mut().insert("X-Hermes-Session-Id", val);
+                }
+                resp
+            }
         }
     }
 }
