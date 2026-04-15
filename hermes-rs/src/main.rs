@@ -191,7 +191,14 @@ enum Commands {
         action: Option<AuthAction>,
     },
     /// Show status of all components
-    Status,
+    Status {
+        /// Show all redacted details
+        #[arg(long)]
+        all: bool,
+        /// Run deep checks (slower)
+        #[arg(long)]
+        deep: bool,
+    },
     /// Show session analytics and insights
     Insights,
     /// Generate shell completion script
@@ -305,7 +312,20 @@ enum Commands {
         force: bool,
     },
     /// Interactive analytics dashboard
-    Dashboard,
+    Dashboard {
+        /// Port to listen on
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Don't auto-open browser
+        #[arg(long)]
+        no_open: bool,
+        /// Disable HTTPS redirect (testing)
+        #[arg(long)]
+        insecure: bool,
+    },
     /// Configure WhatsApp Cloud API
     WhatsApp {
         /// Action: setup, connect, status
@@ -793,6 +813,17 @@ enum SessionAction {
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
     },
+    /// Export sessions to JSONL
+    Export {
+        /// Output file path (use - for stdout)
+        path: String,
+        /// Filter by source
+        #[arg(short, long)]
+        source: Option<String>,
+        /// Export a specific session by ID
+        #[arg(long)]
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1256,6 +1287,9 @@ fn main() -> anyhow::Result<()> {
                 Some(SessionAction::Browse { source, limit }) => {
                     hermes_cli::sessions_cmd::cmd_sessions_list(&db, limit, source.as_deref(), true)?;
                 }
+                Some(SessionAction::Export { path, source, session_id }) => {
+                    hermes_cli::sessions_cmd::cmd_sessions_export(&db, &path, source.as_deref(), session_id.as_deref())?;
+                }
                 None => {
                     hermes_cli::sessions_cmd::cmd_sessions_list(&db, 20, None, false)?;
                 }
@@ -1379,8 +1413,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Commands::Status) => {
-            hermes_cli::status_cmd::cmd_status()?;
+        Some(Commands::Status { all, deep }) => {
+            hermes_cli::status_cmd::cmd_status(all, deep)?;
         }
         Some(Commands::Insights) => {
             hermes_cli::insights_cmd::cmd_insights()?;
@@ -1525,8 +1559,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Uninstall { keep_data, keep_config, force }) => {
             hermes_cli::uninstall_cmd::cmd_uninstall(keep_data, keep_config, force)?;
         }
-        Some(Commands::Dashboard) => {
-            hermes_cli::dashboard_cmd::cmd_dashboard()?;
+        Some(Commands::Dashboard { port, host, no_open, insecure }) => {
+            hermes_cli::dashboard_cmd::cmd_dashboard_with_opts(&host, port, no_open, insecure)?;
         }
         Some(Commands::WhatsApp { action, token, phone_id }) => {
             hermes_cli::whatsapp_cmd::cmd_whatsapp(&action, token.as_deref(), phone_id.as_deref())?;

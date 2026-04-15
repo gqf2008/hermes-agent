@@ -20,7 +20,7 @@ fn yellow() -> Style { Style::new().yellow() }
 fn red() -> Style { Style::new().red() }
 
 /// Show status of all Hermes components.
-pub fn cmd_status() -> anyhow::Result<()> {
+pub fn cmd_status(_all: bool, _deep: bool) -> anyhow::Result<()> {
     let home = get_hermes_home();
 
     println!();
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn test_status_runs_without_errors() {
         // Should not panic even without HERMES_HOME
-        let result = cmd_status();
+        let result = cmd_status(false, false);
         assert!(result.is_ok());
     }
 }

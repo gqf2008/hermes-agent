@@ -22,6 +22,11 @@ fn get_hermes_home() -> PathBuf {
 
 /// Show interactive dashboard.
 pub fn cmd_dashboard() -> anyhow::Result<()> {
+    cmd_dashboard_with_opts("127.0.0.1", 8080, false, false)
+}
+
+/// Show interactive dashboard with custom options.
+pub fn cmd_dashboard_with_opts(host: &str, port: u16, no_open: bool, _insecure: bool) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ Hermes Dashboard"));
     println!();

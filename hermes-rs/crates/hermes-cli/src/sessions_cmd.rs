@@ -56,30 +56,55 @@ pub fn cmd_sessions_list(
     Ok(())
 }
 
-/// Export a session to JSON.
+/// Export sessions to JSONL.
 pub fn cmd_sessions_export(
     db: &SessionDB,
-    session_id: &str,
-    output: Option<&str>,
+    path: &str,
+    source: Option<&str>,
+    session_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Try prefix resolution first
-    let resolved = db.resolve_session_id(session_id)?;
-    let sid = resolved.as_deref().unwrap_or(session_id);
-
-    let export = db.export_session(sid)?;
-    match export {
-        Some(data) => {
+    // Single session export
+    if let Some(sid) = session_id {
+        let resolved = db.resolve_session_id(sid)?;
+        let sid = resolved.as_deref().unwrap_or(sid);
+        let export = db.export_session(sid)?;
+        if let Some(data) = export {
             let json = serde_json::to_string_pretty(&data)?;
-            if let Some(path) = output {
-                std::fs::write(path, json)?;
-                println!("Exported session {} to {}", style(sid).cyan(), style(path).green());
-            } else {
+            if path == "-" {
                 println!("{json}");
+            } else {
+                std::fs::write(path, json)?;
+                println!("Exported session {sid} to {path}");
             }
+        } else {
+            println!("Session {sid} not found.");
         }
-        None => {
-            println!("{}", style(format!("Session {} not found.", sid)).red());
-        }
+        return Ok(());
+    }
+
+    // Bulk export with optional source filter
+    let sessions = db.list_sessions_rich(source, None, 10000, 0, false)?;
+    let output: Vec<_> = sessions.iter().map(|s| {
+        serde_json::json!({
+            "id": s.session.id,
+            "title": s.session.title,
+            "source": s.session.source,
+            "created_at": s.session.started_at,
+            "input_tokens": s.session.input_tokens,
+            "output_tokens": s.session.output_tokens,
+        })
+    }).collect();
+
+    let jsonl: String = output.iter()
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if path == "-" {
+        println!("{jsonl}");
+    } else {
+        std::fs::write(path, jsonl)?;
+        println!("Exported {} sessions to {path}", output.len());
     }
     Ok(())
 }
@@ -283,7 +308,7 @@ mod tests {
     #[test]
     fn test_export_not_found() {
         let db = SessionDB::open(":memory:").unwrap();
-        let result = cmd_sessions_export(&db, "nonexistent", None);
+        let result = cmd_sessions_export(&db, "/tmp/test.jsonl", None, Some("nonexistent"));
         assert!(result.is_ok());
     }
 

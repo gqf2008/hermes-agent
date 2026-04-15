@@ -1,0 +1,44 @@
+[
+  {
+    "id": "read-py-core",
+    "content": "Read Python run_agent.py core conversation loop structure",
+    "status": "completed",
+    "priority": "high"
+  },
+  {
+    "id": "read-rs-core",
+    "content": "Read Rust agent.rs core conversation loop structure",
+    "status": "completed",
+    "priority": "high"
+  },
+  {
+    "id": "compare-self-improvement",
+    "content": "Compare self-improvement mechanisms (nudge + background review)",
+    "status": "completed",
+    "priority": "high"
+  },
+  {
+    "id": "compare-fuzzy-match",
+    "content": "Compare fuzzy match implementation",
+    "status": "completed",
+    "priority": "high"
+  },
+  {
+    "id": "compare-memory",
+    "content": "Compare memory system implementation",
+    "status": "completed",
+    "priority": "high"
+  },
+  {
+    "id": "compare-architecture",
+    "content": "Compare architecture (monolithic vs modular)",
+    "status": "completed",
+    "priority": "high"
+  },
+  {
+    "id": "write-report",
+    "content": "Write comparison document",
+    "status": "completed",
+    "priority": "high"
+  }
+]

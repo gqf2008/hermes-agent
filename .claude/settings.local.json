@@ -1,0 +1,66 @@
+{
+  "api_key": null,
+  "model": null,
+  "permission_mode": null,
+  "allowed_tools": [],
+  "denied_tools": [],
+  "custom_system_prompt": null,
+  "append_system_prompt": null,
+  "permission_rules": [
+    {
+      "tool_name": "Git",
+      "pattern": null,
+      "behavior": "Allow"
+    },
+    {
+      "tool_name": "TodoWrite",
+      "pattern": null,
+      "behavior": "Allow"
+    },
+    {
+      "tool_name": "Write",
+      "pattern": null,
+      "behavior": "Allow"
+    },
+    {
+      "tool_name": "Agent",
+      "pattern": null,
+      "behavior": "Allow"
+    }
+  ],
+  "hooks": {
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "PostToolUseFailure": [],
+    "Stop": [],
+    "StopFailure": [],
+    "UserPromptSubmit": [],
+    "SessionStart": [],
+    "SessionEnd": [],
+    "Setup": [],
+    "PreCompact": [],
+    "PostCompact": [],
+    "SubagentStart": [],
+    "SubagentStop": [],
+    "Notification": [],
+    "PostSampling": [],
+    "PermissionRequest": [],
+    "PermissionDenied": [],
+    "InstructionsLoaded": [],
+    "CwdChanged": [],
+    "FileChanged": [],
+    "ConfigChange": [],
+    "TaskCreated": [],
+    "TaskCompleted": [],
+    "TeammateIdle": [],
+    "Elicitation": [],
+    "ElicitationResult": [],
+    "WorktreeCreate": [],
+    "WorktreeRemove": []
+  },
+  "language": null,
+  "output_style": null,
+  "env": {},
+  "autoMode": null,
+  "theme": null
+}
