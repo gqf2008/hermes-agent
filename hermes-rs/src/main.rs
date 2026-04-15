@@ -20,6 +20,10 @@ struct Cli {
     /// Hermes home directory override (profiles)
     #[arg(long, global = true)]
     hermes_home: Option<String>,
+
+    /// Profile name (resolves HERMES_HOME before subcommands)
+    #[arg(short = 'p', long, global = true)]
+    profile: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -960,6 +964,11 @@ fn main() -> anyhow::Result<()> {
     // Set Hermes home if provided
     if let Some(home) = cli.hermes_home {
         hermes_core::hermes_home::set_hermes_home(&home)
+            .ok();
+    } else if let Some(profile) = cli.profile {
+        // Resolve profile name to path and set as HERMES_HOME
+        let profile_path = hermes_core::hermes_home::resolve_profile_path(&profile);
+        hermes_core::hermes_home::set_hermes_home(&profile_path)
             .ok();
     }
 

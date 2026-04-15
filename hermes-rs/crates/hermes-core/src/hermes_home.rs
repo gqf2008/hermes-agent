@@ -64,6 +64,24 @@ pub fn get_default_hermes_root() -> PathBuf {
     get_hermes_home()
 }
 
+/// Resolve a profile name to its HERMES_HOME directory path.
+///
+/// Mirrors Python `get_profile_dir()`:
+/// - `"default"` → `get_hermes_home()`
+/// - Any other name → `<profiles_root>/<name>`
+///
+/// Profiles root is `default_hermes_home() / "profiles"`.
+/// In Docker/custom deployments where HERMES_HOME is already set to a
+/// non-default path, profiles live under that path so they persist on
+/// the mounted volume.
+pub fn resolve_profile_path(name: &str) -> PathBuf {
+    if name == "default" {
+        return get_hermes_home();
+    }
+    let profiles_root = get_default_hermes_root().join("profiles");
+    profiles_root.join(name)
+}
+
 /// Backward-compatible path resolution.
 ///
 /// Checks for old migration paths and returns the first one that exists.
