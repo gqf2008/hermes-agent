@@ -219,14 +219,19 @@ fn save_permanent_allowlist() {
     let allowlist_path = path.join(".approval_allowlist.json");
     let list: Vec<String> = PERMANENT_ALLOWLIST.lock().iter().cloned().collect();
     if let Ok(json) = serde_json::to_string_pretty(&list) {
+        // Ensure directory exists
+        let _ = std::fs::create_dir_all(&path);
         // Write to temp file first, then atomically rename
         let tmp_path = path.join(".approval_allowlist.json.tmp");
-        if std::fs::write(&tmp_path, json).is_ok() {
-            // On Windows, rename over existing file fails, so remove first
-            if allowlist_path.exists() {
-                let _ = std::fs::remove_file(&allowlist_path);
-            }
-            let _ = std::fs::rename(&tmp_path, &allowlist_path);
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            tracing::warn!("Failed to write allowlist temp file: {e}");
+            return;
+        }
+        // std::fs::rename overwrites the destination on all platforms
+        if let Err(e) = std::fs::rename(&tmp_path, &allowlist_path) {
+            tracing::warn!("Failed to rename allowlist: {e}");
+            // Clean up temp file
+            let _ = std::fs::remove_file(&tmp_path);
         }
     }
 }

@@ -467,6 +467,8 @@ impl AIAgent {
         let mut truncated_response_prefix = String::new();
         let mut compression_attempts: u32 = 0;
         let max_compression_attempts: u32 = 3;
+        // Post-tool empty response nudge — only nudge once per tool round.
+        let mut post_tool_empty_retried = false;
 
         // Self-evolution: increment turn counter, check memory nudge threshold
         let mut should_review_memory = false;
@@ -564,14 +566,38 @@ impl AIAgent {
                             }
 
                             // Not truncated or exceeded retries — treat as final
-                            if let Some(content) = response.get("content").and_then(Value::as_str) {
-                                if !truncated_response_prefix.is_empty() {
-                                    let mut full = truncated_response_prefix.clone();
-                                    full.push_str(content);
-                                    final_response = full;
-                                } else {
-                                    final_response = content.to_string();
-                                }
+                            // Post-tool empty response nudge (Python PR #9400):
+                            // Weaker models sometimes return empty after tool results
+                            // instead of continuing. Nudge once per tool round.
+                            let content = response.get("content").and_then(Value::as_str).unwrap_or("");
+                            let has_recent_tool_result = messages.iter().rev().take(5)
+                                .any(|m| m.get("role").and_then(Value::as_str) == Some("tool"));
+                            if content.is_empty() && has_recent_tool_result && !post_tool_empty_retried {
+                                post_tool_empty_retried = true;
+                                tracing::info!(
+                                    "Empty response after tool calls — nudging model to continue"
+                                );
+                                // Append the empty assistant message first so the
+                                // message sequence stays valid: tool(result) → assistant("(empty)") → user(nudge)
+                                messages.push(serde_json::json!({
+                                    "role": "assistant",
+                                    "content": "(empty)"
+                                }));
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": "You just executed tool calls but returned an \
+                                    empty response. Please process the tool \
+                                    results above and continue with the task."
+                                }));
+                                continue;
+                            }
+
+                            if !truncated_response_prefix.is_empty() {
+                                let mut full = truncated_response_prefix.clone();
+                                full.push_str(content);
+                                final_response = full;
+                            } else {
+                                final_response = content.to_string();
                             }
                             exit_reason = "completed".to_string();
                             messages.push(response);
@@ -625,13 +651,23 @@ impl AIAgent {
                                 // Rebuild system prompt after compression
                                 self.cached_system_prompt = None;
                                 let _ = self.build_system_prompt(system_message);
-                                // Fallback compression resets the retry counter
+                                // Compression resets retry counters so the model
+                                // gets a fresh budget on the compressed context.
+                                // Without this, pre-compression retries carry over
+                                // and the model hits errors immediately after
+                                // compression-induced context loss.
                                 compression_attempts = 0;
+                                length_continue_retries = 0;
+                                truncated_response_prefix.clear();
+                                truncated_retry = false;
                             }
                         }
 
                         // Self-evolution: increment iteration counter after each tool-calling iteration
                         self.iters_since_skill += 1;
+                        // Successful tool execution — reset the post-tool nudge flag
+                        // so it can fire again if the model goes empty on a later tool round.
+                        post_tool_empty_retried = false;
                     } else {
                         // No tool_calls key in response — check content
                         let is_length_truncated = response.get("finish_reason")

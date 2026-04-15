@@ -95,6 +95,10 @@ pub struct ContextCompressor {
     last_completion_tokens: usize,
     previous_summary: Option<String>,
     summary_failure_cooldown_until: Option<f64>,
+    /// Anti-thrashing: track whether last compression was effective.
+    last_compression_savings_pct: f64,
+    /// Anti-thrashing: count of consecutive ineffective compressions.
+    ineffective_compression_count: usize,
 }
 
 impl ContextCompressor {
@@ -120,6 +124,8 @@ impl ContextCompressor {
             last_completion_tokens: 0,
             previous_summary: None,
             summary_failure_cooldown_until: None,
+            last_compression_savings_pct: 100.0,
+            ineffective_compression_count: 0,
         }
     }
 
@@ -130,9 +136,28 @@ impl ContextCompressor {
     }
 
     /// Check if context exceeds the compression threshold.
+    ///
+    /// Includes anti-thrashing protection: if the last two compressions
+    /// each saved less than 10%, skip compression to avoid infinite loops
+    /// where each pass removes only 1-2 messages.
     pub fn should_compress(&self, prompt_tokens: Option<usize>) -> bool {
         let tokens = prompt_tokens.unwrap_or(self.last_prompt_tokens);
-        tokens >= self.threshold_tokens
+        if tokens < self.threshold_tokens {
+            return false;
+        }
+        // Anti-thrashing: back off if recent compressions were ineffective
+        if self.ineffective_compression_count >= 2 {
+            if !self.config.quiet_mode {
+                tracing::warn!(
+                    "Compression skipped — last {} compressions saved <10% each. \
+                    Consider /new to start a fresh session, or /compress <topic> \
+                    for focused compression.",
+                    self.ineffective_compression_count
+                );
+            }
+            return false;
+        }
+        true
     }
 
     /// Compress conversation messages by summarizing middle turns.
@@ -285,19 +310,38 @@ impl ContextCompressor {
         if !self.config.quiet_mode {
             let new_estimate = estimate_messages_tokens(&compressed);
             let saved = display_tokens.saturating_sub(new_estimate);
+            let savings_pct = if display_tokens > 0 {
+                (saved as f64 / display_tokens as f64) * 100.0
+            } else {
+                100.0
+            };
             tracing::info!(
-                "Compressed: {} -> {} messages (~{} tokens saved)",
+                "Compressed: {} -> {} messages (~{} tokens saved, {:.1}% reduction)",
                 n_messages,
                 compressed.len(),
-                saved
+                saved,
+                savings_pct
             );
             tracing::info!("Compression #{} complete", self.compression_count);
+
+            // Anti-thrashing: track effectiveness
+            if savings_pct < 10.0 {
+                self.ineffective_compression_count += 1;
+            } else {
+                self.ineffective_compression_count = 0;
+            }
+            self.last_compression_savings_pct = savings_pct;
         }
 
         compressed
     }
 
     /// Prune old tool results (cheap pre-pass, no LLM call).
+    ///
+    /// Three passes:
+    /// 1. Deduplicate identical tool results (MD5 hash)
+    /// 2. Replace old tool outputs with informative 1-line summaries
+    /// 3. Truncate large tool_call arguments in assistant messages
     ///
     /// When `protect_tail_tokens` is Some, the boundary is determined by
     /// token budget rather than message count — messages are accumulated
@@ -316,27 +360,90 @@ impl ContextCompressor {
         let mut result: Vec<Value> = messages.to_vec();
         let mut pruned = 0;
 
+        // Build index: tool_call_id -> (tool_name, arguments_json)
+        let mut call_id_to_tool: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        for msg in &result {
+            if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tool_calls {
+                        if let Some(cid) = tc.get("id").and_then(Value::as_str) {
+                            let name = tc
+                                .get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                                .unwrap_or("unknown").to_string();
+                            let args = tc
+                                .get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str)
+                                .unwrap_or("").to_string();
+                            call_id_to_tool.insert(cid.to_string(), (name, args));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Determine the prune boundary
         let prune_boundary = if let Some(token_budget) = protect_tail_tokens {
-            // Token-budget path: walk backward from tail, accumulating tokens
-            // until budget is exceeded. Everything before is eligible.
             let mut accumulated = 0;
             let mut cut = messages.len();
+            let min_protect = protect_tail_count.min(messages.len().saturating_sub(1));
             for i in (0..messages.len()).rev() {
                 let content = messages[i].get("content").and_then(Value::as_str).unwrap_or("");
-                let msg_tokens = content.len() / CHARS_PER_TOKEN + 10;
-                accumulated += msg_tokens;
-                if accumulated > token_budget {
+                let mut msg_tokens = content.len() / CHARS_PER_TOKEN + 10;
+                if let Some(tool_calls) = messages[i].get("tool_calls").and_then(Value::as_array) {
+                    for tc in tool_calls {
+                        if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                            msg_tokens += args.len() / CHARS_PER_TOKEN;
+                        }
+                    }
+                }
+                if accumulated + msg_tokens > token_budget && (messages.len() - i) >= min_protect {
                     cut = i + 1;
                     break;
                 }
+                accumulated += msg_tokens;
             }
             // Ensure at least protect_tail_count messages are protected
-            cut.min(messages.len().saturating_sub(protect_tail_count))
+            cut.max(messages.len().saturating_sub(protect_tail_count))
         } else {
-            // Count-based path (original behavior)
             messages.len().saturating_sub(protect_tail_count)
         };
 
+        // Pass 1: Deduplicate identical tool results.
+        // When the same file is read multiple times, keep only the most recent
+        // full copy and replace older duplicates with a back-reference.
+        let mut content_hashes: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for i in (0..result.len()).rev() {
+            let msg = &result[i];
+            if msg.get("role").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+            // Skip multimodal content (list of content blocks)
+            if content.starts_with('[') {
+                continue;
+            }
+            if content.len() < 200 {
+                continue;
+            }
+            // Simple hash: first 12 hex chars of content length + first 50 chars checksum
+            let checksum: usize = content.chars().take(50).map(|c| c as usize).sum();
+            let h = format!("{:x}", content.len() ^ checksum);
+            let h = &h[..12.min(h.len())].to_string();
+            if content_hashes.contains_key(h) {
+                // This is an older duplicate — replace with back-reference
+                result[i] = serde_json::json!({
+                    "role": "tool",
+                    "content": "[Duplicate tool output — same content as a more recent call]",
+                    "tool_call_id": msg.get("tool_call_id").cloned().unwrap_or(Value::Null)
+                });
+                pruned += 1;
+            } else {
+                content_hashes.insert(h.to_string(), i);
+            }
+        }
+
+        // Pass 2: Replace old tool results with informative summaries
         for item in result.iter_mut().take(prune_boundary) {
             if item.get("role").and_then(Value::as_str) != Some("tool") {
                 continue;
@@ -345,9 +452,50 @@ impl ContextCompressor {
             if content.is_empty() || content == PRUNED_TOOL_PLACEHOLDER {
                 continue;
             }
+            if content.starts_with("[Duplicate tool output") {
+                continue;
+            }
             if content.len() > 200 {
-                item["content"] = Value::String(PRUNED_TOOL_PLACEHOLDER.to_string());
-                pruned += 1;
+                let call_id = item.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+                if let Some((tool_name, tool_args)) = call_id_to_tool.get(call_id) {
+                    let summary = summarize_tool_result(tool_name, tool_args, content);
+                    item["content"] = Value::String(summary);
+                    pruned += 1;
+                } else {
+                    item["content"] = Value::String(PRUNED_TOOL_PLACEHOLDER.to_string());
+                    pruned += 1;
+                }
+            }
+        }
+
+        // Pass 3: Truncate large tool_call arguments in assistant messages
+        // outside the protected tail. write_file with 50KB content, for
+        // example, survives pruning entirely without this.
+        for i in 0..prune_boundary.min(result.len()) {
+            let msg = &result[i];
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) else {
+                continue;
+            };
+            let mut modified = false;
+            let mut new_tcs: Vec<Value> = Vec::new();
+            for tc in tool_calls {
+                let mut tc = tc.clone();
+                if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+                    if let Some(args_str) = args.as_str() {
+                        if args_str.len() > 500 {
+                            let truncated = format!("{}...[truncated]", &args_str[..200]);
+                            *args = Value::String(truncated);
+                            modified = true;
+                        }
+                    }
+                }
+                new_tcs.push(tc);
+            }
+            if modified {
+                result[i]["tool_calls"] = Value::Array(new_tcs);
             }
         }
 
@@ -617,7 +765,7 @@ The focus topic sections should receive roughly 60-70% of the summary token budg
         };
 
         // Attempt to call the real LLM.
-        self.call_summary_llm(&prompt)
+        self.call_summary_llm(&prompt, summary_budget)
     }
 
     /// Call the LLM for summary generation.
@@ -625,7 +773,7 @@ The focus topic sections should receive roughly 60-70% of the summary token budg
     /// Uses `summary_model_override` if set, otherwise falls back to the
     /// compressor's main model. On success, stores the summary in
     /// `previous_summary` for iterative updates.
-    fn call_summary_llm(&mut self, prompt: &str) -> Option<String> {
+    fn call_summary_llm(&mut self, prompt: &str, summary_budget: usize) -> Option<String> {
         use hermes_llm::client::{call_llm, LlmRequest};
 
         // Determine summary model: override or main model
@@ -642,7 +790,7 @@ The focus topic sections should receive roughly 60-70% of the summary token budg
             })],
             tools: None,
             temperature: Some(0.3),
-            max_tokens: Some(self.max_summary_tokens * 2),
+            max_tokens: Some((summary_budget as f64 * 1.3) as usize),
             base_url: self.config.summary_base_url.clone(),
             api_key: self.config.summary_api_key.clone(),
             timeout_secs: Some(120),
@@ -768,6 +916,132 @@ The focus topic sections should receive roughly 60-70% of the summary token budg
     }
 }
 
+/// Create an informative 1-line summary of a tool call + result.
+///
+/// Used during the pre-compression pruning pass to replace large tool
+/// outputs with a short but useful description of what the tool did,
+/// rather than a generic placeholder that carries zero information.
+///
+/// Mirrors Python `_summarize_tool_result()`.
+fn summarize_tool_result(tool_name: &str, tool_args: &str, tool_content: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(tool_args)
+        .unwrap_or(serde_json::Value::Null);
+    let content_len = tool_content.len();
+    let line_count = tool_content.lines().count().max(1);
+
+    match tool_name {
+        "terminal" => {
+            let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+            let cmd_display = if cmd.len() > 80 {
+                format!("{}...", &cmd[..77])
+            } else {
+                cmd.to_string()
+            };
+            let exit_code = args.get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| {
+                    if tool_content.contains("\"exit_code\"") {
+                        serde_json::from_str::<serde_json::Value>(tool_content).ok()
+                            .and_then(|v| v.get("exit_code").and_then(Value::as_i64))
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    } else {
+                        "?".to_string()
+                    }
+                });
+            format!("[terminal] ran `{cmd_display}` -> exit {exit_code}, {line_count} lines output")
+        }
+        "read_file" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1);
+            format!("[read_file] read {path} from line {offset} ({content_len} chars)")
+        }
+        "write_file" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
+            let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+            let lines = content.lines().count();
+            format!("[write_file] wrote to {path} ({lines} lines)")
+        }
+        "search_files" => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("?");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let target = args.get("target").and_then(Value::as_str).unwrap_or("content");
+            let count = if tool_content.contains("\"total_count\"") {
+                serde_json::from_str::<serde_json::Value>(tool_content).ok()
+                    .and_then(|v| v.get("total_count").and_then(Value::as_u64))
+                    .map(|c| c.to_string())
+            } else {
+                None
+            }.unwrap_or_else(|| "?".to_string());
+            format!("[search_files] {target} search for '{pattern}' in {path} -> {count} matches")
+        }
+        "patch" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
+            let mode = args.get("mode").and_then(Value::as_str).unwrap_or("replace");
+            format!("[patch] {mode} in {path} ({content_len} chars result)")
+        }
+        "web_search" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("?");
+            format!("[web_search] query='{query}' ({content_len} chars result)")
+        }
+        "web_extract" => {
+            let urls = args.get("urls");
+            let url_desc = urls.and_then(|u| u.get(0)).and_then(Value::as_str).unwrap_or("?");
+            let more = urls.and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0);
+            let more_suffix = if more > 1 { format!(" (+{} more)", more - 1) } else { String::new() };
+            format!("[web_extract] {url_desc}{more_suffix} ({content_len} chars)")
+        }
+        "delegate_task" => {
+            let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+            let goal_display = if goal.len() > 60 {
+                format!("{}...", &goal[..57])
+            } else {
+                goal.to_string()
+            };
+            format!("[delegate_task] '{goal_display}' ({content_len} chars result)")
+        }
+        "execute_code" => {
+            let code = args.get("code").and_then(Value::as_str).unwrap_or("");
+            let code_preview = if code.len() > 60 {
+                format!("{}...", &code[..60])
+            } else {
+                code.to_string()
+            };
+            format!("[execute_code] `{code_preview}` ({line_count} lines output)")
+        }
+        "memory" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("?");
+            let target = args.get("target").and_then(Value::as_str).unwrap_or("?");
+            format!("[memory] {action} on {target}")
+        }
+        "cronjob" | "cron" => {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("?");
+            format!("[cronjob] {action}")
+        }
+        _ => {
+            let first_args: Vec<String> = if let Some(obj) = args.as_object() {
+                obj.iter().take(2).map(|(k, v)| {
+                    let sv = if v.is_string() {
+                        v.as_str().unwrap().chars().take(40).collect::<String>()
+                    } else {
+                        v.to_string().chars().take(40).collect::<String>()
+                    };
+                    format!("{k}={sv}")
+                }).collect()
+            } else {
+                Vec::new()
+            };
+            let args_str = if first_args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", first_args.join(" "))
+            };
+            format!("[{tool_name}]{args_str} ({content_len} chars result)")
+        }
+    }
+}
+
 /// Truncate content for summary input.
 fn truncate_content_for_summary(content: &str) -> String {
     const CONTENT_MAX: usize = 6000;
@@ -888,10 +1162,9 @@ mod tests {
         // With protect_tail_count=2, only the last 2 messages are protected
         // So the tool result at index 3 should be pruned
         assert_eq!(count, 1);
-        assert_eq!(
-            result[3].get("content").and_then(Value::as_str),
-            Some(PRUNED_TOOL_PLACEHOLDER)
-        );
+        // Should now contain an informative summary instead of a generic placeholder
+        let content = result[3].get("content").and_then(Value::as_str).unwrap_or("");
+        assert!(content.contains("[run]"), "expected informative summary, got: {content}");
     }
 
     #[test]

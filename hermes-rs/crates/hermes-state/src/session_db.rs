@@ -696,12 +696,31 @@ impl SessionDB {
                 return Ok(0);
             }
 
-            // Delete messages and sessions for each old session
-            for id in &ids {
-                conn.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
-                conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id=?1", params![id])?;
-                conn.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
+            // Use a transaction for atomic batch delete
+            let tx = conn.transaction()?;
+            let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            // Delete messages for all old sessions in one query
+            let sql = format!("DELETE FROM messages WHERE session_id IN ({})", placeholders);
+            {
+                let mut stmt = tx.prepare(&sql)?;
+                let id_params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                stmt.execute(rusqlite::params_from_iter(id_params))?;
             }
+            // Clear parent references
+            let sql2 = format!("UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id IN ({})", placeholders);
+            {
+                let mut stmt2 = tx.prepare(&sql2)?;
+                let id_params2: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                stmt2.execute(rusqlite::params_from_iter(id_params2))?;
+            }
+            // Delete sessions
+            let sql3 = format!("DELETE FROM sessions WHERE id IN ({})", placeholders);
+            {
+                let mut stmt3 = tx.prepare(&sql3)?;
+                let id_params3: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                stmt3.execute(rusqlite::params_from_iter(id_params3))?;
+            }
+            tx.commit()?;
 
             Ok(count)
         })

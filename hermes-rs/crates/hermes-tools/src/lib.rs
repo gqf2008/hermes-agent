@@ -102,4 +102,6 @@ pub fn register_all_tools(registry: &mut crate::registry::ToolRegistry) {
     let registry_arc = Arc::new(registry.clone());
     code_exec::register_code_exec_tool(registry, registry_arc);
     moa::register_moa_tool(registry);
+    // Load permanent allowlist from disk so it survives restarts
+    approval::load_permanent_allowlist();
 }
