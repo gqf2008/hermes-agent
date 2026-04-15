@@ -297,6 +297,10 @@ pub struct TurnResult {
     pub api_calls: usize,
     /// Exit reason.
     pub exit_reason: String,
+    /// Compression exhaustion flag — set when max compression attempts
+    /// were reached without resolving the context overflow. The caller
+    /// (e.g., gateway) should auto-reset the session to break the loop.
+    pub compression_exhausted: bool,
 }
 
 /// AI Agent with tool calling capabilities.
@@ -469,6 +473,9 @@ impl AIAgent {
         let max_compression_attempts: u32 = 3;
         // Post-tool empty response nudge — only nudge once per tool round.
         let mut post_tool_empty_retried = false;
+        // Compression exhaustion — set when max attempts reached without
+        // resolving context overflow. Caller (gateway) should auto-reset.
+        let mut compression_exhausted = false;
 
         // Self-evolution: increment turn counter, check memory nudge threshold
         let mut should_review_memory = false;
@@ -760,6 +767,7 @@ impl AIAgent {
                                 "Context/rate error — max compression attempts ({}) reached",
                                 max_compression_attempts
                             );
+                            compression_exhausted = true;
                             final_response = format!("Error: context too large after {} compression attempts: {}", max_compression_attempts, e);
                             exit_reason = "llm_error".to_string();
                             break;
@@ -817,6 +825,7 @@ impl AIAgent {
             messages,
             api_calls: api_call_count,
             exit_reason: exit_reason.to_string(),
+            compression_exhausted,
         }
     }
 
@@ -1313,11 +1322,13 @@ mod tests {
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
             api_calls: 1,
             exit_reason: "completed".to_string(),
+            compression_exhausted: false,
         };
         assert_eq!(result.response, "hello");
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.api_calls, 1);
         assert_eq!(result.exit_reason, "completed");
+        assert!(!result.compression_exhausted);
     }
 
     #[test]

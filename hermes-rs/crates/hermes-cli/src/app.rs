@@ -673,7 +673,7 @@ impl HermesApp {
                 _platform: Platform,
                 chat_id: &str,
                 content: &str,
-            ) -> std::result::Result<String, String> {
+            ) -> std::result::Result<hermes_gateway::runner::HandlerResult, String> {
                 tracing::info!("Gateway received from {chat_id}: {}", content.chars().take(50).collect::<String>());
 
                 let mut agent = self.agent.lock().await;
@@ -681,7 +681,22 @@ impl HermesApp {
                 if turn_result.response.is_empty() {
                     Err("Agent returned no response".to_string())
                 } else {
-                    Ok(turn_result.response.clone())
+                    Ok(hermes_gateway::runner::HandlerResult {
+                        response: turn_result.response.clone(),
+                        compression_exhausted: turn_result.compression_exhausted,
+                    })
+                }
+            }
+
+            fn interrupt(&self, _chat_id: &str, _new_message: &str) {
+                // Signal the agent to stop the current turn immediately.
+                // The new message will be queued and processed after this
+                // turn completes. Mirrors Python PR a8b7db35.
+                let agent = self.agent.try_lock();
+                if let Ok(mut a) = agent {
+                    a.close();
+                } else {
+                    tracing::debug!("Agent handler locked during interrupt — flag already set");
                 }
             }
         }

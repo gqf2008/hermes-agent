@@ -7,10 +7,54 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::errors::{ErrorCategory, HermesError, Result};
 use crate::hermes_home::get_hermes_home;
+
+/// Custom deserializer for context_length that accepts both integers and
+/// string values like "256K". Emits a warning for non-integer values,
+/// mirroring Python PR 93fe4ead.
+fn deserialize_context_length<'de, D>(deserializer: D) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_yaml::Value>::deserialize(deserializer)
+        .map_err(|e| <D::Error as serde::de::Error>::custom(e.to_string()))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    // Try integer first
+    if let Some(n) = value.as_u64() {
+        return Ok(Some(n as usize));
+    }
+
+    // Try string — warn if it looks like a suffixed value
+    if let Some(s) = value.as_str() {
+        // Try plain numeric string
+        if let Ok(n) = s.parse::<usize>() {
+            return Ok(Some(n));
+        }
+
+        // Looks like "256K", "128k", "1M", etc. — warn and fall through
+        tracing::warn!(
+            "Invalid model.context_length in config.yaml: {:?} — \
+             must be a plain integer (e.g. 256000, not '256K'). \
+             Falling back to auto-detection.",
+            s
+        );
+        eprintln!(
+            "\n\u{26A0} Invalid model.context_length in config.yaml: {:?}\n \
+             Must be a plain integer (e.g. 256000, not '256K').\n \
+             Falling back to auto-detected context window.\n",
+            s
+        );
+    }
+
+    // Null or other type — return None (auto-detect)
+    Ok(None)
+}
 
 /// Main configuration structure.
 ///
@@ -67,6 +111,7 @@ pub struct ModelConfig {
     /// API mode: "openai", "anthropic_messages", "codex_responses"
     pub api_mode: Option<String>,
     /// Context length override
+    #[serde(deserialize_with = "deserialize_context_length")]
     pub context_length: Option<usize>,
     /// Temperature
     pub temperature: Option<f64>,

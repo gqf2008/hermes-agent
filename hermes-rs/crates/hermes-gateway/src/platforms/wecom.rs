@@ -806,13 +806,13 @@ impl WeComAdapter {
                                         )
                                         .await
                                     {
-                                        Ok(response) => {
-                                            if !response.is_empty() {
+                                        Ok(result) => {
+                                            if !result.response.is_empty() {
                                                 Self::send_reply(
                                                     &ws_state_clone,
                                                     &event_req_id,
                                                     &event_chat_id,
-                                                    response,
+                                                    result.response,
                                                 )
                                                 .await;
                                             }

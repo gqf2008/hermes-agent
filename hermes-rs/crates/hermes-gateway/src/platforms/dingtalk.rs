@@ -602,10 +602,10 @@ async fn webhook_handler(
                     )
                     .await
                 {
-                    Ok(response) => {
-                        if !response.is_empty() {
+                    Ok(result) => {
+                        if !result.response.is_empty() {
                             if let Err(e) = adapter
-                                .send_text(&event.session_webhook, &response)
+                                .send_text(&event.session_webhook, &result.response)
                                 .await
                             {
                                 error!("Dingtalk send failed: {e}");

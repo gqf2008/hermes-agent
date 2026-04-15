@@ -6,6 +6,7 @@
 //! - Routes messages to the agent engine
 //! - Handles graceful shutdown
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -37,6 +38,16 @@ pub struct PlatformConfigEntry {
     pub config: PlatformConfig,
 }
 
+/// Result from a message handler, including metadata for gateway-level handling.
+#[derive(Debug, Clone)]
+pub struct HandlerResult {
+    /// Response text to send to the user.
+    pub response: String,
+    /// Compression was exhausted — gateway should auto-reset the session
+    /// to break the infinite loop. Mirrors Python PR c5688e7c.
+    pub compression_exhausted: bool,
+}
+
 /// Message handler trait -- called when a platform receives a message.
 #[async_trait::async_trait]
 pub trait MessageHandler: Send + Sync + 'static {
@@ -45,7 +56,14 @@ pub trait MessageHandler: Send + Sync + 'static {
         platform: Platform,
         chat_id: &str,
         content: &str,
-    ) -> Result<String, String>;
+    ) -> Result<HandlerResult, String>;
+
+    /// Signal the handler to interrupt its current conversation turn.
+    /// Default is no-op for handlers that don't support interruption.
+    /// Mirrors Python PR a8b7db35 — immediate interrupt on user message.
+    fn interrupt(&self, _chat_id: &str, _new_message: &str) {
+        // no-op by default
+    }
 }
 
 /// Gateway runner managing platform adapter lifecycles.
@@ -60,6 +78,12 @@ pub struct GatewayRunner {
     dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
+    /// Track which sessions are currently running (chat_id -> start timestamp).
+    /// Used for busy-session interrupt logic (Python PR a8b7db35).
+    /// std::sync::Mutex — critical sections are trivially fast (HashMap insert/get).
+    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    /// Busy ack timestamps for debouncing (chat_id -> last ack time).
+    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
 }
 
 impl GatewayRunner {
@@ -75,6 +99,8 @@ impl GatewayRunner {
             dingtalk_shutdown_tx: Vec::new(),
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
+            running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            busy_ack_ts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -171,8 +197,10 @@ impl GatewayRunner {
             let adapter = adapter.clone();
             let handler = self.message_handler.clone();
             let running = self.running.clone();
+            let running_sessions = self.running_sessions.clone();
+            let busy_ack_ts = self.busy_ack_ts.clone();
             let handle = tokio::spawn(async move {
-                run_weixin_poll(adapter, handler, running).await;
+                run_weixin_poll(adapter, handler, running, running_sessions, busy_ack_ts).await;
             });
             handles.push(handle);
         }
@@ -250,6 +278,9 @@ impl GatewayRunner {
             let _ = tx.send(());
         }
         self.running.store(false, Ordering::SeqCst);
+        // Clear tracking state so it doesn't leak across stop/restart cycles.
+        self.running_sessions.lock().unwrap().clear();
+        self.busy_ack_ts.lock().unwrap().clear();
         info!("Gateway stop requested");
     }
 
@@ -289,6 +320,8 @@ async fn run_weixin_poll(
     adapter: Arc<WeixinAdapter>,
     handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
+    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
 ) {
     let mut poll_interval = interval(Duration::from_secs(2));
     let mut consecutive_errors = 0u32;
@@ -302,7 +335,17 @@ async fn run_weixin_poll(
             Ok(events) => {
                 consecutive_errors = 0;
                 for event in events {
-                    route_weixin_message(&adapter, &handler, &event).await;
+                    // Check busy + interrupt before acquiring handler lock.
+                    // This lets us call interrupt() on the handler Arc
+                    // without needing to hold the Mutex guard.
+                    let handler_guard = handler.lock().await;
+                    let handler_ref = handler_guard.as_ref().cloned();
+                    drop(handler_guard); // Release lock before routing
+
+                    route_weixin_message(
+                        &adapter, handler_ref.as_ref(), &event,
+                        &running_sessions, &busy_ack_ts,
+                    ).await;
                 }
             }
             Err(e) => {
@@ -326,43 +369,128 @@ async fn run_weixin_poll(
 }
 
 /// Route a Weixin message to the agent handler.
+///
+/// If the session is already running (agent is busy), interrupt the agent,
+/// send a busy ack to the user, and queue the message for the next cycle.
+/// Mirrors Python PR a8b7db35 — immediate interrupt on user message.
 async fn route_weixin_message(
     adapter: &WeixinAdapter,
-    handler: &Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
+    handler: Option<&Arc<dyn MessageHandler>>,
     event: &WeixinMessageEvent,
+    running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
 ) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     if event.content.is_empty() {
         return;
     }
 
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let chat_id = &event.peer_id;
+
+    // Check if this session is already running (busy session handling)
+    let busy_elapsed_min: Option<f64> = {
+        let sessions = running_sessions.lock().unwrap();
+        sessions.get(chat_id).map(|&start_ts| {
+            let elapsed_secs = now - start_ts;
+            elapsed_secs / 60.0
+        })
+    };
+
+    if let Some(elapsed_min) = busy_elapsed_min {
+        // Session is busy — interrupt the running agent and ack
+
+        // Busy ack debounce: only send every 30 seconds
+        let should_ack = {
+            let mut ack_map = busy_ack_ts.lock().unwrap();
+            let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
+            if now - last_ack < 30.0 {
+                false // Debounced
+            } else {
+                ack_map.insert(chat_id.to_string(), now);
+                true
+            }
+        };
+
+        if should_ack {
+            // Signal interrupt to the running agent
+            if let Some(h) = handler {
+                h.interrupt(chat_id, &event.content);
+            }
+            info!(
+                "Session {chat_id}: busy — agent interrupted after {elapsed_min:.1} min"
+            );
+
+            // Send busy status to user
+            let busy_msg = format!(
+                "Still processing your previous message ({elapsed_min:.0}m elapsed). \
+                 Please wait for my response before sending another prompt."
+            );
+            let _ = adapter.send_text(chat_id, &busy_msg).await;
+        }
+        return;
+    }
+
+    // Session not running — proceed with normal handling
     info!(
         "Weixin message from {}: {}",
-        event.peer_id,
+        chat_id,
         event.content.chars().take(50).collect::<String>(),
     );
 
-    let handler_guard = handler.lock().await;
-    if let Some(handler) = handler_guard.as_ref() {
-        match handler
-            .handle_message(Platform::Weixin, &event.peer_id, &event.content)
-            .await
-        {
-            Ok(response) => {
-                if !response.is_empty() {
-                    if let Err(e) = adapter.send_text(&event.peer_id, &response).await {
-                        error!("Weixin send failed: {e}");
-                    }
+    // Mark session as running
+    {
+        let mut sessions = running_sessions.lock().unwrap();
+        sessions.insert(chat_id.clone(), now);
+    }
+
+    let Some(handler_ref) = handler else {
+        running_sessions.lock().unwrap().remove(chat_id);
+        warn!("No message handler registered for Weixin messages");
+        return;
+    };
+
+    match handler_ref
+        .handle_message(Platform::Weixin, chat_id, &event.content)
+        .await
+    {
+        Ok(result) => {
+            // Clear session running flag
+            running_sessions.lock().unwrap().remove(chat_id);
+            // Clear busy ack timestamp
+            busy_ack_ts.lock().unwrap().remove(chat_id);
+
+            // Compression exhaustion — log warning so gateway operator
+            // knows to implement session auto-reset policy.
+            // Mirrors Python PR c5688e7c.
+            if result.compression_exhausted {
+                warn!(
+                    "Session {}: compression exhausted — context too large after max attempts. \
+                     Consider resetting the session.",
+                    chat_id
+                );
+            }
+            if !result.response.is_empty() {
+                if let Err(e) = adapter.send_text(chat_id, &result.response).await {
+                    error!("Weixin send failed: {e}");
                 }
             }
-            Err(e) => {
-                error!("Agent handler failed for Weixin message: {e}");
-                let _ = adapter
-                    .send_text(&event.peer_id, "Sorry, I encountered an error processing your message.")
-                    .await;
-            }
         }
-    } else {
-        warn!("No message handler registered for Weixin messages");
+        Err(e) => {
+            // Clear session running flag on error too
+            running_sessions.lock().unwrap().remove(chat_id);
+            busy_ack_ts.lock().unwrap().remove(chat_id);
+
+            error!("Agent handler failed for Weixin message: {e}");
+            let _ = adapter
+                .send_text(chat_id, "Sorry, I encountered an error processing your message.")
+                .await;
+        }
     }
 }
 
