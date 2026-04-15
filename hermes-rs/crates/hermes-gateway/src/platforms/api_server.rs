@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::config::Platform;
 use crate::runner::MessageHandler;
@@ -972,6 +972,7 @@ async fn chat_completions_handler(
     if let Some((ref key, ref fp)) = idem_key_and_fp {
         let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
         if let Some(cached) = cache.get(key, fp) {
+            debug!("Idempotency cache hit for chat completions, key={key}");
             if let Ok(resp) = serde_json::from_value::<ChatCompletionResponse>(cached) {
                 let session_id = resp.id.clone();
                 return Ok(SseOrJson::Json(Json(resp), session_id));
@@ -1204,6 +1205,7 @@ async fn responses_handler(
     if let Some((ref key, ref fp)) = idem_key_and_fp {
         let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
         if let Some(cached) = cache.get(key, fp) {
+            debug!("Idempotency cache hit for responses, key={key}");
             if let Ok(resp) = serde_json::from_value::<ResponseData>(cached) {
                 return Ok(ResponsesResponse::Json(Json(resp)));
             }
