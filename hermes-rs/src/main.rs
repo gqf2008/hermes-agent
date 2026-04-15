@@ -33,8 +33,47 @@ enum Commands {
         /// Model to use
         #[arg(short, long)]
         model: Option<String>,
+        /// Single query (non-interactive mode)
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// Optional local image path to attach to a single query
+        #[arg(long)]
+        image: Option<String>,
+        /// Comma-separated toolsets to enable
+        #[arg(short = 't', long)]
+        toolsets: Option<String>,
+        /// Preload one or more skills (comma-separated)
+        #[arg(short = 's', long)]
+        skills: Option<String>,
+        /// Inference provider selection (default: auto)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Resume a previous session by ID
+        #[arg(short = 'r', long)]
+        resume: Option<String>,
+        /// Resume last session (or by name if provided)
+        #[arg(short = 'c', long)]
+        continue_last: Option<Option<String>>,
+        /// Run in an isolated git worktree
+        #[arg(short = 'w', long)]
+        worktree: bool,
+        /// Enable filesystem checkpoints before destructive file operations
+        #[arg(long)]
+        checkpoints: bool,
+        /// Maximum tool-calling iterations per turn
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// Bypass all dangerous command approval prompts
+        #[arg(long)]
+        yolo: bool,
+        /// Include session ID in system prompt
+        #[arg(long)]
+        pass_session_id: bool,
+        /// Session source tag (default: cli)
+        #[arg(long)]
+        source: Option<String>,
         /// Quiet mode (suppress debug output)
-        #[arg(short, long)]
+        #[arg(long)]
         quiet: bool,
         /// Skip loading context files
         #[arg(long)]
@@ -975,8 +1014,8 @@ fn main() -> anyhow::Result<()> {
     let app = HermesApp::new()?;
 
     match cli.command {
-        Some(Commands::Chat { model, quiet, skip_context_files, skip_memory, voice }) => {
-            app.run_chat(model, quiet, skip_context_files, skip_memory, voice)?;
+        Some(Commands::Chat { model, query, image, toolsets, skills, provider, resume, continue_last, worktree, checkpoints, max_turns, yolo, pass_session_id, source, quiet, skip_context_files, skip_memory, voice }) => {
+            app.run_chat(model, query, image, toolsets, skills, provider, resume, continue_last, worktree, checkpoints, max_turns, yolo, pass_session_id, source, quiet, skip_context_files, skip_memory, voice)?;
         }
         Some(Commands::Setup { section }) => {
             if let Some(sec) = section {
@@ -1428,7 +1467,7 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             // Default: interactive chat
-            app.run_chat(None, false, false, false, false)?;
+            app.run_chat(None, None, None, None, None, None, None, None, false, false, None, false, false, None, false, false, false, false)?;
         }
         Some(Commands::Model { action }) => {
             match action {

@@ -23,7 +23,27 @@ impl HermesApp {
     }
 
     /// Run the interactive chat loop.
-    pub fn run_chat(&self, model: Option<String>, quiet: bool, skip_context: bool, _skip_memory: bool, _voice: bool) -> Result<()> {
+    pub fn run_chat(
+        &self,
+        model: Option<String>,
+        query: Option<String>,
+        _image: Option<String>,
+        _toolsets: Option<String>,
+        _skills: Option<String>,
+        _provider: Option<String>,
+        _resume: Option<String>,
+        _continue_last: Option<Option<String>>,
+        _worktree: bool,
+        _checkpoints: bool,
+        max_turns: Option<u32>,
+        _yolo: bool,
+        _pass_session_id: bool,
+        _source: Option<String>,
+        quiet: bool,
+        skip_context: bool,
+        _skip_memory: bool,
+        _voice: bool,
+    ) -> Result<()> {
         let model_name = model.unwrap_or_else(|| "anthropic/claude-opus-4.6".to_string());
 
         // Build tool registry
@@ -54,9 +74,10 @@ impl HermesApp {
         };
 
         // Build agent config
+        let max_iterations = max_turns.unwrap_or(90) as usize;
         let config = AgentConfig {
             model: final_model,
-            max_iterations: 90,
+            max_iterations,
             skip_context_files: skip_context,
             terminal_cwd: std::env::current_dir().ok(),
             ..AgentConfig::default()
@@ -72,6 +93,38 @@ impl HermesApp {
             ))?;
 
         let mut agent = AIAgent::new(config.clone(), Arc::new(registry))?;
+
+        // Single-shot query mode (non-interactive)
+        if let Some(ref q) = query {
+            let spinner = if !quiet {
+                let s = indicatif::ProgressBar::new_spinner();
+                s.set_style(
+                    indicatif::ProgressStyle::default_spinner()
+                        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+                        .template("{spinner} {msg}")
+                        .unwrap(),
+                );
+                s.set_message("Thinking...");
+                s.enable_steady_tick(std::time::Duration::from_millis(100));
+                Some(s)
+            } else {
+                None
+            };
+
+            let turn_result = rt.block_on(async {
+                agent.run_conversation(q, None, None).await
+            });
+
+            if let Some(s) = spinner {
+                s.finish_and_clear();
+            }
+
+            if !turn_result.response.is_empty() {
+                println!("{}", turn_result.response);
+            }
+
+            return Ok(());
+        }
 
         // Set up reedline for input
         let mut line_editor = reedline::Reedline::create();
