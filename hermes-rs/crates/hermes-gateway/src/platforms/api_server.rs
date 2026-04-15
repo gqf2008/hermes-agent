@@ -219,6 +219,10 @@ static RESPONSE_STORE: LazyLock<std::sync::Mutex<ResponseStore>> =
 /// Maximum entries before LRU eviction.
 const RESPONSE_STORE_MAX: usize = 100;
 
+/// Server start time for uptime tracking.
+static START_TIME: LazyLock<std::time::Instant> =
+    LazyLock::new(std::time::Instant::now);
+
 /// SQLite-free in-memory response store with LRU eviction.
 #[derive(Default)]
 struct ResponseStore {
@@ -270,6 +274,80 @@ impl ResponseStore {
     }
 }
 
+// ── Run Streams ─────────────────────────────────────────────────
+
+/// Maximum concurrent runs.
+const MAX_CONCURRENT_RUNS: usize = 20;
+/// TTL for unconsumed run streams (seconds).
+const RUN_STREAM_TTL: u64 = 300;
+
+/// A single run event (structured lifecycle event for SSE streaming).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunEvent {
+    pub event: String,
+    pub run_id: String,
+    pub timestamp: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+}
+
+/// Run start response (202 Accepted).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+/// In-memory store for run event streams.
+/// Each run has a tokio broadcast channel for SSE events.
+static RUN_STREAMS: LazyLock<Arc<Mutex<RunStreamStore>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(RunStreamStore::default())));
+
+#[derive(Default)]
+struct RunStreamStore {
+    /// run_id -> (event sender, created_at timestamp)
+    senders: HashMap<String, (tokio::sync::broadcast::Sender<RunEvent>, f64)>,
+}
+
+impl RunStreamStore {
+    fn insert(&mut self, run_id: String, tx: tokio::sync::broadcast::Sender<RunEvent>, created_at: f64) {
+        self.senders.insert(run_id, (tx, created_at));
+    }
+
+    fn get_sender(&self, run_id: &str) -> Option<tokio::sync::broadcast::Sender<RunEvent>> {
+        self.senders.get(run_id).map(|(tx, _)| tx.clone())
+    }
+
+    fn remove(&mut self, run_id: &str) {
+        self.senders.remove(run_id);
+    }
+
+    fn sweep_orphaned(&mut self, now: f64) {
+        self.senders.retain(|_, (_, created_at)| {
+            now - *created_at < RUN_STREAM_TTL as f64
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.senders.len()
+    }
+}
+
 /// OpenAI Responses API response data.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseData {
@@ -280,6 +358,98 @@ pub struct ResponseData {
     pub model: String,
     pub output: Vec<OutputItem>,
     pub usage: ResponseUsage,
+}
+
+/// SSE event data for streaming Responses API.
+/// Each variant corresponds to an OpenAI Responses SSE event type.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ResponsesSseEvent {
+    /// `response.created` — initial envelope
+    ResponseCreated {
+        #[serde(rename = "type")]
+        event_type: String,
+        response: SseResponseEnvelope,
+        sequence_number: usize,
+    },
+    /// `response.output_text.delta` — text chunk
+    OutputTextDelta {
+        #[serde(rename = "type")]
+        event_type: String,
+        item_id: String,
+        output_index: usize,
+        content_index: usize,
+        delta: String,
+        logprobs: Vec<()>,
+        sequence_number: usize,
+    },
+    /// `response.output_text.done` — text complete
+    OutputTextDone {
+        #[serde(rename = "type")]
+        event_type: String,
+        item_id: String,
+        output_index: usize,
+        content_index: usize,
+        text: String,
+        logprobs: Vec<()>,
+        sequence_number: usize,
+    },
+    /// `response.output_item.added` — new output item
+    OutputItemAdded {
+        #[serde(rename = "type")]
+        event_type: String,
+        output_index: usize,
+        item: SseOutputItem,
+        sequence_number: usize,
+    },
+    /// `response.output_item.done` — output item complete
+    OutputItemDone {
+        #[serde(rename = "type")]
+        event_type: String,
+        output_index: usize,
+        item: SseOutputItem,
+        sequence_number: usize,
+    },
+    /// `response.completed` — terminal event
+    ResponseCompleted {
+        #[serde(rename = "type")]
+        event_type: String,
+        response: SseResponseEnvelope,
+        sequence_number: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SseResponseEnvelope {
+    pub id: String,
+    pub object: String,
+    pub status: String,
+    pub created_at: i64,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Vec<SseOutputItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SseOutputItem {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentPart>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Vec<ContentPart>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,6 +504,25 @@ pub struct HealthResponse {
     pub status: String,
 }
 
+/// Detailed health check response — returns gateway state, platforms,
+/// PID, and uptime for cross-container dashboard probing.
+/// Mirrors Python _handle_health_detailed.
+#[derive(Debug, Serialize)]
+pub struct DetailedHealthResponse {
+    pub status: String,
+    pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_state: Option<String>,
+    pub platforms: Vec<String>,
+    pub active_agents: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    pub pid: u32,
+    pub uptime_seconds: u64,
+}
+
 /// API Server adapter — holds config, builds the HTTP router.
 pub struct ApiServerAdapter {
     pub config: ApiServerConfig,
@@ -353,11 +542,15 @@ impl ApiServerAdapter {
 
         Router::new()
             .route("/health", get(health_handler))
+            .route("/health/detailed", get(health_detailed_handler))
+            .route("/v1/health", get(health_handler))
             .route("/v1/models", get(models_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/responses", post(responses_handler))
             .route("/v1/responses/{response_id}", get(get_response_handler))
             .route("/v1/responses/{response_id}", delete(delete_response_handler))
+            .route("/v1/runs", post(runs_handler))
+            .route("/v1/runs/{run_id}/events", get(run_events_handler))
             .layer(cors)
             .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1MB max request body
             .with_state(state)
@@ -397,6 +590,30 @@ impl ApiServerAdapter {
 async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
+    })
+}
+
+/// GET /health/detailed — rich status for cross-container dashboard probing.
+/// Mirrors Python _handle_health_detailed.
+async fn health_detailed_handler(
+    State(state): State<ApiServerState>,
+) -> Json<DetailedHealthResponse> {
+    let uptime = START_TIME.elapsed().as_secs();
+    let pid = std::process::id();
+
+    // Count stored responses as active agents proxy
+    let active_agents = RESPONSE_STORE.lock().unwrap().entries.len();
+
+    Json(DetailedHealthResponse {
+        status: "ok".to_string(),
+        platform: "hermes-agent".to_string(),
+        gateway_state: Some("running".to_string()),
+        platforms: vec!["api_server".to_string()],
+        active_agents,
+        exit_reason: None,
+        updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        pid,
+        uptime_seconds: uptime,
     })
 }
 
@@ -552,15 +769,31 @@ async fn chat_completions_handler(
 
 // ── Responses API Handlers ──────────────────────────────────────
 
+/// Union type for responses: batch JSON or streaming SSE.
+enum ResponsesResponse {
+    Json(Json<ResponseData>),
+    Sse(Sse<SseResponsesStreamType>),
+}
+
+#[async_trait::async_trait]
+impl axum::response::IntoResponse for ResponsesResponse {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            ResponsesResponse::Json(json) => json.into_response(),
+            ResponsesResponse::Sse(sse) => sse.into_response(),
+        }
+    }
+}
+
 /// POST /v1/responses — OpenAI Responses API format.
 /// Stateful via previous_response_id; supports conversation naming,
-/// explicit conversation_history, store flag, and truncation.
+/// explicit conversation_history, store flag, truncation, and streaming.
 /// Mirrors Python _handle_responses (lines 1393–1645).
 async fn responses_handler(
     State(state): State<ApiServerState>,
     headers: HeaderMap,
     Json(request): Json<ResponsesRequest>,
-) -> Result<Json<ResponseData>, (StatusCode, String)> {
+) -> Result<ResponsesResponse, (StatusCode, String)> {
     // Bearer token auth
     if !state.api_key.is_empty() {
         let auth = headers
@@ -622,7 +855,7 @@ async fn responses_handler(
     }
 
     // Carry forward instructions if not provided
-    let instructions = request.instructions.or(stored_instructions);
+    let instructions = request.instructions.clone().or(stored_instructions);
 
     // Append all but last input message to history
     let all_but_last: Vec<_> = input_messages.iter().take(input_messages.len().saturating_sub(1)).cloned().collect();
@@ -729,12 +962,365 @@ async fn responses_handler(
         });
 
         // Update conversation mapping
-        if let Some(conv) = request.conversation {
-            store.set_conversation(conv, response_id);
+        if let Some(ref conv) = request.conversation {
+            store.set_conversation(conv.clone(), response_id);
         }
     }
 
-    Ok(Json(response_data))
+    // Check for streaming mode
+    if request.stream.unwrap_or(false) {
+        let stream_result = responses_stream_handler(
+            state.clone(), &state.api_key, request,
+        ).await
+        .map_err(|e| e)?;
+        return Ok(ResponsesResponse::Sse(stream_result));
+    }
+
+    Ok(ResponsesResponse::Json(Json(response_data)))
+}
+
+/// POST /v1/responses — streaming variant.
+/// When `stream: true`, emits spec-compliant SSE events with proper
+/// event types (response.created, output_text.delta, output_item.added/done,
+/// response.completed). Tool call events require agent engine streaming
+/// callbacks — currently deferred (TODO: wire through agent stream_delta_callback).
+async fn responses_stream_handler(
+    state: ApiServerState,
+    api_key: &str,
+    request: ResponsesRequest,
+) -> Result<Sse<SseResponsesStreamType>, (StatusCode, String)> {
+    // Reuse the same setup logic as batch mode
+    let input_messages = normalize_responses_input(&request.input)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    if request.conversation.is_some() && request.previous_response_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cannot use both 'conversation' and 'previous_response_id'".to_string(),
+        ));
+    }
+
+    let mut prev_id = request.previous_response_id.clone();
+    if let Some(ref conv) = request.conversation {
+        let store = RESPONSE_STORE.lock().unwrap();
+        if let Some(resp_id) = store.get_conversation(conv) {
+            prev_id = Some(resp_id.clone());
+        }
+    }
+
+    let mut conversation_history: Vec<HistoryMessage> = Vec::new();
+    let mut stored_session_id: Option<String> = None;
+    let mut stored_instructions: Option<String> = None;
+
+    if let Some(ref raw_history) = request.conversation_history {
+        for entry in raw_history {
+            conversation_history.push(HistoryMessage {
+                role: entry.role.clone(),
+                content: entry.content.clone(),
+            });
+        }
+    } else if let Some(ref prev_resp_id) = prev_id {
+        let store = RESPONSE_STORE.lock().unwrap();
+        if let Some(stored) = store.get(prev_resp_id) {
+            conversation_history = stored.conversation_history.clone();
+            stored_session_id = Some(stored.session_id.clone());
+            stored_instructions = stored.instructions.clone();
+        } else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Previous response not found: {}", prev_resp_id),
+            ));
+        }
+    }
+
+    let instructions = request.instructions.or(stored_instructions);
+
+    let all_but_last: Vec<_> = input_messages.iter().take(input_messages.len().saturating_sub(1)).cloned().collect();
+    for msg in all_but_last {
+        conversation_history.push(msg);
+    }
+
+    let user_message = input_messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+
+    if user_message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No user message found in input".to_string()));
+    }
+
+    if request.truncation.as_deref() == Some("auto") && conversation_history.len() > 100 {
+        conversation_history = conversation_history.split_off(conversation_history.len() - 100);
+    }
+
+    let session_id = stored_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let store_response = request.store.unwrap_or(true);
+    let model = request.model.clone().unwrap_or_else(|| "hermes-agent".to_string());
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple().to_string().chars().take(28).collect::<String>());
+    let created_at = chrono::Utc::now().timestamp();
+
+    // Spawn agent run in background task
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(String, bool), String>>();
+    let handler = state.handler.clone();
+    let sess_id = session_id.clone();
+    let user_msg_spawn = user_message.clone();
+    tokio::spawn(async move {
+        let handler_guard = handler.lock().await;
+        let result = match handler_guard.as_ref() {
+            Some(h) => h.handle_message(Platform::ApiServer, &sess_id, &user_msg_spawn).await
+                .map(|r| (r.response, r.compression_exhausted)),
+            None => Err("No message handler registered".to_string()),
+        };
+        let _ = tx.send(result);
+    });
+
+    // Build SSE stream
+    let stream = build_responses_sse_stream(
+        rx, response_id, model, created_at, session_id,
+        conversation_history, user_message, instructions,
+        store_response, request.conversation.clone(),
+    );
+
+    Ok(Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text(": keepalive"),
+        ))
+}
+
+/// Stream type for responses SSE.
+type SseResponsesStreamType = Pin<Box<dyn Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>>;
+
+/// Build an SSE stream for Responses API streaming.
+/// Emits: response.created → output_item.added (message) → output_text.delta (chunked)
+/// → output_text.done → output_item.done (message) → response.completed
+fn build_responses_sse_stream(
+    agent_rx: tokio::sync::oneshot::Receiver<Result<(String, bool), String>>,
+    response_id: String,
+    model: String,
+    created_at: i64,
+    session_id: String,
+    conversation_history: Vec<HistoryMessage>,
+    user_message: String,
+    instructions: Option<String>,
+    store_response: bool,
+    conversation: Option<String>,
+) -> SseResponsesStreamType {
+    Box::pin(async_stream::stream! {
+        let mut seq: usize = 0;
+
+        // Helper: emit an SSE event
+        fn make_event(data: impl serde::Serialize) -> axum::response::sse::Event {
+            axum::response::sse::Event::default()
+                .json_data(&data).unwrap()
+        }
+
+        // response.created
+        let envelope = SseResponseEnvelope {
+            id: response_id.clone(),
+            object: "response".to_string(),
+            status: "in_progress".to_string(),
+            created_at,
+            model: model.clone(),
+            output: Some(vec![]),
+            usage: None,
+        };
+        yield Ok(make_event(ResponsesSseEvent::ResponseCreated {
+            event_type: "response.created".to_string(),
+            response: envelope,
+            sequence_number: seq,
+        }));
+        seq += 1;
+
+        // output_item.added (message)
+        let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple().to_string().chars().take(24).collect::<String>());
+        let msg_item = SseOutputItem {
+            id: message_item_id.clone(),
+            item_type: "message".to_string(),
+            status: "in_progress".to_string(),
+            role: Some("assistant".to_string()),
+            content: Some(vec![]),
+            name: None,
+            call_id: None,
+            arguments: None,
+            output: None,
+        };
+        let msg_output_index: usize = 0;
+        yield Ok(make_event(ResponsesSseEvent::OutputItemAdded {
+            event_type: "response.output_item.added".to_string(),
+            output_index: msg_output_index,
+            item: msg_item,
+            sequence_number: seq,
+        }));
+        seq += 1;
+
+        // Wait for agent to complete
+        let agent_result = agent_rx.await;
+        let response_text = match agent_result {
+            Ok(Ok((text, _))) => text,
+            Ok(Err(e)) => {
+                // Agent error — emit response.failed (simplified)
+                let error_envelope = SseResponseEnvelope {
+                    id: response_id.clone(),
+                    object: "response".to_string(),
+                    status: "failed".to_string(),
+                    created_at,
+                    model: model.clone(),
+                    output: None,
+                    usage: None,
+                };
+                yield Ok(make_event(ResponsesSseEvent::ResponseCompleted {
+                    event_type: "response.failed".to_string(),
+                    response: error_envelope,
+                    sequence_number: seq,
+                }));
+                return;
+            }
+            Err(_) => {
+                // Channel dropped
+                return;
+            }
+        };
+
+        // Emit text deltas (character-level chunks, like build_sse_stream)
+        let mut chars = response_text.chars().peekable();
+        while chars.peek().is_some() {
+            let text: String = chars.by_ref().take(3).collect();
+            if text.is_empty() { break; }
+            yield Ok(make_event(ResponsesSseEvent::OutputTextDelta {
+                event_type: "response.output_text.delta".to_string(),
+                item_id: message_item_id.clone(),
+                output_index: msg_output_index,
+                content_index: 0,
+                delta: text,
+                logprobs: vec![],
+                sequence_number: seq,
+            }));
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // output_text.done
+        yield Ok(make_event(ResponsesSseEvent::OutputTextDone {
+            event_type: "response.output_text.done".to_string(),
+            item_id: message_item_id.clone(),
+            output_index: msg_output_index,
+            content_index: 0,
+            text: response_text.clone(),
+            logprobs: vec![],
+            sequence_number: seq,
+        }));
+        seq += 1;
+
+        // output_item.done (message)
+        let msg_done = SseOutputItem {
+            id: message_item_id.clone(),
+            item_type: "message".to_string(),
+            status: "completed".to_string(),
+            role: Some("assistant".to_string()),
+            content: Some(vec![ContentPart {
+                part_type: "output_text".to_string(),
+                text: Some(response_text.clone()),
+            }]),
+            name: None,
+            call_id: None,
+            arguments: None,
+            output: None,
+        };
+        yield Ok(make_event(ResponsesSseEvent::OutputItemDone {
+            event_type: "response.output_item.done".to_string(),
+            output_index: msg_output_index,
+            item: msg_done,
+            sequence_number: seq,
+        }));
+        seq += 1;
+
+        // response.completed
+        let completed_envelope = SseResponseEnvelope {
+            id: response_id.clone(),
+            object: "response".to_string(),
+            status: "completed".to_string(),
+            created_at,
+            model: model.clone(),
+            output: Some(vec![SseOutputItem {
+                id: message_item_id,
+                item_type: "message".to_string(),
+                status: "completed".to_string(),
+                role: Some("assistant".to_string()),
+                content: Some(vec![ContentPart {
+                    part_type: "output_text".to_string(),
+                    text: Some(response_text.clone()),
+                }]),
+                name: None,
+                call_id: None,
+                arguments: None,
+                output: None,
+            }]),
+            usage: Some(ResponseUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+            }),
+        };
+        yield Ok(make_event(ResponsesSseEvent::ResponseCompleted {
+            event_type: "response.completed".to_string(),
+            response: completed_envelope,
+            sequence_number: seq,
+        }));
+
+        // Store for future chaining (same as batch mode)
+        if store_response {
+            let mut store = RESPONSE_STORE.lock().unwrap();
+            let mut full_history = conversation_history;
+            full_history.push(HistoryMessage {
+                role: "user".to_string(),
+                content: user_message,
+            });
+            full_history.push(HistoryMessage {
+                role: "assistant".to_string(),
+                content: response_text,
+            });
+
+            let final_response_data = ResponseData {
+                id: response_id.clone(),
+                object: "response".to_string(),
+                status: "completed".to_string(),
+                created_at,
+                model,
+                output: vec![OutputItem {
+                    item_type: "message".to_string(),
+                    role: "assistant".to_string(),
+                    content: vec![ContentPart {
+                        part_type: "output_text".to_string(),
+                        text: Some(full_history.last().map(|m| m.content.clone()).unwrap_or_default()),
+                    }],
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    output: None,
+                }],
+                usage: ResponseUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                },
+            };
+
+            let conv_name = conversation.clone();
+            store.put(response_id.clone(), ResponseStoreEntry {
+                response_data: Some(final_response_data),
+                conversation_history: full_history,
+                instructions,
+                session_id,
+                conversation,
+            });
+
+            if let Some(conv) = conv_name {
+                store.set_conversation(conv, response_id);
+            }
+        }
+    })
 }
 
 /// GET /v1/responses/{response_id} — retrieve a stored response.
@@ -809,6 +1395,311 @@ pub struct DeleteResponseResult {
     pub id: String,
     pub object: String,
     pub deleted: bool,
+}
+
+// ── Runs API Handlers ──────────────────────────────────────────
+
+/// POST /v1/runs — start an agent run, return run_id immediately (202).
+/// The actual run runs in a background tokio task. Events are streamed
+/// via GET /v1/runs/{run_id}/events.
+/// Mirrors Python _handle_runs.
+async fn runs_handler(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<RunStartResponse>), (StatusCode, String)> {
+    // Bearer token auth
+    if !state.api_key.is_empty() {
+        let auth = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if auth != format!("Bearer {}", state.api_key) {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+        }
+    }
+
+    // Enforce concurrency limit
+    {
+        let store = RUN_STREAMS.lock().await;
+        if store.len() >= MAX_CONCURRENT_RUNS {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Too many concurrent runs (max {})", MAX_CONCURRENT_RUNS),
+            ));
+        }
+    }
+
+    let raw_input = request.get("input").cloned().unwrap_or(serde_json::Value::Null);
+    if raw_input.is_null() {
+        return Err((StatusCode::BAD_REQUEST, "Missing 'input' field".to_string()));
+    }
+
+    // Normalize input to extract user_message and conversation_history
+    let (user_message, conversation_history, instructions, session_id, previous_response_id) = {
+        let user_message = if let Some(s) = raw_input.as_str() {
+            s.to_string()
+        } else if let Some(arr) = raw_input.as_array() {
+            arr.last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| Some(extract_content_from_value(Some(c))))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let conversation_history: Vec<HistoryMessage> = Vec::new();
+        let instructions = request.get("instructions").and_then(|v| v.as_str()).map(String::from);
+        let session_id = request.get("session_id").and_then(|v| v.as_str()).map(String::from);
+        let previous_response_id = request.get("previous_response_id").and_then(|v| v.as_str()).map(String::from);
+
+        (user_message, conversation_history, instructions, session_id, previous_response_id)
+    };
+
+    if user_message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No user message found in input".to_string()));
+    }
+
+    let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+
+    // Create broadcast channel for run events
+    let (tx, _rx) = tokio::sync::broadcast::channel::<RunEvent>(256);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    {
+        let mut store = RUN_STREAMS.lock().await;
+        store.insert(run_id.clone(), tx.clone(), now);
+    }
+
+    // Spawn the run in a background task
+    let state_clone = state.clone();
+    let run_id_spawn = run_id.clone();
+    let final_session_id = session_id.unwrap_or_else(|| run_id.clone());
+    tokio::spawn(async move {
+        run_and_close(
+            state_clone,
+            run_id_spawn,
+            tx.clone(),
+            user_message,
+            conversation_history,
+            instructions,
+            final_session_id,
+            previous_response_id,
+        ).await;
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(RunStartResponse {
+        run_id,
+        status: "started".to_string(),
+    })))
+}
+
+/// Background task: run the agent, emit events, then close the channel.
+async fn run_and_close(
+    state: ApiServerState,
+    run_id: String,
+    tx: tokio::sync::broadcast::Sender<RunEvent>,
+    user_message: String,
+    mut conversation_history: Vec<HistoryMessage>,
+    instructions: Option<String>,
+    session_id: String,
+    previous_response_id: Option<String>,
+) {
+    use std::time::SystemTime;
+
+    let mut sequence_number: usize = 0;
+
+    // Emit run.started
+    let started_event = RunEvent {
+        event: "run.started".to_string(),
+        run_id: run_id.clone(),
+        timestamp: SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64(),
+        delta: None,
+        output: None,
+        error: None,
+        usage: None,
+        sequence_number: Some(sequence_number),
+    };
+    let _ = tx.send(started_event);
+    sequence_number += 1;
+
+    // Resolve previous_response_id for conversation chaining
+    if conversation_history.is_empty() {
+        if let Some(ref prev_id) = previous_response_id {
+            let store = RESPONSE_STORE.lock().unwrap();
+            if let Some(stored) = store.get(prev_id) {
+                conversation_history = stored.conversation_history.clone();
+            }
+        }
+    }
+
+    let handler_guard = state.handler.lock().await;
+    let result = if let Some(handler) = handler_guard.as_ref() {
+        handler.handle_message(Platform::ApiServer, &session_id, &user_message).await
+    } else {
+        Err("No message handler registered".to_string())
+    };
+
+    match result {
+        Ok(handler_result) => {
+            // Emit message.delta events
+            let response_text = handler_result.response;
+            let mut delta_event = RunEvent {
+                event: "message.delta".to_string(),
+                run_id: run_id.clone(),
+                timestamp: SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                delta: Some(response_text.clone()),
+                output: None,
+                error: None,
+                usage: None,
+                sequence_number: Some(sequence_number),
+            };
+            let _ = tx.send(delta_event);
+            sequence_number += 1;
+
+            // Emit run.completed
+            let mut completed_event = RunEvent {
+                event: "run.completed".to_string(),
+                run_id: run_id.clone(),
+                timestamp: SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                delta: None,
+                output: Some(response_text),
+                error: None,
+                usage: Some(RunUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                }),
+                sequence_number: Some(sequence_number),
+            };
+            let _ = tx.send(completed_event);
+        }
+        Err(e) => {
+            let mut failed_event = RunEvent {
+                event: "run.failed".to_string(),
+                run_id: run_id.clone(),
+                timestamp: SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                delta: None,
+                output: None,
+                error: Some(e),
+                usage: None,
+                sequence_number: Some(sequence_number),
+            };
+            let _ = tx.send(failed_event);
+        }
+    }
+
+    // Cleanup run stream
+    RUN_STREAMS.lock().await.remove(&run_id);
+}
+
+/// GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events.
+/// Mirrors Python _handle_run_events.
+async fn run_events_handler(
+    State(state): State<ApiServerState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Sse<SseRunStreamType>, (StatusCode, String)> {
+    // Bearer token auth
+    if !state.api_key.is_empty() {
+        let auth = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if auth != format!("Bearer {}", state.api_key) {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()));
+        }
+    }
+
+    // Wait for run to be registered (race condition window)
+    let tx = {
+        let mut attempts = 0;
+        loop {
+            let store = RUN_STREAMS.lock().await;
+            if let Some(sender) = store.get_sender(&run_id) {
+                break Some(sender);
+            }
+            drop(store);
+            attempts += 1;
+            if attempts >= 20 {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let Some(tx) = tx else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Run not found: {}", run_id),
+        ));
+    };
+
+    let stream = build_run_sse_stream(tx, run_id);
+    Ok(Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text(": keepalive"),
+        ))
+}
+
+/// Stream type for run SSE responses.
+type SseRunStreamType = Pin<Box<dyn Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>>;
+
+/// Build an SSE stream from a run event broadcast channel.
+fn build_run_sse_stream(
+    tx: tokio::sync::broadcast::Sender<RunEvent>,
+    run_id: String,
+) -> SseRunStreamType {
+    Box::pin(async_stream::stream! {
+        let mut rx = tx.subscribe();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Ok(event)) => {
+                    // Check if this is a terminal event
+                    let is_terminal = matches!(event.event.as_str(), "run.completed" | "run.failed");
+                    let event_json = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+                    let sse_event = axum::response::sse::Event::default()
+                        .json_data(&event_json).unwrap();
+                    yield Ok::<_, std::convert::Infallible>(sse_event);
+
+                    if is_terminal {
+                        // Send final comment and close
+                        let done_event = axum::response::sse::Event::default()
+                            .data(": stream closed");
+                        yield Ok(done_event);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Channel closed
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — send keepalive
+                    let keepalive = axum::response::sse::Event::default()
+                        .data(": keepalive");
+                    yield Ok(keepalive);
+                }
+            }
+        }
+    })
 }
 
 /// Normalize Responses API input into a list of history messages.
