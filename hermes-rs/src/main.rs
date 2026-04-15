@@ -288,6 +288,7 @@ enum ModelAction {
     /// Interactive model selection
     Browse,
     /// List available models
+    #[command(alias = "ls")]
     List,
 }
 
@@ -295,6 +296,7 @@ enum ModelAction {
 #[derive(Subcommand)]
 enum PairingAction {
     /// Show pending + approved pairings
+    #[command(alias = "ls")]
     List,
     /// Approve a pairing code
     Approve {
@@ -313,6 +315,7 @@ enum PairingAction {
 #[derive(Subcommand)]
 enum WebhookAction {
     /// Create a webhook subscription
+    #[command(alias = "add")]
     Subscribe {
         /// Route name
         name: String,
@@ -336,8 +339,10 @@ enum WebhookAction {
         skills: String,
     },
     /// List webhook subscriptions
+    #[command(alias = "ls")]
     List,
     /// Remove a subscription
+    #[command(alias = "rm")]
     Remove {
         /// Subscription name
         name: String,
@@ -368,11 +373,13 @@ enum PluginAction {
         name: String,
     },
     /// Remove a plugin
+    #[command(alias = "rm", alias = "uninstall")]
     Remove {
         /// Plugin name
         name: String,
     },
     /// List installed plugins
+    #[command(alias = "ls")]
     List,
     /// Enable a disabled plugin
     Enable {
@@ -399,6 +406,7 @@ enum MemoryAction {
 #[derive(Subcommand)]
 enum McpAction {
     /// List configured MCP servers
+    #[command(alias = "ls")]
     List,
     /// Add an MCP server
     Add {
@@ -412,6 +420,7 @@ enum McpAction {
         args: Vec<String>,
     },
     /// Remove an MCP server
+    #[command(alias = "rm", alias = "delete")]
     Remove {
         /// Server name
         name: String,
@@ -422,6 +431,7 @@ enum McpAction {
         name: String,
     },
     /// Interactive MCP configuration
+    #[command(alias = "config")]
     Configure,
     /// Run as MCP stdio server
     Serve,
@@ -430,6 +440,7 @@ enum McpAction {
 #[derive(Subcommand)]
 enum ToolAction {
     /// List all available tools
+    #[command(alias = "ls")]
     List {
         /// Platform to show (default: cli)
         #[arg(long, default_value = "cli")]
@@ -460,6 +471,7 @@ enum ToolAction {
 #[derive(Subcommand)]
 enum SkillAction {
     /// List installed skills
+    #[command(alias = "ls")]
     List {
         /// Filter by source: all, hub, builtin, local
         #[arg(long, default_value = "all")]
@@ -586,6 +598,7 @@ enum SnapshotAction {
 #[derive(Subcommand)]
 enum TapAction {
     /// List configured taps
+    #[command(alias = "ls")]
     List,
     /// Add a GitHub repo as skill source
     Add {
@@ -593,6 +606,7 @@ enum TapAction {
         repo: String,
     },
     /// Remove a tap
+    #[command(alias = "rm")]
     Remove {
         /// Tap name
         name: String,
@@ -602,12 +616,15 @@ enum TapAction {
 #[derive(Subcommand)]
 enum ProfileAction {
     /// List all profiles
+    #[command(alias = "ls")]
     List,
     /// Create a new profile
+    #[command(alias = "add")]
     Create { name: String },
     /// Switch to a profile
     Use { name: String },
     /// Delete a profile
+    #[command(alias = "rm")]
     Delete {
         /// Profile name
         name: String,
@@ -651,6 +668,7 @@ enum ProfileAction {
 #[derive(Subcommand)]
 enum SessionAction {
     /// List recent sessions
+    #[command(alias = "ls")]
     List {
         /// Maximum number of sessions to show
         #[arg(short, long, default_value_t = 20)]
@@ -668,6 +686,7 @@ enum SessionAction {
         output: Option<String>,
     },
     /// Delete a session
+    #[command(alias = "rm")]
     Delete {
         /// Session ID or prefix
         session_id: String,
@@ -814,8 +833,10 @@ enum GatewayAction {
 #[derive(Subcommand)]
 enum CronAction {
     /// List scheduled jobs
+    #[command(alias = "ls")]
     List,
     /// Create a new scheduled job
+    #[command(alias = "add")]
     Create {
         /// Job name
         name: String,
@@ -833,6 +854,7 @@ enum CronAction {
         paused: bool,
     },
     /// Delete a scheduled job
+    #[command(alias = "rm", alias = "delete")]
     Delete {
         /// Job ID
         job_id: String,
