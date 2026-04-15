@@ -279,6 +279,69 @@ fn internal_server_error(message: &str) -> (StatusCode, Json<OpenAIError>) {
     (StatusCode::INTERNAL_SERVER_ERROR, openai_error(message, None, Some("server_error")))
 }
 
+/// Build output items from agent result messages.
+///
+/// Walks `messages` and emits:
+/// - `function_call` items for each tool_call on assistant messages
+/// - `function_call_output` items for each tool-role message
+/// - a final `message` item with the assistant's text reply
+///
+/// Mirrors Python `_extract_output_items`.
+fn extract_output_items(response: &str, messages: &[serde_json::Value]) -> Vec<OutputItem> {
+    let mut items = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "assistant" {
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tool_calls {
+                    let func = tc.get("function").and_then(|v| v.as_object());
+                    let name = func.and_then(|m| m.get("name").and_then(|v| v.as_str())).unwrap_or("").to_string();
+                    let arguments = func.and_then(|m| m.get("arguments").and_then(|v| v.as_str())).unwrap_or("").to_string();
+                    let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    items.push(OutputItem {
+                        item_type: "function_call".to_string(),
+                        role: String::new(),
+                        content: None,
+                        call_id: Some(call_id),
+                        name: Some(name),
+                        arguments: Some(arguments),
+                        output: None,
+                    });
+                }
+            }
+        } else if role == "tool" {
+            let call_id = msg.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            items.push(OutputItem {
+                item_type: "function_call_output".to_string(),
+                role: String::new(),
+                content: None,
+                call_id: Some(call_id),
+                name: None,
+                arguments: None,
+                output: Some(content),
+            });
+        }
+    }
+
+    // Final assistant message
+    items.push(OutputItem {
+        item_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content: Some(vec![ContentPart {
+            part_type: "output_text".to_string(),
+            text: Some(response.to_string()),
+        }]),
+        call_id: None,
+        name: None,
+        arguments: None,
+        output: None,
+    });
+
+    items
+}
+
 /// Response store entry — holds full response object for Responses API
 /// chaining / GET retrieval. Mirrors Python ResponseStore class.
 #[derive(Debug, Clone)]
@@ -548,7 +611,8 @@ pub struct SseOutputItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<Vec<ContentPart>>,
+    /// Plain string output for function_call_output items (matches Python).
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -556,15 +620,17 @@ pub struct OutputItem {
     #[serde(rename = "type")]
     pub item_type: String,
     pub role: String,
-    pub content: Vec<ContentPart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentPart>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
+    /// Plain string output for function_call_output items (matches Python).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<Vec<ContentPart>>,
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1005,24 +1071,13 @@ async fn responses_handler(
             internal_server_error(&format!("Agent handler error: {e}"))
         })?;
 
-    let response_text = result.response;
+    let response_text = result.response.clone();
     let model = request.model.clone().unwrap_or_else(|| state.model_name.clone());
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple().to_string().chars().take(28).collect::<String>());
     let created_at = chrono::Utc::now().timestamp();
 
-    // Build output items (Responses API format)
-    let output_items = vec![OutputItem {
-        item_type: "message".to_string(),
-        role: "assistant".to_string(),
-        content: vec![ContentPart {
-            part_type: "output_text".to_string(),
-            text: Some(response_text.clone()),
-        }],
-        call_id: None,
-        name: None,
-        arguments: None,
-        output: None,
-    }];
+    // Build output items from agent messages (tool_calls + tool outputs + final message)
+    let output_items = extract_output_items(&response_text, &result.messages);
 
     let response_data = ResponseData {
         id: response_id.clone(),
@@ -1153,15 +1208,14 @@ async fn responses_stream_handler(
     let created_at = chrono::Utc::now().timestamp();
 
     // Spawn agent run in background task
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(String, bool), String>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<crate::runner::HandlerResult, String>>();
     let handler = state.handler.clone();
     let sess_id = session_id.clone();
     let user_msg_spawn = user_message.clone();
     tokio::spawn(async move {
         let handler_guard = handler.lock().await;
         let result = match handler_guard.as_ref() {
-            Some(h) => h.handle_message(Platform::ApiServer, &sess_id, &user_msg_spawn).await
-                .map(|r| (r.response, r.compression_exhausted)),
+            Some(h) => h.handle_message(Platform::ApiServer, &sess_id, &user_msg_spawn).await,
             None => Err("No message handler registered".to_string()),
         };
         let _ = tx.send(result);
@@ -1189,7 +1243,7 @@ type SseResponsesStreamType = Pin<Box<dyn Stream<Item = Result<axum::response::s
 /// Emits: response.created → output_item.added (message) → output_text.delta (chunked)
 /// → output_text.done → output_item.done (message) → response.completed
 fn build_responses_sse_stream(
-    agent_rx: tokio::sync::oneshot::Receiver<Result<(String, bool), String>>,
+    agent_rx: tokio::sync::oneshot::Receiver<Result<crate::runner::HandlerResult, String>>,
     response_id: String,
     model: String,
     created_at: i64,
@@ -1250,8 +1304,8 @@ fn build_responses_sse_stream(
 
         // Wait for agent to complete
         let agent_result = agent_rx.await;
-        let response_text = match agent_result {
-            Ok(Ok((text, _))) => text,
+        let (response_text, result_messages) = match agent_result {
+            Ok(Ok(result)) => (result.response.clone(), result.messages.clone()),
             Ok(Err(_e)) => {
                 // Agent error — emit response.failed (simplified)
                 let error_envelope = SseResponseEnvelope {
@@ -1365,6 +1419,8 @@ fn build_responses_sse_stream(
         // Store for future chaining (same as batch mode)
         if store_response {
             let mut store = RESPONSE_STORE.lock().unwrap();
+            let output_items = extract_output_items(&response_text, &result_messages);
+
             let mut full_history = conversation_history;
             full_history.push(HistoryMessage {
                 role: "user".to_string(),
@@ -1381,18 +1437,7 @@ fn build_responses_sse_stream(
                 status: "completed".to_string(),
                 created_at,
                 model,
-                output: vec![OutputItem {
-                    item_type: "message".to_string(),
-                    role: "assistant".to_string(),
-                    content: vec![ContentPart {
-                        part_type: "output_text".to_string(),
-                        text: Some(full_history.last().map(|m| m.content.clone()).unwrap_or_default()),
-                    }],
-                    call_id: None,
-                    name: None,
-                    arguments: None,
-                    output: None,
-                }],
+                output: output_items,
                 usage: ResponseUsage {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -2209,10 +2254,10 @@ mod tests {
             output: vec![OutputItem {
                 item_type: "message".to_string(),
                 role: "assistant".to_string(),
-                content: vec![ContentPart {
+                content: Some(vec![ContentPart {
                     part_type: "output_text".to_string(),
                     text: Some("Hello world".to_string()),
-                }],
+                }]),
                 call_id: None,
                 name: None,
                 arguments: None,

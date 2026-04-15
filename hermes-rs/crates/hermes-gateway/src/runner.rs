@@ -43,6 +43,10 @@ pub struct PlatformConfigEntry {
 pub struct HandlerResult {
     /// Response text to send to the user.
     pub response: String,
+    /// Complete agent message history after the turn (includes tool_calls).
+    /// Mirrors Python result["messages"] — used by Responses API to produce
+    /// function_call/function_call_output output items.
+    pub messages: Vec<serde_json::Value>,
     /// Compression was exhausted — gateway should auto-reset the session
     /// to break the infinite loop. Mirrors Python PR c5688e7c.
     pub compression_exhausted: bool,

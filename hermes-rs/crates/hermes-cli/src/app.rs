@@ -683,6 +683,7 @@ impl HermesApp {
                 } else {
                     Ok(hermes_gateway::runner::HandlerResult {
                         response: turn_result.response.clone(),
+                        messages: turn_result.messages.clone(),
                         compression_exhausted: turn_result.compression_exhausted,
                     })
                 }
