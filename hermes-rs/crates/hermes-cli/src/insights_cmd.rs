@@ -18,7 +18,7 @@ fn dim() -> Style { Style::new().dim() }
 fn yellow() -> Style { Style::new().yellow() }
 
 /// Show session analytics and usage insights.
-pub fn cmd_insights() -> anyhow::Result<()> {
+pub fn cmd_insights(_days: usize, _source: Option<&str>) -> anyhow::Result<()> {
     let home = get_hermes_home();
     let db_path = home.join("sessions.db");
 
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_insights_runs_without_errors() {
-        let result = cmd_insights();
+        let result = cmd_insights(30, None);
         assert!(result.is_ok());
     }
 }

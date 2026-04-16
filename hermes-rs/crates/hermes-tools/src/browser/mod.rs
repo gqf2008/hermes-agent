@@ -178,7 +178,7 @@ fn browser_navigate_camofox(url: &str, task_id: &str) -> Result<String, hermes_c
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_navigate_async(url, task_id))
     {
         Ok(result) => Ok(result),
@@ -237,7 +237,7 @@ fn browser_navigate_cloud(
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(cloud_navigate_async(url, task_id, provider))
     {
         Ok(result) => Ok(result),
@@ -309,7 +309,7 @@ fn browser_snapshot_camofox(task_id: &str) -> Result<String, hermes_core::Hermes
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_snapshot_async(task_id, false))
     {
         Ok(result) => Ok(result),
@@ -372,7 +372,7 @@ fn browser_click_camofox(ref_id: &str, task_id: &str) -> Result<String, hermes_c
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_click_async(ref_id, task_id))
     {
         Ok(result) => Ok(result),
@@ -442,7 +442,7 @@ fn browser_type_camofox(ref_id: &str, text: &str, task_id: &str) -> Result<Strin
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_type_async(ref_id, text, task_id))
     {
         Ok(result) => Ok(result),
@@ -502,7 +502,7 @@ fn browser_scroll_camofox(direction: &str, task_id: &str) -> Result<String, herm
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_scroll_async(direction, task_id))
     {
         Ok(result) => Ok(result),
@@ -557,7 +557,7 @@ fn browser_back_camofox(task_id: &str) -> Result<String, hermes_core::HermesErro
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_back_async(task_id))
     {
         Ok(result) => Ok(result),
@@ -620,7 +620,7 @@ fn browser_press_camofox(key: &str, task_id: &str) -> Result<String, hermes_core
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_press_async(key, task_id))
     {
         Ok(result) => Ok(result),
@@ -719,7 +719,7 @@ fn browser_vision_camofox(question: &str, _temp_path: &str) -> Result<String, he
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(camofox_vision_async(question, task_id))
     {
         Ok(result) => Ok(result),

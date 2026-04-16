@@ -33,12 +33,12 @@ fn log_path(name: &str) -> PathBuf {
 /// Parse a duration string like "1h", "30m", "2d".
 fn parse_since(s: &str) -> Option<SystemTime> {
     let s = s.trim();
-    let (num_str, unit) = if s.ends_with('h') {
-        (&s[..s.len() - 1], 3600u64)
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], 60u64)
-    } else if s.ends_with('d') {
-        (&s[..s.len() - 1], 86400u64)
+    let (num_str, unit) = if let Some(s) = s.strip_suffix('h') {
+        (s, 3600u64)
+    } else if let Some(s) = s.strip_suffix('m') {
+        (s, 60u64)
+    } else if let Some(s) = s.strip_suffix('d') {
+        (s, 86400u64)
     } else {
         return None;
     };
@@ -61,12 +61,7 @@ fn level_priority(level: &str) -> Option<usize> {
 
 /// Extract log level from a line (matches "INFO", "WARNING", "ERROR", "DEBUG").
 fn line_level(line: &str) -> Option<&str> {
-    for level in &["ERROR", "WARNING", "WARN", "INFO", "DEBUG"] {
-        if line.contains(level) {
-            return Some(level);
-        }
-    }
-    None
+    ["ERROR", "WARNING", "WARN", "INFO", "DEBUG"].iter().find(|&level| line.contains(level)).map(|v| v as _)
 }
 
 /// List available log files with sizes.
@@ -129,8 +124,8 @@ pub fn cmd_logs_view(
         return Ok(());
     }
 
-    let min_priority = level_filter.and_then(|l| level_priority(l));
-    let cutoff = since.and_then(|s| parse_since(s));
+    let min_priority = level_filter.and_then(level_priority);
+    let cutoff = since.and_then(parse_since);
 
     let content = std::fs::read_to_string(&path)?;
     let all_lines: Vec<&str> = content.lines().collect();

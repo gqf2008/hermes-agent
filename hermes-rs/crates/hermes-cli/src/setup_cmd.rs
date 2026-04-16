@@ -54,18 +54,20 @@ fn load_config() -> serde_yaml::Value {
 
 fn save_config(config: &serde_yaml::Value) -> io::Result<()> {
     let path = config_path();
-    let home = path.parent().unwrap();
-    std::fs::create_dir_all(home)?;
+    if let Some(home) = path.parent() {
+        std::fs::create_dir_all(home)?;
+    }
 
     let yaml = serde_yaml::to_string(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     std::fs::write(&path, yaml)
 }
 
 fn append_env(key: &str, value: &str) -> io::Result<()> {
     let path = env_path();
-    let home = path.parent().unwrap();
-    std::fs::create_dir_all(home)?;
+    if let Some(home) = path.parent() {
+        std::fs::create_dir_all(home)?;
+    }
 
     let mut content = String::new();
     if path.exists() {
@@ -216,7 +218,7 @@ fn setup_model_provider(config: &mut serde_yaml::Value) -> io::Result<()> {
         _ => "API_KEY",
     };
 
-    let api_key = read_secret(&format!("{env_key}"))?;
+    let api_key = read_secret(env_key)?;
     if !api_key.is_empty() {
         append_env(env_key, &api_key)?;
         println!("  {} API key saved to .env", green().apply_to("✓"));
@@ -266,15 +268,14 @@ fn setup_model_provider(config: &mut serde_yaml::Value) -> io::Result<()> {
             .get("model")
             .and_then(|m| m.get("base_url"))
             .is_some();
-        if !has_base_url {
-            if confirm("Use default OpenRouter endpoint?")? {
+        if !has_base_url
+            && confirm("Use default OpenRouter endpoint?")? {
                 set_config_value(
                     config,
                     &["model", "base_url"],
                     "https://openrouter.ai/api/v1".to_string(),
                 );
             }
-        }
     }
 
     println!("\n  {} Provider: {}", green().apply_to("✓"), provider);
@@ -559,6 +560,9 @@ fn setup_tts(config: &mut serde_yaml::Value) -> io::Result<()> {
 
 /// Set a nested config value. Supports dotted paths like ["compression", "enabled"].
 fn set_config_value(config: &mut serde_yaml::Value, path: &[&str], value: String) {
+    if path.is_empty() {
+        return;
+    }
     if let Some(map) = config.as_mapping_mut() {
         let mut current = map;
         for &key in &path[..path.len() - 1] {
@@ -567,11 +571,11 @@ fn set_config_value(config: &mut serde_yaml::Value, path: &[&str], value: String
                 .entry(key_val)
                 .or_insert(serde_yaml::Value::Mapping(Default::default()));
             if entry.is_mapping() {
-                current = entry.as_mapping_mut().unwrap();
+                current = entry.as_mapping_mut().expect("entry should be a mapping");
             } else {
                 // Replace with mapping
                 *entry = serde_yaml::Value::Mapping(Default::default());
-                current = entry.as_mapping_mut().unwrap();
+                current = entry.as_mapping_mut().expect("entry should be a mapping after replacement");
             }
         }
         let last_key = serde_yaml::Value::String(path.last().unwrap().to_string());
@@ -722,8 +726,26 @@ pub fn cmd_setup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reset configuration to defaults.
+pub fn cmd_setup_reset() -> anyhow::Result<()> {
+    let green = console::Style::new().green();
+    let yellow = console::Style::new().yellow();
+
+    for file in ["config.yaml", ".env", "SOUL.md"] {
+        let path = get_hermes_home().join(file);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            println!("  {} Removed {file}", green.apply_to("✓"));
+        } else {
+            println!("  {} {file} not found", yellow.apply_to("→"));
+        }
+    }
+    println!();
+    Ok(())
+}
+
 /// Run setup for a specific section.
-pub fn cmd_setup_section(section: &str) -> anyhow::Result<()> {
+pub fn cmd_setup_section(section: &str, _non_interactive: bool) -> anyhow::Result<()> {
     let home = get_hermes_home();
     std::fs::create_dir_all(&home)?;
 

@@ -226,7 +226,7 @@ pub fn cmd_config_set(key: &str, value: &str) -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
-            let last_key = serde_yaml::Value::String(parts.last().unwrap().to_string());
+            let last_key = serde_yaml::Value::String(parts.last().map(|s| s.to_string()).unwrap_or_default());
             current.insert(last_key, parse_yaml_value(value));
         }
     }

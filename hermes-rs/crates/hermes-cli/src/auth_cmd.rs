@@ -14,6 +14,12 @@ pub fn cmd_auth_add(
     label: Option<&str>,
     client_id: Option<&str>,
     no_browser: bool,
+    _portal_url: Option<&str>,
+    _inference_url: Option<&str>,
+    _scope: Option<&str>,
+    _timeout: Option<f64>,
+    _insecure: bool,
+    _ca_bundle: Option<&str>,
 ) -> anyhow::Result<()> {
     let green = Style::new().green();
     let cyan = Style::new().cyan();

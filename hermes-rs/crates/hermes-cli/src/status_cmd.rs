@@ -80,8 +80,10 @@ pub fn cmd_status(_all: bool, _deep: bool) -> anyhow::Result<()> {
     // Sessions DB
     let db_path = home.join("sessions.db");
     let db_status = if db_path.exists() {
-        let metadata = std::fs::metadata(&db_path).unwrap();
-        green().apply_to(format!("{} bytes", metadata.len())).to_string()
+        match std::fs::metadata(&db_path) {
+            Ok(metadata) => green().apply_to(format!("{} bytes", metadata.len())).to_string(),
+            Err(e) => yellow().apply_to(format!("inaccessible: {e}")).to_string(),
+        }
     } else {
         dim().apply_to("empty").to_string()
     };

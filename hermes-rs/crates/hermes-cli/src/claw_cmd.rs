@@ -21,7 +21,18 @@ fn get_hermes_home() -> PathBuf {
 }
 
 /// Migrate from another agent system.
-pub fn cmd_claw(action: &str, source: &str, force: bool) -> anyhow::Result<()> {
+pub fn cmd_claw(
+    action: &str,
+    source: Option<&str>,
+    force: bool,
+    _dry_run: bool,
+    _preset: &str,
+    _overwrite: bool,
+    _migrate_secrets: bool,
+    _yes: bool,
+    _workspace_target: Option<&str>,
+    _skill_conflict: &str,
+) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ Claw Migration"));
     println!();
@@ -29,15 +40,18 @@ pub fn cmd_claw(action: &str, source: &str, force: bool) -> anyhow::Result<()> {
     match action {
         "migrate" => {
             match source {
-                "claude-code" | "claude" => {
+                Some("claude-code" | "claude") => {
                     migrate_claude_code(force)?;
                 }
-                "chatgpt" | "openai" => {
+                Some("chatgpt" | "openai") => {
                     println!("  {}", dim().apply_to("OpenAI ChatGPT migration not yet implemented."));
                 }
-                _ => {
-                    println!("  {} Unknown source: {source}", yellow().apply_to("⚠"));
+                Some(src) => {
+                    println!("  {} Unknown source: {src}", yellow().apply_to("⚠"));
                     println!("  Supported: claude-code, chatgpt");
+                }
+                None => {
+                    println!("  {} Please specify --source (e.g. claude-code)", yellow().apply_to("⚠"));
                 }
             }
         }

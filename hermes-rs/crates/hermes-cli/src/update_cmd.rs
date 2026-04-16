@@ -10,7 +10,7 @@ fn yellow() -> Style { Style::new().yellow() }
 fn dim() -> Style { Style::new().dim() }
 
 /// Check for and apply updates.
-pub fn cmd_update(preview: bool, force: bool) -> anyhow::Result<()> {
+pub fn cmd_update(preview: bool, force: bool, _gateway: bool) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ Hermes Update"));
     println!();

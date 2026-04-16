@@ -50,7 +50,9 @@ fn load_registry() -> Vec<PluginInfo> {
 
 fn save_registry(reg: &[PluginInfo]) -> anyhow::Result<()> {
     let path = plugin_registry();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(reg)?;
     std::fs::write(&path, content)?;
     Ok(())
@@ -64,7 +66,7 @@ pub fn cmd_plugins_install(identifier: &str, force: bool) -> anyhow::Result<()> 
     // Extract plugin name from identifier
     let name = identifier
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or(identifier)
         .trim_end_matches(".git");
 
@@ -189,7 +191,7 @@ pub fn cmd_plugins_list() -> anyhow::Result<()> {
         std::fs::read_dir(&dir)
             .ok()
             .into_iter()
-            .flat_map(|iter| iter)
+            .flatten()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
             .filter_map(|e| e.file_name().into_string().ok())

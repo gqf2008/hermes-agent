@@ -548,7 +548,7 @@ impl SessionStore {
         // Save outside the lock
         self.save().ok();
 
-        entry_to_return.unwrap()
+        entry_to_return.expect("session entry should have been created above")
     }
 
     /// Update lightweight session metadata after an interaction.

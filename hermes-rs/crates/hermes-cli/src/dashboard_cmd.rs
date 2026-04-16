@@ -26,7 +26,7 @@ pub fn cmd_dashboard() -> anyhow::Result<()> {
 }
 
 /// Show interactive dashboard with custom options.
-pub fn cmd_dashboard_with_opts(host: &str, port: u16, no_open: bool, _insecure: bool) -> anyhow::Result<()> {
+pub fn cmd_dashboard_with_opts(_host: &str, _port: u16, _no_open: bool, _insecure: bool) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ Hermes Dashboard"));
     println!();

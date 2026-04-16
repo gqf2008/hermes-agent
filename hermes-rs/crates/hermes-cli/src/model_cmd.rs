@@ -60,7 +60,7 @@ pub fn cmd_model_list() -> anyhow::Result<()> {
         ("nous", "hermes-3", "Nous Hermes 3"),
     ];
 
-    println!("  {:15} {:25} {}", "Provider", "Model ID", "Display Name");
+    println!("  {:15} {:25} Display Name", "Provider", "Model ID");
     println!("  {}", "-".repeat(60));
     for (provider, model_id, name) in &models {
         println!("  {:15} {:25} {}", provider, model_id, name);

@@ -130,10 +130,8 @@ impl Summarizer {
             self.summary_failure_cooldown_until = None;
         }
 
-        // Compute dynamic summary budget: max(2000, min(content_tokens * 0.20, 12000))
-        let content_tokens = content.len() / 4; // rough estimate
-        let summary_budget = (content_tokens as f64 * 0.20) as usize;
-        let summary_budget = summary_budget.max(2000).min(12_000);
+        // Compute dynamic summary budget: clamp(content_tokens * 0.20, 2000..=12000)
+        let summary_budget = (content.len() as f64 / 4.0 * 0.20).clamp(2000.0, 12_000.0) as usize;
 
         let prompt = if let Some(ref previous) = self.previous_summary {
             // Iterative update path

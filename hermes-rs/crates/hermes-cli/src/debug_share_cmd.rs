@@ -38,7 +38,7 @@ pub fn cmd_debug_share(
     report.push_str(&format!("Arch: {}\n", std::env::consts::ARCH));
     report.push_str(&format!("Hermes: {}\n", env!("CARGO_PKG_VERSION")));
     report.push_str(&format!("HERMES_HOME: {}\n", home.display()));
-    report.push_str("\n");
+    report.push('\n');
 
     // Config (redacted)
     let config_path = home.join("config.yaml");

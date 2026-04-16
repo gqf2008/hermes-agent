@@ -32,12 +32,11 @@ pub fn cmd_uninstall(
     println!("{}", cyan().apply_to("◆ Hermes Uninstall"));
     println!();
 
-    if !force {
-        if !crate::confirm("This will remove Hermes Agent from your system. Continue?")? {
+    if !force
+        && !crate::confirm("This will remove Hermes Agent from your system. Continue?")? {
             println!("  {}", dim().apply_to("Uninstall cancelled."));
             return Ok(());
         }
-    }
 
     // Remove binary (best-effort; may fail on Windows due to file locking)
     if let Ok(exe) = std::env::current_exe() {
@@ -67,8 +66,10 @@ pub fn cmd_uninstall(
     } else {
         println!("  Removing data directory: {}", home.display());
         if home.exists() {
-            let _ = std::fs::remove_dir_all(&home);
-            println!("  {} Data removed.", green().apply_to("✓"));
+            match std::fs::remove_dir_all(&home) {
+                Ok(()) => println!("  {} Data removed.", green().apply_to("✓")),
+                Err(e) => println!("  {} Failed to remove data: {e}", yellow().apply_to("⚠")),
+            }
         }
     }
 

@@ -27,9 +27,20 @@ fn mcp_config_path() -> PathBuf {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct MCPServer {
     name: String,
-    command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
     enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preset: Option<String>,
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 fn load_mcp_servers() -> Vec<MCPServer> {
@@ -46,7 +57,9 @@ fn load_mcp_servers() -> Vec<MCPServer> {
 
 fn save_mcp_servers(servers: &[MCPServer]) -> anyhow::Result<()> {
     let path = mcp_config_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(servers)?;
     std::fs::write(&path, content)?;
     Ok(())
@@ -70,9 +83,26 @@ pub fn cmd_mcp_list() -> anyhow::Result<()> {
             } else {
                 yellow().apply_to("disabled").to_string()
             };
-            println!("  {} — {} ({})", server.name, status, server.command);
-            if !server.args.is_empty() {
-                println!("    args: {}", server.args.join(" "));
+            print!("  {} — {}", server.name, status);
+            if let Some(ref u) = server.url {
+                print!(" (url: {u})");
+            }
+            if let Some(ref c) = server.command {
+                print!(" ({c}",);
+                if !server.args.is_empty() {
+                    print!(" {}", server.args.join(" "));
+                }
+                print!(")");
+            }
+            println!();
+            if let Some(ref a) = server.auth {
+                println!("    auth: {a}");
+            }
+            if let Some(ref p) = server.preset {
+                println!("    preset: {p}");
+            }
+            if !server.env.is_empty() {
+                println!("    env: {}", server.env.join(" "));
             }
         }
     }
@@ -82,7 +112,15 @@ pub fn cmd_mcp_list() -> anyhow::Result<()> {
 }
 
 /// Add an MCP server.
-pub fn cmd_mcp_add(name: &str, command: &str, args: &[String], auto_enable: bool) -> anyhow::Result<()> {
+pub fn cmd_mcp_add(
+    name: &str,
+    url: Option<&str>,
+    command: Option<&str>,
+    args: &[String],
+    auth: Option<&str>,
+    preset: Option<&str>,
+    env: &[String],
+) -> anyhow::Result<()> {
     let mut servers = load_mcp_servers();
 
     // Check for duplicate
@@ -91,16 +129,40 @@ pub fn cmd_mcp_add(name: &str, command: &str, args: &[String], auto_enable: bool
         return Ok(());
     }
 
+    // Require either url or command
+    if url.is_none() && command.is_none() {
+        println!("  {} Specify either --url or --command.", yellow().apply_to("⚠"));
+        return Ok(());
+    }
+
     servers.push(MCPServer {
         name: name.to_string(),
-        command: command.to_string(),
+        url: url.map(String::from),
+        command: command.map(String::from),
         args: args.to_vec(),
-        enabled: auto_enable,
+        enabled: true,
+        auth: auth.map(String::from),
+        preset: preset.map(String::from),
+        env: env.to_vec(),
     });
 
     save_mcp_servers(&servers)?;
     println!("  {} MCP server added: {}", green().apply_to("✓"), name);
-    println!("    Command: {} {}", command, args.join(" "));
+    if let Some(u) = url {
+        println!("    URL: {u}");
+    }
+    if let Some(c) = command {
+        println!("    Command: {c} {}", args.join(" "));
+    }
+    if let Some(a) = auth {
+        println!("    Auth: {a}");
+    }
+    if let Some(p) = preset {
+        println!("    Preset: {p}");
+    }
+    if !env.is_empty() {
+        println!("    Env: {}", env.join(" "));
+    }
 
     Ok(())
 }
@@ -129,27 +191,35 @@ pub fn cmd_mcp_test(name: &str) -> anyhow::Result<()> {
     match server {
         Some(s) => {
             println!("  Testing MCP server: {}", s.name);
-            println!("  Command: {} {}", s.command, s.args.join(" "));
+            match (&s.url, &s.command) {
+                (Some(u), _) => println!("  URL: {u}"),
+                (_, Some(c)) => println!("  Command: {c} {}", s.args.join(" ")),
+                (None, None) => println!("  {}", yellow().apply_to("⚠ No URL or command configured.")),
+            }
             println!();
 
             // Try to run the command with --help or version
-            let output = std::process::Command::new(&s.command)
-                .args(&s.args)
-                .arg("--version")
-                .output();
+            if let Some(ref cmd) = s.command {
+                let output = std::process::Command::new(cmd)
+                    .args(&s.args)
+                    .arg("--version")
+                    .output();
 
-            match output {
-                Ok(out) if out.status.success() => {
-                    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    println!("  {} Connected — version: {}", green().apply_to("✓"), version);
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        println!("  {} Connected — version: {}", green().apply_to("✓"), version);
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        println!("  {} Connection failed: {}", yellow().apply_to("⚠"), stderr.trim());
+                    }
+                    Err(e) => {
+                        println!("  {} Failed to execute: {}", red().apply_to("✗"), e);
+                    }
                 }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    println!("  {} Connection failed: {}", yellow().apply_to("⚠"), stderr.trim());
-                }
-                Err(e) => {
-                    println!("  {} Failed to execute: {}", red().apply_to("✗"), e);
-                }
+            } else {
+                println!("  {}", dim().apply_to("URL-based server — use curl or http client to test connectivity."));
             }
         }
         None => {
@@ -162,7 +232,7 @@ pub fn cmd_mcp_test(name: &str) -> anyhow::Result<()> {
 }
 
 /// Configure MCP servers interactively.
-pub fn cmd_mcp_configure() -> anyhow::Result<()> {
+pub fn cmd_mcp_configure(_name: &str) -> anyhow::Result<()> {
     let servers = load_mcp_servers();
 
     println!();
@@ -174,7 +244,12 @@ pub fn cmd_mcp_configure() -> anyhow::Result<()> {
     } else {
         for (i, server) in servers.iter().enumerate() {
             let status = if server.enabled { "ON" } else { "OFF" };
-            println!("  {}. {} [{}] — {} {}", i + 1, server.name, status, server.command, server.args.join(" "));
+            let location = match (&server.url, &server.command) {
+                (Some(u), _) => format!("url: {u}"),
+                (_, Some(c)) => format!("{c} {}", server.args.join(" ")),
+                (None, None) => "(none)".to_string(),
+            };
+            println!("  {}. {} [{status}] — {location}", i + 1, server.name);
         }
     }
     println!();
@@ -195,7 +270,7 @@ pub fn cmd_mcp(
         "list" | "ls" | "" => cmd_mcp_list(),
         "add" | "register" => {
             let n = name.ok_or_else(|| anyhow::anyhow!("name is required"))?;
-            cmd_mcp_add(n, command, args, true)
+            cmd_mcp_add(n, None, if command.is_empty() { None } else { Some(command) }, args, None, None, &[])
         }
         "remove" | "rm" | "unregister" => {
             let n = name.ok_or_else(|| anyhow::anyhow!("name is required"))?;
@@ -205,7 +280,7 @@ pub fn cmd_mcp(
             let n = name.ok_or_else(|| anyhow::anyhow!("name is required"))?;
             cmd_mcp_test(n)
         }
-        "configure" | "config" => cmd_mcp_configure(),
+        "configure" | "config" => cmd_mcp_configure(""),
         _ => {
             anyhow::bail!("Unknown action: {}. Use list, add, remove, test, or configure.", action);
         }
@@ -213,7 +288,7 @@ pub fn cmd_mcp(
 }
 
 /// Run as MCP stdio server.
-pub fn cmd_mcp_serve() -> anyhow::Result<()> {
+pub fn cmd_mcp_serve(_verbose: bool) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ MCP Stdio Server"));
     println!();
@@ -231,10 +306,60 @@ pub fn cmd_mcp_serve() -> anyhow::Result<()> {
     } else {
         println!("  Enabled servers:");
         for server in &enabled {
-            println!("    - {} ({})", server.name, server.command);
+            let location = match (&server.url, &server.command) {
+                (Some(u), _) => format!("url: {u}"),
+                (_, Some(c)) => format!("{c} {}", server.args.join(" ")),
+                (None, None) => "(none)".to_string(),
+            };
+            println!("    - {} ({})", server.name, location);
         }
     }
     println!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_server_deserialize_legacy_format() {
+        // Legacy config had command as required String; new format makes it Option<String>
+        let legacy_json = r#"{"name":"test","command":"python","args":["-m","server"],"enabled":true}"#;
+        let server: MCPServer = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(server.name, "test");
+        assert_eq!(server.command, Some("python".to_string()));
+        assert!(server.url.is_none());
+        assert!(server.auth.is_none());
+        assert!(server.preset.is_none());
+        assert_eq!(server.args, vec!["-m", "server"]);
+        assert!(server.enabled);
+    }
+
+    #[test]
+    fn test_mcp_server_deserialize_new_format() {
+        let new_json = r#"{"name":"remote","url":"http://localhost:8080","auth":"bearer","preset":"github","env":["FOO=bar"]}"#;
+        let server: MCPServer = serde_json::from_str(new_json).unwrap();
+        assert_eq!(server.name, "remote");
+        assert_eq!(server.url, Some("http://localhost:8080".to_string()));
+        assert!(server.command.is_none());
+        assert_eq!(server.auth, Some("bearer".to_string()));
+        assert_eq!(server.preset, Some("github".to_string()));
+        assert_eq!(server.env, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn test_mcp_server_deserialize_empty_defaults() {
+        let minimal = r#"{"name":"minimal"}"#;
+        let server: MCPServer = serde_json::from_str(minimal).unwrap();
+        assert_eq!(server.name, "minimal");
+        assert!(server.command.is_none());
+        assert!(server.url.is_none());
+        assert!(server.args.is_empty());
+        assert!(!server.enabled);
+        assert!(server.auth.is_none());
+        assert!(server.preset.is_none());
+        assert!(server.env.is_empty());
+    }
 }

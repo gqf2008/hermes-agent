@@ -41,7 +41,7 @@ pub async fn run_review(
     let user_msg = extract_user_message(&messages)
         .unwrap_or_default();
     let user_msg_truncated = if user_msg.len() > MAX_USER_MSG_LEN {
-        format!("{}... [truncated]", &user_msg[..MAX_USER_MSG_LEN])
+        format!("{}... [truncated]", user_msg.chars().take(MAX_USER_MSG_LEN).collect::<String>())
     } else {
         user_msg
     };

@@ -68,9 +68,12 @@ pub fn cmd_cron_create(
     name: &str,
     schedule: &str,
     command: &str,
-    prompt: Option<&str>,
+    _prompt: Option<&str>,
     delivery: &str,
     enabled: bool,
+    _repeat: usize,
+    _skill: Option<&str>,
+    _script: Option<&str>,
 ) -> anyhow::Result<()> {
     let green = Style::new().green();
     let cyan = Style::new().cyan();
@@ -157,6 +160,12 @@ pub fn cmd_cron_edit(
     name: Option<&str>,
     prompt: Option<&str>,
     deliver: Option<&str>,
+    _repeat: Option<usize>,
+    _script: Option<&str>,
+    _skill: Option<&str>,
+    _add_skill: Option<&str>,
+    _remove_skill: Option<&str>,
+    _clear_skills: bool,
 ) -> anyhow::Result<()> {
     let green = Style::new().green();
     let cyan = Style::new().cyan();

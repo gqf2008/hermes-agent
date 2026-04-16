@@ -301,6 +301,16 @@ pub struct TurnResult {
     /// were reached without resolving the context overflow. The caller
     /// (e.g., gateway) should auto-reset the session to break the loop.
     pub compression_exhausted: bool,
+    /// Token usage from the last LLM call (if available).
+    pub usage: Option<TurnUsage>,
+}
+
+/// Token usage from a turn.
+#[derive(Debug, Clone)]
+pub struct TurnUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// AI Agent with tool calling capabilities.
@@ -323,6 +333,8 @@ pub struct AIAgent {
     delegate_depth: u32,
     /// Pending subagent results to inject as tool messages.
     delegate_results: std::sync::Mutex<Vec<SubagentResult>>,
+    /// Token usage from the last LLM call (for API response propagation).
+    last_usage: std::sync::Mutex<Option<TurnUsage>>,
     /// Activity callback to prevent gateway inactivity timeout.
     activity_callback: Option<ActivityCallback>,
     /// Turns since last memory tool use (starts at 0).
@@ -397,6 +409,7 @@ impl AIAgent {
             iters_since_skill: 0,
             disable_streaming: false,
             force_ascii_payload: false,
+            last_usage: std::sync::Mutex::new(None),
         })
     }
 
@@ -826,6 +839,7 @@ impl AIAgent {
             api_calls: api_call_count,
             exit_reason: exit_reason.to_string(),
             compression_exhausted,
+            usage: self.take_last_usage(),
         }
     }
 
@@ -879,6 +893,19 @@ impl AIAgent {
                 e.to_string(),
             ))?;
 
+        // Capture usage for later propagation to API responses
+        if let Some(ref usage_info) = response.usage {
+            let usage = TurnUsage {
+                prompt_tokens: usage_info.prompt_tokens,
+                completion_tokens: usage_info.completion_tokens,
+                total_tokens: usage_info.total_tokens,
+            };
+            // Safety: we hold &mut self through the async borrow, so this is safe
+            // to update via a separate method call after the match.
+            // We'll store it after returning. For now, save it via a helper.
+            self.set_last_usage(usage);
+        }
+
         // Convert to internal format
         let mut result = serde_json::json!({
             "role": "assistant",
@@ -894,6 +921,18 @@ impl AIAgent {
         }
 
         Ok(result)
+    }
+
+    /// Store usage from the last LLM call (interior mutability via Mutex).
+    fn set_last_usage(&self, usage: TurnUsage) {
+        if let Ok(mut guard) = self.last_usage.lock() {
+            *guard = Some(usage);
+        }
+    }
+
+    /// Extract and clear the last LLM usage.
+    fn take_last_usage(&self) -> Option<TurnUsage> {
+        self.last_usage.lock().ok().and_then(|mut g| g.take())
     }
 
     /// Extract and clear pending delegate results.
@@ -1323,6 +1362,7 @@ mod tests {
             api_calls: 1,
             exit_reason: "completed".to_string(),
             compression_exhausted: false,
+            usage: None,
         };
         assert_eq!(result.response, "hello");
         assert_eq!(result.messages.len(), 1);

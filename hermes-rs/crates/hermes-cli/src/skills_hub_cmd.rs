@@ -92,7 +92,9 @@ fn scan_skills_dir(dir: &PathBuf) -> Vec<SkillEntry> {
 
 fn save_skills_index(skills: &[SkillEntry]) -> anyhow::Result<()> {
     let path = skills_index_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(skills)?;
     std::fs::write(&path, content)?;
     Ok(())
@@ -127,8 +129,8 @@ pub fn cmd_skills_list(source: &str) -> anyhow::Result<()> {
                 skill.description.clone()
             };
             println!("  {} — {} {}", skill.name, status, dim().apply_to(&desc));
-            if skill.version.is_some() {
-                println!("    source: {}, version: {}", skill.source, skill.version.as_ref().unwrap());
+            if let Some(ref ver) = skill.version {
+                println!("    source: {}, version: {}", skill.source, ver);
             }
         }
     }
@@ -286,12 +288,10 @@ pub fn cmd_skills_inspect(identifier: &str) -> anyhow::Result<()> {
         println!("  Path: {}", skill_path.display());
 
         // Read skill files
-        for entry in std::fs::read_dir(&skill_path).ok().into_iter().flatten() {
-            if let Ok(e) = entry {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".md") || name.ends_with(".txt") || name.ends_with(".py") || name.ends_with(".yaml") {
-                    println!("    {}", name);
-                }
+        for e in std::fs::read_dir(&skill_path).ok().into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".md") || name.ends_with(".txt") || name.ends_with(".py") || name.ends_with(".yaml") {
+                println!("    {}", name);
             }
         }
     } else {
@@ -314,7 +314,7 @@ pub fn cmd_skills_inspect(identifier: &str) -> anyhow::Result<()> {
 }
 
 /// Install a skill.
-pub fn cmd_skills_install(identifier: &str, category: &str, force: bool) -> anyhow::Result<()> {
+pub fn cmd_skills_install(identifier: &str, category: &str, force: bool, _yes: bool) -> anyhow::Result<()> {
     let dir = skills_dir();
     std::fs::create_dir_all(&dir)?;
 
@@ -514,17 +514,15 @@ pub fn cmd_skills_audit(name_filter: Option<&str>) -> anyhow::Result<()> {
     let indexed: std::collections::HashSet<String> = index.iter().map(|s| s.name.clone()).collect();
 
     if dir.exists() {
-        for entry in std::fs::read_dir(&dir).ok().into_iter().flatten() {
-            if let Ok(e) = entry {
-                if e.path().is_dir() {
-                    let disk_name = e.file_name().to_string_lossy().to_string();
-                    if !indexed.contains(&disk_name) {
-                        if let Some(filter) = name_filter {
-                            if disk_name != filter { continue; }
-                        }
-                        println!("  {} {} — on disk but not in index",
-                            yellow().apply_to("⚠"), disk_name);
+        for e in std::fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
+            if e.path().is_dir() {
+                let disk_name = e.file_name().to_string_lossy().to_string();
+                if !indexed.contains(&disk_name) {
+                    if let Some(filter) = name_filter {
+                        if disk_name != filter { continue; }
                     }
+                    println!("  {} {} — on disk but not in index",
+                        yellow().apply_to("⚠"), disk_name);
                 }
             }
         }
@@ -576,14 +574,16 @@ fn load_taps() -> Vec<SkillTap> {
 
 fn save_taps(taps: &[SkillTap]) -> anyhow::Result<()> {
     let path = skills_taps_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(taps)?;
     std::fs::write(&path, content)?;
     Ok(())
 }
 
 /// Publish a skill to a registry.
-pub fn cmd_skills_publish(name: &str, _registry: &str) -> anyhow::Result<()> {
+pub fn cmd_skills_publish(name: &str, _registry: Option<&str>, _repo: Option<&str>) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ Publish Skill"));
     println!();
@@ -643,7 +643,7 @@ pub fn cmd_skills_tap_list() -> anyhow::Result<()> {
 /// Add a tap.
 pub fn cmd_skills_tap_add(repo: &str) -> anyhow::Result<()> {
     let mut taps = load_taps();
-    let name = repo.split('/').last().unwrap_or(repo);
+    let name = repo.split('/').next_back().unwrap_or(repo);
     if taps.iter().any(|t| t.name == name) {
         println!("  {} Tap '{name}' already exists.", yellow().apply_to("⚠"));
     } else {
@@ -709,7 +709,7 @@ pub fn cmd_skills(
         "browse" => cmd_skills_browse(page, limit.max(20), source),
         "install" => {
             let n = name.ok_or_else(|| anyhow::anyhow!("skill name is required"))?;
-            cmd_skills_install(n, category, force)
+            cmd_skills_install(n, category, force, false)
         }
         "uninstall" | "remove" => {
             let n = name.ok_or_else(|| anyhow::anyhow!("skill name is required"))?;
@@ -725,7 +725,7 @@ pub fn cmd_skills(
         "list" | "" => cmd_skills_list(source),
         "publish" => {
             let n = name.ok_or_else(|| anyhow::anyhow!("skill name is required"))?;
-            cmd_skills_publish(n, category)
+            cmd_skills_publish(n, Some(category), None)
         }
         "snapshot-export" => cmd_skills_snapshot_export(category),
         "snapshot-import" => {

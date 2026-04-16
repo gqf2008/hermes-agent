@@ -15,6 +15,11 @@ pub fn cmd_login(
     client_id: Option<&str>,
     no_browser: bool,
     scopes: Option<&str>,
+    _portal_url: Option<&str>,
+    _inference_url: Option<&str>,
+    _timeout: Option<f64>,
+    _ca_bundle: Option<&str>,
+    _insecure: bool,
 ) -> anyhow::Result<()> {
     println!();
     println!("{}", cyan().apply_to("◆ OAuth Login"));

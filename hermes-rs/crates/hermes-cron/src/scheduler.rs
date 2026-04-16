@@ -301,13 +301,11 @@ fn load_skill_content(skill_name: &str) -> Result<String> {
         let mut content = String::new();
         for entry in std::fs::read_dir(&bundled).map_err(|e| {
             HermesError::new(hermes_core::errors::ErrorCategory::InternalError, format!("Failed to read skill dir: {e}"))
-        })? {
-            if let Ok(entry) = entry {
-                if entry.path().extension().is_some_and(|ext| ext == "md") {
-                    if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                        content.push_str(&text);
-                        content.push_str("\n\n");
-                    }
+        })?.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "md") {
+                if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                    content.push_str(&text);
+                    content.push_str("\n\n");
                 }
             }
         }
@@ -332,7 +330,7 @@ fn run_job_script(script_path: &str) -> Result<String> {
     let full_path = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
-        scripts_dir.join(&script_path)
+        scripts_dir.join(script_path)
     };
 
     // Validate script is within scripts directory (path traversal guard)

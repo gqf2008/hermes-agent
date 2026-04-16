@@ -1027,6 +1027,17 @@ async fn chat_completions_handler(
 
     let response = result.response;
 
+    // Extract token usage from handler result
+    let usage = result.usage.map(|u| Usage {
+        prompt_tokens: u.prompt_tokens as usize,
+        completion_tokens: u.completion_tokens as usize,
+        total_tokens: u.total_tokens as usize,
+    }).unwrap_or(Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    });
+
     let model = request.model.clone().unwrap_or_else(|| state.model_name.clone());
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
@@ -1062,11 +1073,7 @@ async fn chat_completions_handler(
                 },
                 finish_reason: "stop".to_string(),
             }],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            },
+            usage,
         };
 
         // Cache response for idempotency
@@ -1292,8 +1299,7 @@ async fn responses_handler(
     if request.stream.unwrap_or(false) {
         let stream_result = responses_stream_handler(
             state.clone(), &state.api_key, request,
-        ).await
-        .map_err(|e| e)?;
+        ).await?;
         return Ok(ResponsesResponse::Sse(stream_result));
     }
 
@@ -1737,8 +1743,7 @@ async fn runs_handler(
             s.to_string()
         } else if let Some(arr) = raw_input.as_array() {
             arr.last()
-                .and_then(|m| m.get("content"))
-                .and_then(|c| Some(extract_content_from_value(Some(c))))
+                .and_then(|m| m.get("content")).map(|c| extract_content_from_value(Some(c)))
                 .unwrap_or_default()
         } else {
             String::new()

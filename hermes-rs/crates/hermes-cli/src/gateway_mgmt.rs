@@ -401,7 +401,7 @@ fn is_process_running(pid: u32) -> bool {
 
 /// Start gateway in foreground (already implemented in app.rs).
 /// Start gateway as background service.
-pub fn cmd_gateway_start() -> Result<(), String> {
+pub fn cmd_gateway_start(_all: bool, _system: bool) -> Result<(), String> {
     let green = Style::new().green();
     let yellow = Style::new().yellow();
 
@@ -449,7 +449,7 @@ pub fn cmd_gateway_start() -> Result<(), String> {
 }
 
 /// Stop gateway service.
-pub fn cmd_gateway_stop() -> Result<(), String> {
+pub fn cmd_gateway_stop(_all: bool, _system: bool) -> Result<(), String> {
     let green = Style::new().green();
     let yellow = Style::new().yellow();
 
@@ -513,7 +513,7 @@ pub fn cmd_gateway_stop() -> Result<(), String> {
 }
 
 /// Show gateway status.
-pub fn cmd_gateway_status() -> Result<(), String> {
+pub fn cmd_gateway_status(_deep: bool, _system: bool) -> Result<(), String> {
     let green = Style::new().green();
     let yellow = Style::new().yellow();
     let red = Style::new().red();
@@ -649,7 +649,7 @@ pub fn cmd_gateway_status() -> Result<(), String> {
 }
 
 /// Install gateway as system service.
-pub fn cmd_gateway_install() -> Result<(), String> {
+pub fn cmd_gateway_install(_force: bool, _system: bool, _run_as_user: Option<&str>) -> Result<(), String> {
     let green = Style::new().green();
     let yellow = Style::new().yellow();
 
@@ -675,7 +675,7 @@ pub fn cmd_gateway_install() -> Result<(), String> {
 }
 
 /// Uninstall gateway service.
-pub fn cmd_gateway_uninstall() -> Result<(), String> {
+pub fn cmd_gateway_uninstall(_system: bool) -> Result<(), String> {
     let green = Style::new().green();
     let yellow = Style::new().yellow();
 
@@ -721,21 +721,15 @@ pub fn cmd_gateway_uninstall() -> Result<(), String> {
 }
 
 /// Restart gateway service.
-pub fn cmd_gateway_restart(system: bool) -> Result<(), String> {
-    cmd_gateway_stop()?;
-    if system {
-        cmd_gateway_start()?;
-    } else {
-        cmd_gateway_start()?;
-    }
+pub fn cmd_gateway_restart(_system: bool, _all: bool) -> Result<(), String> {
+    cmd_gateway_stop(false, false)?;
+    cmd_gateway_start(false, false)?;
     Ok(())
 }
 
 /// Configure messaging platforms interactively.
 pub fn cmd_gateway_setup() -> Result<(), String> {
     let cyan = Style::new().cyan();
-    let _green = Style::new().green();
-    let _dim = Style::new().dim();
 
     println!();
     println!("{}", cyan.apply_to("◆ Gateway Platform Setup"));

@@ -75,6 +75,9 @@ enum Commands {
         /// Quiet mode (suppress debug output)
         #[arg(long)]
         quiet: bool,
+        /// Verbose output (show tool previews, debug info)
+        #[arg(short = 'v', long)]
+        verbose: bool,
         /// Skip loading context files
         #[arg(long)]
         skip_context_files: bool,
@@ -89,6 +92,12 @@ enum Commands {
     Setup {
         /// Section to configure (model, terminal, agent, gateway, tools, tts)
         section: Option<String>,
+        /// Non-interactive mode (use defaults/env vars)
+        #[arg(long)]
+        non_interactive: bool,
+        /// Reset configuration to defaults
+        #[arg(long)]
+        reset: bool,
     },
     /// Backup Hermes state
     Backup {
@@ -200,7 +209,14 @@ enum Commands {
         deep: bool,
     },
     /// Show session analytics and insights
-    Insights,
+    Insights {
+        /// Number of days to analyze (default: 30)
+        #[arg(long, default_value_t = 30)]
+        days: usize,
+        /// Filter by platform/source
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Generate shell completion script
     Completion {
         /// Shell type: bash, zsh, fish, elvish, powershell
@@ -284,6 +300,21 @@ enum Commands {
         /// OAuth scopes
         #[arg(long)]
         scopes: Option<String>,
+        /// Nous portal base URL
+        #[arg(long)]
+        portal_url: Option<String>,
+        /// Nous inference base URL
+        #[arg(long)]
+        inference_url: Option<String>,
+        /// Request timeout in seconds
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// Custom CA bundle path
+        #[arg(long)]
+        ca_bundle: Option<String>,
+        /// Disable TLS verification
+        #[arg(long)]
+        insecure: bool,
     },
     /// Manage device pairings
     Pairing {
@@ -298,6 +329,9 @@ enum Commands {
         /// Force upgrade even when up to date
         #[arg(long)]
         force: bool,
+        /// Gateway mode: use file-based IPC (internal use)
+        #[arg(long)]
+        gateway: bool,
     },
     /// Uninstall Hermes Agent
     Uninstall {
@@ -308,8 +342,8 @@ enum Commands {
         #[arg(long)]
         keep_config: bool,
         /// Skip confirmation
-        #[arg(short, long)]
-        force: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Interactive analytics dashboard
     Dashboard {
@@ -349,12 +383,33 @@ enum Commands {
     Claw {
         /// Action: migrate, cleanup
         action: String,
-        /// Source system (claude-code, chatgpt)
+        /// Source system path or name (claude-code, chatgpt, or ~/.openclaw)
         #[arg(long)]
-        source: String,
+        source: Option<String>,
         /// Force migration
         #[arg(long)]
         force: bool,
+        /// Preview only — stop after showing what would be migrated
+        #[arg(long)]
+        dry_run: bool,
+        /// Migration preset: user-data (excludes secrets) or full
+        #[arg(long, default_value = "full")]
+        preset: String,
+        /// Overwrite existing files (default: skip conflicts)
+        #[arg(long)]
+        overwrite: bool,
+        /// Include allowlisted secrets
+        #[arg(long)]
+        migrate_secrets: bool,
+        /// Skip confirmation prompts
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Path to copy workspace instructions into
+        #[arg(long)]
+        workspace_target: Option<String>,
+        /// How to handle skill conflicts (choices: skip, overwrite, rename)
+        #[arg(long, default_value = "skip")]
+        skill_conflict: String,
     },
 }
 
@@ -376,12 +431,16 @@ enum PairingAction {
     List,
     /// Approve a pairing code
     Approve {
+        /// Platform name (telegram, discord, slack, whatsapp)
+        platform: String,
         /// Pairing code
         code: String,
     },
     /// Revoke user access
     Revoke {
-        /// Pairing code
+        /// Platform name
+        platform: String,
+        /// Pairing code or user ID to revoke
         code: String,
     },
     /// Clear all pending codes
@@ -413,6 +472,9 @@ enum WebhookAction {
         /// Comma-separated skill names
         #[arg(long, default_value = "")]
         skills: String,
+        /// HMAC secret for payload verification
+        #[arg(long)]
+        secret: Option<String>,
     },
     /// List webhook subscriptions
     #[command(alias = "ls")]
@@ -488,12 +550,24 @@ enum McpAction {
     Add {
         /// Server name
         name: String,
+        /// HTTP/SSE endpoint URL
+        #[arg(long)]
+        url: Option<String>,
         /// Command to run
         #[arg(long)]
-        command: String,
+        command: Option<String>,
         /// Command arguments
         #[arg(long, default_values_t = Vec::<String>::new())]
         args: Vec<String>,
+        /// Auth method (oauth, header)
+        #[arg(long)]
+        auth: Option<String>,
+        /// Known MCP preset name
+        #[arg(long)]
+        preset: Option<String>,
+        /// Environment variables (KEY=VALUE)
+        #[arg(long, default_values_t = Vec::<String>::new())]
+        env: Vec<String>,
     },
     /// Remove an MCP server
     #[command(alias = "rm", alias = "delete")]
@@ -508,9 +582,16 @@ enum McpAction {
     },
     /// Interactive MCP configuration
     #[command(alias = "config")]
-    Configure,
+    Configure {
+        /// Server name
+        name: String,
+    },
     /// Run as MCP stdio server
-    Serve,
+    Serve {
+        /// Enable verbose logging on stderr
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -586,6 +667,9 @@ enum SkillAction {
         /// Force install despite existing
         #[arg(long)]
         force: bool,
+        /// Skip confirmation prompts
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Preview a skill without installing
     Inspect {
@@ -639,6 +723,9 @@ enum SkillAction {
         /// Registry URL
         #[arg(long)]
         registry: Option<String>,
+        /// Target GitHub repo (owner/repo)
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Export/import skill configurations
     Snapshot {
@@ -667,6 +754,9 @@ enum SnapshotAction {
     Import {
         /// Input file path
         path: String,
+        /// Force import despite existing
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -696,7 +786,21 @@ enum ProfileAction {
     List,
     /// Create a new profile
     #[command(alias = "add")]
-    Create { name: String },
+    Create {
+        name: String,
+        /// Copy config.yaml, .env, SOUL.md from active profile
+        #[arg(long)]
+        clone: bool,
+        /// Full copy of active profile
+        #[arg(long)]
+        clone_all: bool,
+        /// Source profile to clone from
+        #[arg(long)]
+        clone_from: Option<String>,
+        /// Skip wrapper script creation
+        #[arg(long)]
+        no_alias: bool,
+    },
     /// Switch to a profile
     Use { name: String },
     /// Delete a profile
@@ -707,6 +811,9 @@ enum ProfileAction {
         /// Skip confirmation
         #[arg(short, long)]
         force: bool,
+        /// Skip confirmation (alias)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Show profile details
     Show {
@@ -717,6 +824,12 @@ enum ProfileAction {
     Alias {
         /// Profile name
         name: String,
+        /// Remove the wrapper script
+        #[arg(long)]
+        remove: bool,
+        /// Custom alias name
+        #[arg(long)]
+        alias_name: Option<String>,
     },
     /// Rename a profile
     Rename {
@@ -738,6 +851,9 @@ enum ProfileAction {
     Import {
         /// Archive file path
         path: String,
+        /// Profile name (default: inferred from archive)
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -753,22 +869,14 @@ enum SessionAction {
         #[arg(short, long)]
         source: Option<String>,
     },
-    /// Export a session to JSON
-    Export {
-        /// Session ID or prefix
-        session_id: String,
-        /// Output file path
-        #[arg(short, long)]
-        output: Option<String>,
-    },
     /// Delete a session
     #[command(alias = "rm")]
     Delete {
         /// Session ID or prefix
         session_id: String,
         /// Skip confirmation
-        #[arg(short, long)]
-        force: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Search sessions by query
     Search {
@@ -794,15 +902,15 @@ enum SessionAction {
     },
     /// Prune old sessions
     Prune {
-        /// Delete sessions older than this many days (default: 30)
-        #[arg(long, default_value_t = 30)]
-        older_than_days: i64,
+        /// Delete sessions older than this many days (default: 90)
+        #[arg(long, default_value_t = 90)]
+        older_than: i64,
         /// Filter by source
         #[arg(short, long)]
         source: Option<String>,
         /// Skip confirmation
-        #[arg(short, long)]
-        force: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Interactive session browser
     Browse {
@@ -896,23 +1004,71 @@ enum BatchAction {
 #[derive(Subcommand)]
 enum GatewayAction {
     /// Run gateway in foreground
-    Run,
+    Run {
+        /// Enable verbose logging
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Suppress non-error output
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Replace running gateway instance
+        #[arg(long)]
+        replace: bool,
+    },
     /// Start gateway as background service
-    Start,
+    Start {
+        /// Start on all platforms
+        #[arg(long)]
+        all: bool,
+        /// Target Linux system-level gateway service (systemd)
+        #[arg(long)]
+        system: bool,
+    },
     /// Stop gateway service
-    Stop,
+    Stop {
+        /// Stop on all platforms
+        #[arg(long)]
+        all: bool,
+        /// Target Linux system-level gateway service (systemd)
+        #[arg(long)]
+        system: bool,
+    },
     /// Restart gateway service
     Restart {
         /// Restart system service (systemd/launchd)
         #[arg(long)]
         system: bool,
+        /// Restart on all platforms
+        #[arg(long)]
+        all: bool,
     },
     /// Show gateway status
-    Status,
+    Status {
+        /// Run deep checks (slower)
+        #[arg(long)]
+        deep: bool,
+        /// Target Linux system-level gateway service (systemd)
+        #[arg(long)]
+        system: bool,
+    },
     /// Install gateway as systemd/launchd service
-    Install,
+    Install {
+        /// Force reinstall
+        #[arg(long)]
+        force: bool,
+        /// Install as Linux system-level service (systemd)
+        #[arg(long)]
+        system: bool,
+        /// User account the Linux system service should run as
+        #[arg(long)]
+        run_as_user: Option<String>,
+    },
     /// Uninstall gateway service
-    Uninstall,
+    Uninstall {
+        /// Target Linux system-level gateway service (systemd)
+        #[arg(long)]
+        system: bool,
+    },
     /// Configure messaging platforms
     Setup,
 }
@@ -946,6 +1102,15 @@ enum CronAction {
         /// Start disabled
         #[arg(long)]
         paused: bool,
+        /// Repeat count (0 = infinite)
+        #[arg(long, default_value_t = 0)]
+        repeat: usize,
+        /// Skill name to invoke
+        #[arg(long)]
+        skill: Option<String>,
+        /// Script content to execute
+        #[arg(long)]
+        script: Option<String>,
     },
     /// Delete a scheduled job
     #[command(alias = "rm", alias = "delete")]
@@ -982,6 +1147,24 @@ enum CronAction {
         /// New delivery target
         #[arg(long)]
         deliver: Option<String>,
+        /// Repeat count
+        #[arg(long)]
+        repeat: Option<usize>,
+        /// Script content
+        #[arg(long)]
+        script: Option<String>,
+        /// Skill name to set
+        #[arg(long)]
+        skill: Option<String>,
+        /// Add a skill to the job
+        #[arg(long)]
+        add_skill: Option<String>,
+        /// Remove a skill from the job
+        #[arg(long)]
+        remove_skill: Option<String>,
+        /// Clear all skills
+        #[arg(long)]
+        clear_skills: bool,
     },
     /// Trigger a job to run on next tick
     Run {
@@ -1004,8 +1187,8 @@ enum AuthAction {
         #[arg(long, default_value = "api-key")]
         auth_type: String,
         /// API key value
-        #[arg(long)]
-        key: Option<String>,
+        #[arg(long, alias = "key")]
+        api_key: Option<String>,
         /// Label for this credential
         #[arg(long)]
         label: Option<String>,
@@ -1015,6 +1198,24 @@ enum AuthAction {
         /// Skip browser auto-open for OAuth
         #[arg(long)]
         no_browser: bool,
+        /// Nous portal base URL
+        #[arg(long)]
+        portal_url: Option<String>,
+        /// Nous inference base URL
+        #[arg(long)]
+        inference_url: Option<String>,
+        /// OAuth scope override
+        #[arg(long)]
+        scope: Option<String>,
+        /// OAuth/network timeout in seconds
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// Disable TLS verification for OAuth login
+        #[arg(long)]
+        insecure: bool,
+        /// Custom CA bundle for OAuth login
+        #[arg(long)]
+        ca_bundle: Option<String>,
     },
     /// List pooled credentials
     List {
@@ -1065,12 +1266,15 @@ fn main() -> anyhow::Result<()> {
     let app = HermesApp::new()?;
 
     match cli.command {
-        Some(Commands::Chat { model, query, image, toolsets, skills, provider, resume, continue_last, worktree, checkpoints, max_turns, yolo, pass_session_id, source, quiet, skip_context_files, skip_memory, voice }) => {
-            app.run_chat(model, query, image, toolsets, skills, provider, resume, continue_last, worktree, checkpoints, max_turns, yolo, pass_session_id, source, quiet, skip_context_files, skip_memory, voice)?;
+        Some(Commands::Chat { model, query, image, toolsets, skills, provider, resume, continue_last, worktree, checkpoints, max_turns, yolo, pass_session_id, source, quiet, verbose, skip_context_files, skip_memory, voice }) => {
+            app.run_chat(model, query, image, toolsets, skills, provider, resume, continue_last, worktree, checkpoints, max_turns, yolo, pass_session_id, source, quiet, verbose, skip_context_files, skip_memory, voice)?;
         }
-        Some(Commands::Setup { section }) => {
-            if let Some(sec) = section {
-                hermes_cli::setup_cmd::cmd_setup_section(&sec)
+        Some(Commands::Setup { section, non_interactive, reset }) => {
+            if reset {
+                hermes_cli::setup_cmd::cmd_setup_reset()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            } else if let Some(sec) = section {
+                hermes_cli::setup_cmd::cmd_setup_section(&sec, non_interactive)
                     .map_err(|e| anyhow::anyhow!(e))?;
             } else {
                 hermes_cli::setup_cmd::cmd_setup()
@@ -1129,8 +1333,8 @@ fn main() -> anyhow::Result<()> {
                 Some(SkillAction::Browse { page, size, source }) => {
                     hermes_cli::skills_hub_cmd::cmd_skills("browse", None, None, &source, size, page, "", false)?;
                 }
-                Some(SkillAction::Install { identifier, category, force }) => {
-                    hermes_cli::skills_hub_cmd::cmd_skills("install", Some(&identifier), None, "all", 10, 1, &category, force)?;
+                Some(SkillAction::Install { identifier, category, force, yes }) => {
+                    hermes_cli::skills_hub_cmd::cmd_skills_install(&identifier, &category, force, yes)?;
                 }
                 Some(SkillAction::Inspect { identifier }) => {
                     hermes_cli::skills_hub_cmd::cmd_skills("inspect", Some(&identifier), None, "all", 10, 1, "", false)?;
@@ -1151,16 +1355,16 @@ fn main() -> anyhow::Result<()> {
                     hermes_cli::skills_hub_cmd::cmd_skills("audit", name.as_deref(), None, "all", 10, 1, "", false)?;
                 }
                 Some(SkillAction::Commands) => app.list_skill_commands()?,
-                Some(SkillAction::Publish { name, registry }) => {
-                    hermes_cli::skills_hub_cmd::cmd_skills("publish", Some(&name), None, "all", 10, 1, registry.as_deref().unwrap_or(""), false)?;
+                Some(SkillAction::Publish { name, registry, repo }) => {
+                    hermes_cli::skills_hub_cmd::cmd_skills_publish(&name, registry.as_deref(), repo.as_deref())?;
                 }
                 Some(SkillAction::Snapshot { snapshot_action }) => {
                     match snapshot_action {
                         Some(SnapshotAction::Export { output }) => {
                             hermes_cli::skills_hub_cmd::cmd_skills("snapshot-export", None, None, "all", 10, 1, output.as_deref().unwrap_or(""), false)?;
                         }
-                        Some(SnapshotAction::Import { path }) => {
-                            hermes_cli::skills_hub_cmd::cmd_skills("snapshot-import", Some(&path), None, "all", 10, 1, "", false)?;
+                        Some(SnapshotAction::Import { path, force }) => {
+                            hermes_cli::skills_hub_cmd::cmd_skills("snapshot-import", Some(&path), None, "all", 10, 1, "", force)?;
                         }
                         None => {
                             hermes_cli::skills_hub_cmd::cmd_skills("snapshot-export", None, None, "all", 10, 1, "", false)?;
@@ -1191,31 +1395,34 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Gateway { action }) => {
             match action {
-                Some(GatewayAction::Run) | None => {
-                    app.run_gateway()?;
+                Some(GatewayAction::Run { verbose, quiet, replace }) => {
+                    app.run_gateway_with_opts(verbose, quiet, replace)?;
                 }
-                Some(GatewayAction::Start) => {
-                    hermes_cli::gateway_mgmt::cmd_gateway_start()
+                None => {
+                    app.run_gateway_with_opts(false, false, false)?;
+                }
+                Some(GatewayAction::Start { all, system }) => {
+                    hermes_cli::gateway_mgmt::cmd_gateway_start(all, system)
                         .map_err(|e| anyhow::anyhow!(e))?;
                 }
-                Some(GatewayAction::Stop) => {
-                    hermes_cli::gateway_mgmt::cmd_gateway_stop()
+                Some(GatewayAction::Stop { all, system }) => {
+                    hermes_cli::gateway_mgmt::cmd_gateway_stop(all, system)
                         .map_err(|e| anyhow::anyhow!(e))?;
                 }
-                Some(GatewayAction::Restart { system }) => {
-                    hermes_cli::gateway_mgmt::cmd_gateway_restart(system)
+                Some(GatewayAction::Restart { system, all }) => {
+                    hermes_cli::gateway_mgmt::cmd_gateway_restart(system, all)
                         .map_err(|e| anyhow::anyhow!(e))?;
                 }
-                Some(GatewayAction::Status) => {
-                    hermes_cli::gateway_mgmt::cmd_gateway_status()
+                Some(GatewayAction::Status { deep, system }) => {
+                    hermes_cli::gateway_mgmt::cmd_gateway_status(deep, system)
                         .map_err(|e| anyhow::anyhow!(e))?;
                 }
-                Some(GatewayAction::Install) => {
-                    hermes_cli::gateway_mgmt::cmd_gateway_install()
+                Some(GatewayAction::Install { force, system, run_as_user }) => {
+                    hermes_cli::gateway_mgmt::cmd_gateway_install(force, system, run_as_user.as_deref())
                         .map_err(|e| anyhow::anyhow!(e))?;
                 }
-                Some(GatewayAction::Uninstall) => {
-                    hermes_cli::gateway_mgmt::cmd_gateway_uninstall()
+                Some(GatewayAction::Uninstall { system }) => {
+                    hermes_cli::gateway_mgmt::cmd_gateway_uninstall(system)
                         .map_err(|e| anyhow::anyhow!(e))?;
                 }
                 Some(GatewayAction::Setup) => {
@@ -1237,16 +1444,18 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Profiles { action }) => {
             match action {
                 Some(ProfileAction::List) => app.list_profiles()?,
-                Some(ProfileAction::Create { name }) => app.create_profile(&name)?,
+                Some(ProfileAction::Create { name, clone, clone_all, clone_from, no_alias }) => {
+                    hermes_cli::app::cmd_profile_create(&name, clone, clone_all, clone_from.as_deref(), no_alias)?;
+                }
                 Some(ProfileAction::Use { name }) => app.use_profile(&name)?,
-                Some(ProfileAction::Delete { name, force }) => {
-                    hermes_cli::app::cmd_profile_delete(&name, force)?;
+                Some(ProfileAction::Delete { name, force, yes }) => {
+                    hermes_cli::app::cmd_profile_delete(&name, force || yes)?;
                 }
                 Some(ProfileAction::Show { name }) => {
                     hermes_cli::app::cmd_profile_show(&name)?;
                 }
-                Some(ProfileAction::Alias { name }) => {
-                    hermes_cli::app::cmd_profile_alias(&name)?;
+                Some(ProfileAction::Alias { name, remove, alias_name }) => {
+                    hermes_cli::app::cmd_profile_alias(&name, remove, alias_name.as_deref())?;
                 }
                 Some(ProfileAction::Rename { old_name, new_name }) => {
                     hermes_cli::app::cmd_profile_rename(&old_name, &new_name)?;
@@ -1254,8 +1463,8 @@ fn main() -> anyhow::Result<()> {
                 Some(ProfileAction::Export { name, output }) => {
                     hermes_cli::app::cmd_profile_export(&name, output.as_deref())?;
                 }
-                Some(ProfileAction::Import { path }) => {
-                    hermes_cli::app::cmd_profile_import(&path)?;
+                Some(ProfileAction::Import { path, name: profile_name }) => {
+                    hermes_cli::app::cmd_profile_import(&path, profile_name.as_deref())?;
                 }
                 None => app.list_profiles()?,
             }
@@ -1266,11 +1475,8 @@ fn main() -> anyhow::Result<()> {
                 Some(SessionAction::List { limit, source }) => {
                     hermes_cli::sessions_cmd::cmd_sessions_list(&db, limit, source.as_deref(), false)?;
                 }
-                Some(SessionAction::Export { session_id, output }) => {
-                    hermes_cli::sessions_cmd::cmd_sessions_export(&db, &session_id, output.as_deref())?;
-                }
-                Some(SessionAction::Delete { session_id, force }) => {
-                    hermes_cli::sessions_cmd::cmd_sessions_delete(&db, &session_id, force)?;
+                Some(SessionAction::Delete { session_id, yes }) => {
+                    hermes_cli::sessions_cmd::cmd_sessions_delete(&db, &session_id, yes)?;
                 }
                 Some(SessionAction::Search { query, limit }) => {
                     hermes_cli::sessions_cmd::cmd_sessions_search(&db, &query, limit)?;
@@ -1281,8 +1487,8 @@ fn main() -> anyhow::Result<()> {
                 Some(SessionAction::Rename { session_id, title }) => {
                     hermes_cli::sessions_cmd::cmd_sessions_rename(&db, &session_id, &title)?;
                 }
-                Some(SessionAction::Prune { older_than_days, source, force }) => {
-                    hermes_cli::sessions_cmd::cmd_sessions_prune(&db, older_than_days, source.as_deref(), force)?;
+                Some(SessionAction::Prune { older_than, source, yes }) => {
+                    hermes_cli::sessions_cmd::cmd_sessions_prune(&db, older_than, source.as_deref(), yes)?;
                 }
                 Some(SessionAction::Browse { source, limit }) => {
                     hermes_cli::sessions_cmd::cmd_sessions_list(&db, limit, source.as_deref(), true)?;
@@ -1355,8 +1561,8 @@ fn main() -> anyhow::Result<()> {
                 Some(CronAction::List { all }) => {
                     hermes_cli::cron_cmd::cmd_cron_list(all)?;
                 }
-                Some(CronAction::Create { name, schedule, command, prompt, delivery, paused }) => {
-                    hermes_cli::cron_cmd::cmd_cron_create(&name, &schedule, &command, prompt.as_deref(), &delivery.unwrap_or_else(|| "local".to_string()), !paused)?;
+                Some(CronAction::Create { name, schedule, command, prompt, delivery, paused, repeat, skill, script }) => {
+                    hermes_cli::cron_cmd::cmd_cron_create(&name, &schedule, &command, prompt.as_deref(), &delivery.unwrap_or_else(|| "local".to_string()), !paused, repeat, skill.as_deref(), script.as_deref())?;
                 }
                 Some(CronAction::Delete { job_id, force }) => {
                     hermes_cli::cron_cmd::cmd_cron_delete(&job_id, force)?;
@@ -1367,8 +1573,8 @@ fn main() -> anyhow::Result<()> {
                 Some(CronAction::Resume { job_id }) => {
                     hermes_cli::cron_cmd::cmd_cron_resume(&job_id)?;
                 }
-                Some(CronAction::Edit { job_id, schedule, name, prompt, deliver }) => {
-                    hermes_cli::cron_cmd::cmd_cron_edit(&job_id, schedule.as_deref(), name.as_deref(), prompt.as_deref(), deliver.as_deref())?;
+                Some(CronAction::Edit { job_id, schedule, name, prompt, deliver, repeat, script, skill, add_skill, remove_skill, clear_skills }) => {
+                    hermes_cli::cron_cmd::cmd_cron_edit(&job_id, schedule.as_deref(), name.as_deref(), prompt.as_deref(), deliver.as_deref(), repeat, script.as_deref(), skill.as_deref(), add_skill.as_deref(), remove_skill.as_deref(), clear_skills)?;
                 }
                 Some(CronAction::Run { job_id }) => {
                     hermes_cli::cron_cmd::cmd_cron_run(&job_id)?;
@@ -1380,20 +1586,26 @@ fn main() -> anyhow::Result<()> {
                     hermes_cli::cron_cmd::cmd_cron_tick()?;
                 }
                 None => {
-                    hermes_cli::cron_cmd::cmd_cron_list()?;
+                    hermes_cli::cron_cmd::cmd_cron_list(false)?;
                 }
             }
         }
         Some(Commands::Auth { action }) => {
             match action {
-                Some(AuthAction::Add { provider, auth_type, key, label, client_id, no_browser }) => {
+                Some(AuthAction::Add { provider, auth_type, api_key, label, client_id, no_browser, portal_url, inference_url, scope, timeout, insecure, ca_bundle }) => {
                     hermes_cli::auth_cmd::cmd_auth_add(
                         &provider,
                         &auth_type,
-                        key.as_deref(),
+                        api_key.as_deref(),
                         label.as_deref(),
                         client_id.as_deref(),
                         no_browser,
+                        portal_url.as_deref(),
+                        inference_url.as_deref(),
+                        scope.as_deref(),
+                        timeout,
+                        insecure,
+                        ca_bundle.as_deref(),
                     )?;
                 }
                 Some(AuthAction::List { provider }) => {
@@ -1416,8 +1628,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Status { all, deep }) => {
             hermes_cli::status_cmd::cmd_status(all, deep)?;
         }
-        Some(Commands::Insights) => {
-            hermes_cli::insights_cmd::cmd_insights()?;
+        Some(Commands::Insights { days, source }) => {
+            hermes_cli::insights_cmd::cmd_insights(days, source.as_deref())?;
         }
         Some(Commands::Completion { shell }) => {
             hermes_cli::completion_cmd::cmd_completion(&shell)?;
@@ -1438,9 +1650,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Webhook { action }) => {
             match action {
-                WebhookAction::Subscribe { name, prompt, events, description, deliver, deliver_chat_id, skills } => {
+                WebhookAction::Subscribe { name, prompt, events, description, deliver, deliver_chat_id, skills, secret } => {
                     hermes_cli::webhook_cmd::cmd_webhook_subscribe(
-                        &name, &prompt, &events, &description, &deliver, deliver_chat_id, &skills,
+                        &name, &prompt, &events, &description, &deliver, deliver_chat_id, &skills, secret.as_deref(),
                     )?;
                 }
                 WebhookAction::List => {
@@ -1503,8 +1715,8 @@ fn main() -> anyhow::Result<()> {
                 Some(McpAction::List) => {
                     hermes_cli::mcp_cmd::cmd_mcp_list()?;
                 }
-                Some(McpAction::Add { name, command, args }) => {
-                    hermes_cli::mcp_cmd::cmd_mcp("add", Some(&name), &command, &args)?;
+                Some(McpAction::Add { name, url, command, args, auth, preset, env }) => {
+                    hermes_cli::mcp_cmd::cmd_mcp_add(&name, url.as_deref(), command.as_deref(), &args, auth.as_deref(), preset.as_deref(), &env)?;
                 }
                 Some(McpAction::Remove { name }) => {
                     hermes_cli::mcp_cmd::cmd_mcp("remove", Some(&name), "", &[])?;
@@ -1512,11 +1724,11 @@ fn main() -> anyhow::Result<()> {
                 Some(McpAction::Test { name }) => {
                     hermes_cli::mcp_cmd::cmd_mcp("test", Some(&name), "", &[])?;
                 }
-                Some(McpAction::Configure) => {
-                    hermes_cli::mcp_cmd::cmd_mcp_configure()?;
+                Some(McpAction::Configure { name }) => {
+                    hermes_cli::mcp_cmd::cmd_mcp_configure(&name)?;
                 }
-                Some(McpAction::Serve) => {
-                    hermes_cli::mcp_cmd::cmd_mcp_serve()?;
+                Some(McpAction::Serve { verbose }) => {
+                    hermes_cli::mcp_cmd::cmd_mcp_serve(verbose)?;
                 }
                 None => {
                     hermes_cli::mcp_cmd::cmd_mcp_list()?;
@@ -1525,7 +1737,7 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             // Default: interactive chat
-            app.run_chat(None, None, None, None, None, None, None, None, false, false, None, false, false, None, false, false, false, false)?;
+            app.run_chat(None, None, None, None, None, None, None, None, false, false, None, false, false, None, false, false, false, false, false)?;
         }
         Some(Commands::Model { action }) => {
             match action {
@@ -1534,30 +1746,30 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Commands::Login { provider, client_id, no_browser, scopes }) => {
-            hermes_cli::login_cmd::cmd_login(&provider, client_id.as_deref(), no_browser, scopes.as_deref())?;
+        Some(Commands::Login { provider, client_id, no_browser, scopes, portal_url, inference_url, timeout, ca_bundle, insecure }) => {
+            hermes_cli::login_cmd::cmd_login(&provider, client_id.as_deref(), no_browser, scopes.as_deref(), portal_url.as_deref(), inference_url.as_deref(), timeout, ca_bundle.as_deref(), insecure)?;
         }
         Some(Commands::Pairing { action }) => {
             match action {
                 PairingAction::List => {
                     hermes_cli::pairing_cmd::cmd_pairing_list()?;
                 }
-                PairingAction::Approve { code } => {
-                    hermes_cli::pairing_cmd::cmd_pairing_approve(&code)?;
+                PairingAction::Approve { platform, code } => {
+                    hermes_cli::pairing_cmd::cmd_pairing_approve(&platform, &code)?;
                 }
-                PairingAction::Revoke { code } => {
-                    hermes_cli::pairing_cmd::cmd_pairing_revoke(&code)?;
+                PairingAction::Revoke { platform, code } => {
+                    hermes_cli::pairing_cmd::cmd_pairing_revoke(&platform, &code)?;
                 }
                 PairingAction::ClearPending => {
                     hermes_cli::pairing_cmd::cmd_pairing_clear_pending()?;
                 }
             }
         }
-        Some(Commands::Update { preview, force }) => {
-            hermes_cli::update_cmd::cmd_update(preview, force)?;
+        Some(Commands::Update { preview, force, gateway }) => {
+            hermes_cli::update_cmd::cmd_update(preview, force, gateway)?;
         }
-        Some(Commands::Uninstall { keep_data, keep_config, force }) => {
-            hermes_cli::uninstall_cmd::cmd_uninstall(keep_data, keep_config, force)?;
+        Some(Commands::Uninstall { keep_data, keep_config, yes }) => {
+            hermes_cli::uninstall_cmd::cmd_uninstall(keep_data, keep_config, yes)?;
         }
         Some(Commands::Dashboard { port, host, no_open, insecure }) => {
             hermes_cli::dashboard_cmd::cmd_dashboard_with_opts(&host, port, no_open, insecure)?;
@@ -1568,8 +1780,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Acp { action, editor }) => {
             hermes_cli::acp_cmd::cmd_acp(action.as_deref().unwrap_or("status"), editor.as_deref())?;
         }
-        Some(Commands::Claw { action, source, force }) => {
-            hermes_cli::claw_cmd::cmd_claw(&action, &source, force)?;
+        Some(Commands::Claw { action, source, force, dry_run, preset, overwrite, migrate_secrets, yes, workspace_target, skill_conflict }) => {
+            hermes_cli::claw_cmd::cmd_claw(&action, source.as_deref(), force, dry_run, &preset, overwrite, migrate_secrets, yes, workspace_target.as_deref(), &skill_conflict)?;
         }
     }
 

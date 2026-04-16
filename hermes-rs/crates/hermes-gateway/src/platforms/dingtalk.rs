@@ -55,7 +55,9 @@ impl DedupCache {
     fn insert(&self, key: String) {
         let mut set = self.entries.lock();
         if set.len() >= self.max_size {
-            set.clear();
+            if let Some(oldest) = set.iter().next().cloned() {
+                set.remove(&oldest);
+            }
         }
         set.insert(key);
     }

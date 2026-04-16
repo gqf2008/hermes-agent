@@ -25,17 +25,9 @@ pub async fn generate_title(
     base_url: Option<String>,
     timeout_secs: u64,
 ) -> Option<String> {
-    // Truncate long messages to keep the request small
-    let user_snippet = if user_message.len() > 500 {
-        &user_message[..500]
-    } else {
-        user_message
-    };
-    let assistant_snippet = if assistant_response.len() > 500 {
-        &assistant_response[..500]
-    } else {
-        assistant_response
-    };
+    // Truncate long messages to keep the request small (char-safe)
+    let user_snippet = truncate_str(user_message, 500);
+    let assistant_snippet = truncate_str(assistant_response, 500);
 
     let messages = vec![
         json!({"role": "system", "content": TITLE_PROMPT}),
@@ -66,9 +58,9 @@ pub async fn generate_title(
     // Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
     let title = clean_title(&title);
 
-    // Enforce reasonable length
+    // Enforce reasonable length (char-safe)
     if title.len() > 80 {
-        Some(format!("{}...", &title[..77]))
+        Some(format!("{}...", truncate_str(&title, 77)))
     } else if title.is_empty() {
         None
     } else {
@@ -80,12 +72,24 @@ pub async fn generate_title(
 pub fn clean_title(title: &str) -> String {
     let title = title.trim_matches(|c: char| c == '"' || c == '\'').trim();
     if title.to_lowercase().starts_with("title:") {
-        title[6..].trim().to_string()
+        truncate_start(title, 6)
     } else if title.to_lowercase().starts_with("title - ") {
-        title[8..].trim().to_string()
+        truncate_start(title, 8)
     } else {
         title.to_string()
     }
+}
+
+/// Truncate a string to at most `max_chars` characters.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+/// Skip the first N bytes if they are ASCII, otherwise return trimmed string.
+fn truncate_start(s: &str, n: usize) -> String {
+    // "title:" and "title - " are all ASCII, so the prefix itself is byte-safe.
+    // But we use char-based slicing to be safe.
+    s.chars().skip(n).collect::<String>().trim().to_string()
 }
 
 /// Session DB trait for title operations.

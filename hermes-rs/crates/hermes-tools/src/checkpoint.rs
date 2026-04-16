@@ -138,8 +138,9 @@ impl CheckpointManager {
 
         // Lazy git probe
         if self.git_available.is_none() {
-            self.git_available = Some(which_git().await);
-            if !self.git_available.unwrap() {
+            let available = which_git().await;
+            self.git_available = Some(available);
+            if !available {
                 tracing::debug!("Checkpoints disabled: git not found");
             }
         }

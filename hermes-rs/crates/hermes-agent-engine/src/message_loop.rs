@@ -69,6 +69,8 @@ pub struct MessageLoop {
     session_db: Option<Arc<SessionDB>>,
     /// Shared interrupt flag.
     interrupt: Arc<AtomicBool>,
+    /// Number of messages already persisted to DB.
+    persisted_count: usize,
 }
 
 impl MessageLoop {
@@ -85,6 +87,7 @@ impl MessageLoop {
             session_id,
             session_db,
             interrupt,
+            persisted_count: 0,
         }
     }
 
@@ -119,15 +122,19 @@ impl MessageLoop {
 
         // Persist new messages to session DB (only append the latest ones)
         if let Some(ref db) = self.session_db {
-            if let Some(last) = self.messages.last() {
+            let start = self.persisted_count;
+            for msg in &self.messages[start..] {
                 if let (Some(role), Some(content)) = (
-                    last.get("role").and_then(|v| v.as_str()),
-                    last.get("content").and_then(|v| v.as_str()),
+                    msg.get("role").and_then(|v| v.as_str()),
+                    msg.get("content").and_then(|v| v.as_str()),
                 ) {
-                    let _ = db.append_message(&self.session_id, role, Some(content),
-                        None, None, None, None, None, None, None, None);
+                    if let Err(e) = db.append_message(&self.session_id, role, Some(content),
+                        None, None, None, None, None, None, None, None) {
+                        tracing::warn!("Failed to append message to session DB: {e}");
+                    }
                 }
             }
+            self.persisted_count = self.messages.len();
         }
 
         let budget_remaining = {

@@ -49,7 +49,9 @@ fn load_subscriptions() -> Vec<WebhookSubscription> {
 
 fn save_subscriptions(subs: &[WebhookSubscription]) -> anyhow::Result<()> {
     let path = webhook_file();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(subs)?;
     std::fs::write(&path, content)?;
     Ok(())
@@ -64,6 +66,7 @@ pub fn cmd_webhook_subscribe(
     deliver: &str,
     deliver_chat_id: Option<String>,
     skills: &str,
+    _secret: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut subs = load_subscriptions();
 
@@ -198,7 +201,7 @@ pub fn cmd_webhook(
     match action {
         "subscribe" | "add" => {
             let name = name.ok_or_else(|| anyhow::anyhow!("name is required"))?;
-            cmd_webhook_subscribe(name, prompt, events, description, deliver, deliver_chat_id, skills)
+            cmd_webhook_subscribe(name, prompt, events, description, deliver, deliver_chat_id, skills, None)
         }
         "list" | "ls" => cmd_webhook_list(),
         "remove" | "rm" => {

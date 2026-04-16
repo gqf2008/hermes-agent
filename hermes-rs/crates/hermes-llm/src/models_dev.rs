@@ -248,14 +248,16 @@ pub async fn fetch_models_dev(force_refresh: bool) -> serde_json::Value {
     if let Ok(response) = reqwest::get(MODELS_DEV_URL).await {
         if response.status().is_success() {
             if let Ok(data) = response.json::<serde_json::Value>().await {
-                if data.is_object() && !data.as_object().unwrap().is_empty() {
-                    save_disk_cache(&data);
-                    let mut guard = MODELS_DEV_INMEM.lock().await;
-                    *guard = Some(DevCache {
-                        data: data.clone(),
-                        cached_at: std::time::Instant::now(),
-                    });
-                    return data;
+                if let Some(obj) = data.as_object() {
+                    if !obj.is_empty() {
+                        save_disk_cache(&data);
+                        let mut guard = MODELS_DEV_INMEM.lock().await;
+                        *guard = Some(DevCache {
+                            data: data.clone(),
+                            cached_at: std::time::Instant::now(),
+                        });
+                        return data;
+                    }
                 }
             }
         }

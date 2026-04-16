@@ -128,8 +128,8 @@ impl ShellFileOperations {
             let expand_result = self.exec(&format!("echo ~{username}"), None);
             let expanded = expand_result.stdout.trim();
             if !expanded.is_empty() {
-                let suffix = if slash_idx.is_some() {
-                    &rest[slash_idx.unwrap()..]
+                let suffix = if let Some(idx) = slash_idx {
+                    &rest[idx..]
                 } else {
                     ""
                 };
@@ -347,11 +347,17 @@ impl ShellFileOperations {
             }
         }
 
-        // Write via heredoc (avoids ARG_MAX issues for large content)
-        let escaped_content = content.replace("'", "'\"'\"'");
-        let write_cmd = format!("cat > {} << 'HERMES_EOF'\n{}\nHERMES_EOF",
+        // Write via heredoc with a random delimiter (prevents injection if
+        // file content happens to match a fixed delimiter string).
+        let delimiter = format!("HERMES_EOF_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos());
+        let write_cmd = format!("cat > {} << '{}'\n{}\n{}",
             Self::escape_shell_arg(&path),
-            escaped_content);
+            delimiter,
+            content,
+            delimiter);
         let result = self.exec(&write_cmd, None);
 
         if result.exit_code != 0 {

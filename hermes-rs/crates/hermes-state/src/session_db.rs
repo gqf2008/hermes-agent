@@ -617,7 +617,7 @@ impl SessionDB {
         let sessions = self.search_sessions(source, 100000, 0)?;
         let mut results = Vec::new();
         for session in sessions {
-            if let Some(messages) = self.get_messages(&session.id).ok() {
+            if let Ok(messages) = self.get_messages(&session.id) {
                 let mut obj = serde_json::to_value(&session)?.as_object().cloned().unwrap_or_default();
                 obj.insert("messages".into(), serde_json::to_value(messages)?);
                 results.push(serde_json::Value::Object(obj));

@@ -50,6 +50,16 @@ pub struct HandlerResult {
     /// Compression was exhausted — gateway should auto-reset the session
     /// to break the infinite loop. Mirrors Python PR c5688e7c.
     pub compression_exhausted: bool,
+    /// Token usage from the LLM response (if available).
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token usage info from the LLM.
+#[derive(Debug, Clone)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// Message handler trait -- called when a platform receives a message.

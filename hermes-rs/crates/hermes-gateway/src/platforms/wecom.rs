@@ -44,7 +44,9 @@ impl DedupCache {
     fn insert(&self, key: String) {
         let mut set = self.entries.lock();
         if set.len() >= self.max_size {
-            set.clear();
+            if let Some(oldest) = set.iter().next().cloned() {
+                set.remove(&oldest);
+            }
         }
         set.insert(key);
     }
@@ -195,6 +197,9 @@ impl WeComAdapter {
         };
 
         if is_dm {
+            let Some(agent_id) = self.get_agent_id() else {
+                return Err("WECOM_AGENT_ID not configured or invalid".to_string());
+            };
             let resp = self
                 .client
                 .post(format!(
@@ -203,7 +208,7 @@ impl WeComAdapter {
                 .json(&serde_json::json!({
                     "touser": user_or_chat_id,
                     "msgtype": "text",
-                    "agentid": self.get_agent_id(),
+                    "agentid": agent_id,
                     "text": {
                         "content": text,
                     },
@@ -263,11 +268,11 @@ impl WeComAdapter {
     }
 
     /// Get the agent_id from config or env.
-    fn get_agent_id(&self) -> i64 {
-        std::env::var("WECOM_AGENT_ID")
+    fn get_agent_id(&self) -> Option<i64> {
+        let id = std::env::var("WECOM_AGENT_ID")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+            .and_then(|v| v.parse().ok())?;
+        if id == 0 { None } else { Some(id) }
     }
 
     /// Get/refresh the WeCom access token (HTTP fallback).

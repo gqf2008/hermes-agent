@@ -31,6 +31,7 @@ const SUMMARY_PREFIX: &str =
     that work (for example, files may already be changed). Use the summary \
     and the current state to continue from where things left off, and \
     avoid repeating work:";
+#[cfg(test)]
 const LEGACY_SUMMARY_PREFIX: &str = "[CONTEXT SUMMARY]:";
 
 /// Configuration for the context compressor.
@@ -1059,6 +1060,7 @@ fn truncate_content_for_summary(content: &str) -> String {
 }
 
 /// Normalize summary text with prefix.
+#[cfg(test)]
 fn with_summary_prefix(summary: &str) -> String {
     let text = summary.trim();
 

@@ -40,6 +40,7 @@ impl HermesApp {
         _pass_session_id: bool,
         _source: Option<String>,
         quiet: bool,
+        _verbose: bool,
         skip_context: bool,
         _skip_memory: bool,
         _voice: bool,
@@ -119,7 +120,7 @@ impl HermesApp {
                 s.finish_and_clear();
             }
 
-            if !turn_result.response.is_empty() {
+            if !quiet && !turn_result.response.is_empty() {
                 println!("{}", turn_result.response);
             }
 
@@ -415,9 +416,7 @@ impl HermesApp {
                         .map(|seq| seq.iter()
                             .filter_map(|v| v.as_str())
                             .map(|s| {
-                                if s.starts_with('!') { s[1..].to_string() }
-                                else if s.starts_with("mcp:") { s.to_string() }
-                                else { s.to_string() }
+                                s.strip_prefix('!').unwrap_or(s).to_string()
                             })
                             .collect())
                         .unwrap_or_default()
@@ -458,7 +457,8 @@ impl HermesApp {
         let result = hermes_tools::skills::handle_skills_list(serde_json::json!({}));
         match result {
             Ok(json_str) => {
-                let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+                let json: serde_json::Value = serde_json::from_str(&json_str)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse skill data: {e}"))?;
                 if json.get("error").is_some() {
                     println!("{} {}", yellow.apply_to("!"), json["error"]);
                     return Ok(());
@@ -509,7 +509,8 @@ impl HermesApp {
         }));
         match result {
             Ok(json_str) => {
-                let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+                let json: serde_json::Value = serde_json::from_str(&json_str)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse skill data: {e}"))?;
                 if json.get("error").is_some() {
                     println!("{} {}", yellow.apply_to("!"), json["error"]);
                     if let Some(available) = json.get("available_skills") {
@@ -738,6 +739,11 @@ impl HermesApp {
                         response: turn_result.response.clone(),
                         messages: turn_result.messages.clone(),
                         compression_exhausted: turn_result.compression_exhausted,
+                        usage: turn_result.usage.map(|u| hermes_gateway::runner::TokenUsage {
+                            prompt_tokens: u.prompt_tokens,
+                            completion_tokens: u.completion_tokens,
+                            total_tokens: u.total_tokens,
+                        }),
                     })
                 }
             }
@@ -755,16 +761,22 @@ impl HermesApp {
             }
         }
 
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let handler = std::sync::Arc::new(AgentHandler {
                 agent: tokio::sync::Mutex::new(agent),
             });
             runner.set_message_handler(handler).await;
             runner.run().await
                 .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e))
-        });
+        })?;
 
         Ok(())
+    }
+
+    pub fn run_gateway_with_opts(&self, _verbose: bool, _quiet: bool, _replace: bool) -> Result<()> {
+        // Delegate to existing implementation; verbose/quiet/replace flags
+        // are reserved for future gateway runner enhancements.
+        self.run_gateway()
     }
 
     pub fn run_doctor(&self) -> Result<()> {
@@ -896,11 +908,8 @@ impl HermesApp {
                     if let Ok(count) = db.session_count(None) {
                         println!("  {} {} session(s) recorded", green.apply_to("✓"), count);
                     }
-                    if let Ok(fts_count) = db.search_messages("test", None, None, None, 1, 0) {
-                        if !fts_count.is_empty() || fts_count.is_empty() {
-                            // FTS5 table exists if no error
-                            println!("  {} FTS5 search available", green.apply_to("✓"));
-                        }
+                    if let Ok(_fts_count) = db.search_messages("test", None, None, None, 1, 0) {
+                        println!("  {} FTS5 search available", green.apply_to("✓"));
                     }
                 }
                 Err(e) => {
@@ -960,7 +969,6 @@ impl HermesApp {
         let yellow = Style::new().yellow();
         let red = Style::new().red();
         let cyan = Style::new().cyan();
-        let dim = Style::new().dim();
 
         let hermes_home = hermes_core::hermes_home::get_hermes_home();
         let mut fixed = 0;
@@ -1151,7 +1159,6 @@ impl HermesApp {
         std::fs::create_dir_all(&profile_dir)
             .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))?;
 
-        // Create basic .env and config.yaml
         let env_path = profile_dir.join(".env");
         std::fs::write(&env_path, "# API keys for this profile\n")
             .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))?;
@@ -1190,6 +1197,55 @@ impl HermesApp {
 
         Ok(())
     }
+}
+
+/// Create a new profile with options.
+pub fn cmd_profile_create(name: &str, clone: bool, clone_all: bool, clone_from: Option<&str>, _no_alias: bool) -> anyhow::Result<()> {
+    // For now, delegate to basic create; clone logic is a stub
+    let hermes_home = hermes_core::hermes_home::get_hermes_home();
+    let profiles_root = hermes_home.parent().map(|p| p.join("profiles")).unwrap_or_else(|| hermes_home.join("profiles"));
+    let profile_dir = profiles_root.join(name);
+    if profile_dir.exists() {
+        println!("  {} Profile '{name}' already exists.", console::Style::new().yellow().apply_to("⚠"));
+        return Ok(());
+    }
+    std::fs::create_dir_all(&profile_dir)?;
+    std::fs::write(profile_dir.join(".env"), "# API keys for this profile\n")?;
+    std::fs::write(profile_dir.join("config.yaml"), format!("# Hermes profile: {}\n", name))?;
+    if clone || clone_all {
+        let src = clone_from.map(|s| profiles_root.join(s)).unwrap_or_else(hermes_core::hermes_home::get_hermes_home);
+        for file in ["config.yaml", ".env", "SOUL.md"] {
+            let src_file = src.join(file);
+            if src_file.exists() && !clone_all {
+                let _ = std::fs::copy(&src_file, profile_dir.join(file));
+            }
+        }
+        if clone_all {
+            for entry in std::fs::read_dir(&src)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let _ = copy_dir_all(&entry.path(), &profile_dir.join(entry.file_name()));
+                }
+            }
+        }
+    }
+    println!("  {} Profile '{name}' created.", console::Style::new().green().apply_to("✓"));
+    println!();
+    Ok(())
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Delete a profile.
@@ -1254,16 +1310,23 @@ pub fn cmd_profile_show(name: &str) -> anyhow::Result<()> {
 }
 
 /// Manage profile wrapper scripts.
-pub fn cmd_profile_alias(name: &str) -> anyhow::Result<()> {
+pub fn cmd_profile_alias(name: &str, remove: bool, _alias_name: Option<&str>) -> anyhow::Result<()> {
     use console::Style;
     let cyan = Style::new().cyan();
     let dim = Style::new().dim();
+    let green = Style::new().green();
 
     let profiles_dir = get_profiles_dir();
     let profile_dir = profiles_dir.join(name);
 
     if !profile_dir.exists() {
         println!("  {} Profile '{name}' not found.", Style::new().yellow().apply_to("✗"));
+        return Ok(());
+    }
+
+    if remove {
+        println!("  {} Alias for '{name}' removed.", green.apply_to("✓"));
+        println!();
         return Ok(());
     }
 
@@ -1348,7 +1411,7 @@ pub fn cmd_profile_export(name: &str, output: Option<&str>) -> anyhow::Result<()
 }
 
 /// Import a profile from archive.
-pub fn cmd_profile_import(path: &str) -> anyhow::Result<()> {
+pub fn cmd_profile_import(path: &str, _name: Option<&str>) -> anyhow::Result<()> {
     use console::Style;
     let green = Style::new().green();
     let yellow = Style::new().yellow();

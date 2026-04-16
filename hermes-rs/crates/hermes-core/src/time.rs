@@ -58,11 +58,11 @@ pub fn daily_reset_cutoff(reset_hour: u32) -> DateTime<Local> {
     let now = now();
     let today_reset = now
         .date_naive()
-        .and_hms_opt(reset_hour, 0, 0)
-        .unwrap()
+        .and_hms_opt(reset_hour.min(23), 0, 0)
+        .unwrap_or_else(|| now.naive_local().date().and_hms_opt(0, 0, 0).unwrap())
         .and_local_timezone(Local)
-        .single()
-        .unwrap();
+        .earliest()
+        .unwrap_or(now);
 
     if now < today_reset {
         // Yesterday's reset time

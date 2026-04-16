@@ -48,7 +48,9 @@ fn load_pairings() -> Vec<PairingEntry> {
 
 fn save_pairings(entries: &[PairingEntry]) -> anyhow::Result<()> {
     let path = pairing_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(entries)?;
     std::fs::write(&path, content)?;
     Ok(())
@@ -90,7 +92,7 @@ pub fn cmd_pairing_list() -> anyhow::Result<()> {
 }
 
 /// Approve a pairing code.
-pub fn cmd_pairing_approve(code: &str) -> anyhow::Result<()> {
+pub fn cmd_pairing_approve(_platform: &str, code: &str) -> anyhow::Result<()> {
     let mut entries = load_pairings();
 
     for entry in &mut entries {
@@ -109,7 +111,7 @@ pub fn cmd_pairing_approve(code: &str) -> anyhow::Result<()> {
 }
 
 /// Revoke a device pairing.
-pub fn cmd_pairing_revoke(code: &str) -> anyhow::Result<()> {
+pub fn cmd_pairing_revoke(_platform: &str, code: &str) -> anyhow::Result<()> {
     let mut entries = load_pairings();
     let before = entries.len();
     entries.retain(|e| e.code != code);

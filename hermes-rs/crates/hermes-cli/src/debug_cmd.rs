@@ -145,7 +145,7 @@ pub fn cmd_debug() -> anyhow::Result<()> {
 }
 
 /// Dump session data for debugging.
-pub fn cmd_dump_session(session_id: &str) -> anyhow::Result<()> {
+pub fn cmd_dump_session(session_id: &str, _show_keys: bool) -> anyhow::Result<()> {
     let home = get_hermes_home();
     let db_path = home.join("sessions.db");
 
@@ -202,7 +202,7 @@ pub fn cmd_dump_session(session_id: &str) -> anyhow::Result<()> {
 }
 
 /// Dump all config and state for debugging.
-pub fn cmd_dump_all() -> anyhow::Result<()> {
+pub fn cmd_dump_all(show_keys: bool) -> anyhow::Result<()> {
     let home = get_hermes_home();
 
     println!();
@@ -219,14 +219,28 @@ pub fn cmd_dump_all() -> anyhow::Result<()> {
         println!("{content}");
     }
 
-    // Dump .env (redacted)
+    // Dump .env (redacted or with key prefixes)
     let env_path = home.join(".env");
     if env_path.exists() {
-        println!("{}", cyan().apply_to("── .env (redacted) ──"));
         let content = std::fs::read_to_string(&env_path)?;
-        for line in content.lines() {
-            if let Some((key, _)) = line.split_once('=') {
-                println!("{key}=[REDACTED]");
+        if show_keys {
+            println!("{}", cyan().apply_to("── .env (key prefixes) ──"));
+            for line in content.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    let prefix = if value.len() <= 8 {
+                        "[REDACTED]".to_string()
+                    } else {
+                        format!("{}..{}", &value[..4], &value[value.len() - 4..])
+                    };
+                    println!("{key}={prefix}");
+                }
+            }
+        } else {
+            println!("{}", cyan().apply_to("── .env (redacted) ──"));
+            for line in content.lines() {
+                if let Some((key, _)) = line.split_once('=') {
+                    println!("{key}=[REDACTED]");
+                }
             }
         }
     }

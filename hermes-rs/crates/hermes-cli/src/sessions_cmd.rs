@@ -308,8 +308,10 @@ mod tests {
     #[test]
     fn test_export_not_found() {
         let db = SessionDB::open(":memory:").unwrap();
-        let result = cmd_sessions_export(&db, "/tmp/test.jsonl", None, Some("nonexistent"));
+        let tmp = std::env::temp_dir().join("hermes_test_export.jsonl");
+        let result = cmd_sessions_export(&db, &tmp.to_string_lossy(), None, Some("nonexistent"));
         assert!(result.is_ok());
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]

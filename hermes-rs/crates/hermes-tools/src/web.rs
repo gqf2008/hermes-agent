@@ -163,6 +163,11 @@ pub async fn web_search(query: &str, num_results: usize, backend: SearchBackend)
 
 /// Extract content from a URL.
 pub async fn web_extract_url(url: &str) -> Result<String, String> {
+    // SSRF prevention: block private/internal URLs
+    if !crate::url_safety::is_safe_url(url) {
+        return Err(format!("URL blocked by SSRF filter: {url}"));
+    }
+
     let client = reqwest::Client::new();
 
     let resp = client

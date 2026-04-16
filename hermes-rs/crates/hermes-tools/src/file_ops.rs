@@ -11,6 +11,34 @@ use serde_json::Value;
 use crate::binary_extensions::has_binary_extension;
 use crate::registry::{tool_error, tool_result, ToolRegistry};
 
+/// Atomic write: write to temp file then rename to avoid partial writes on crash.
+/// Falls back to direct write on Windows if rename fails (file-in-use issue).
+fn atomic_write(path: &Path, content: &str) -> Result<usize, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{}.", path.file_name().unwrap_or_default().to_string_lossy()))
+        .suffix(".tmp")
+        .tempfile_in(path.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| format!("tempfile: {e}"))?;
+    use std::io::Write;
+    tmp.write_all(content.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    tmp.flush().map_err(|e| format!("flush: {e}"))?;
+    match tmp.persist(path) {
+        Ok(_) => Ok(content.len()),
+        Err(e) => {
+            // On Windows, persist may fail if the target is in use or held open.
+            // Fallback: write directly to target.
+            let tmp_path = e.file.path().to_path_buf();
+            drop(e.file);
+            std::fs::write(path, content.as_bytes()).map_err(|e| format!("write: {e}"))?;
+            let _ = std::fs::remove_file(tmp_path);
+            Ok(content.len())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -80,11 +108,11 @@ fn check_sensitive_path(filepath: &str) -> Option<String> {
         Err(_) => filepath.to_string(),
     };
     let resolved_lower = resolved.to_lowercase();
-    let _filepath_lower = filepath.to_lowercase();
 
     // Check both the original filepath and resolved path against sensitive prefixes
     for prefix in SENSITIVE_PREFIXES {
-        if resolved.starts_with(prefix) || filepath.starts_with(prefix) {
+        if resolved.starts_with(prefix) || filepath.starts_with(prefix)
+            || resolved_lower.contains(prefix) || filepath.to_lowercase().contains(prefix) {
             return Some(format!(
                 "Refusing to write to sensitive system path: {filepath}\nUse the terminal tool with sudo if you need to modify system files."
             ));
@@ -95,9 +123,11 @@ fn check_sensitive_path(filepath: &str) -> Option<String> {
             "Refusing to write to sensitive system path: {filepath}\nUse the terminal tool with sudo if you need to modify system files."
         ));
     }
-    // Check WRITE_DENIED prefixes (match on the resolved path or its suffix)
+    // Check WRITE_DENIED prefixes (match on both resolved and original filepath)
+    let filepath_lower = filepath.to_lowercase();
     for prefix in WRITE_DENIED_PREFIXES {
-        if resolved.contains(prefix) || resolved_lower.contains(*prefix) {
+        if resolved.contains(prefix) || resolved_lower.contains(*prefix)
+            || filepath.contains(prefix) || filepath_lower.contains(*prefix) {
             return Some(format!(
                 "Refusing to write to sensitive path: {filepath}\nUse the terminal tool if you need to modify this file."
             ));
@@ -401,24 +431,14 @@ fn write_file(path: &str, content: &str) -> Value {
     let expanded = shellexpand::tilde(path);
     let file_path = Path::new(expanded.as_ref());
 
-    // Create parent directories
-    if let Some(parent) = file_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return serde_json::json!({ "error": format!("Failed to create directory: {e}") });
-        }
-    }
-
-    // Write the file
-    match std::fs::write(file_path, content) {
-        Ok(()) => {
-            let bytes_written = content.len();
-            serde_json::json!({
-                "success": true,
-                "path": path,
-                "bytes_written": bytes_written,
-                "message": format!("Successfully wrote {} bytes to {path}", bytes_written),
-            })
-        }
+    // Atomic write (temp file + rename to avoid partial writes on crash)
+    match atomic_write(file_path, content) {
+        Ok(bytes_written) => serde_json::json!({
+            "success": true,
+            "path": path,
+            "bytes_written": bytes_written,
+            "message": format!("Successfully wrote {} bytes to {path}", bytes_written),
+        }),
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     }
 }
@@ -448,8 +468,8 @@ fn patch_replace(path: &str, old_string: &str, new_string: &str, replace_all: bo
 
     // Try exact match first
     if let Some(new_content) = exact_replace(&content, old_string, new_string, replace_all) {
-        // Write the patched file
-        if let Err(e) = std::fs::write(file_path, &new_content) {
+        // Atomic write (temp file + rename)
+        if let Err(e) = atomic_write(file_path, &new_content) {
             return serde_json::json!({ "error": format!("Failed to write patched file: {e}") });
         }
         return serde_json::json!({
@@ -557,10 +577,10 @@ fn fuzzy_replace(content: &str, old_string: &str, new_string: &str, replace_all:
         format!("{}{}{}", before, new_string, after)
     };
 
-    // Write the patched file
+    // Atomic write the patched file (temp file + rename)
     let expanded = shellexpand::tilde(file_path);
     let target_path = Path::new(expanded.as_ref());
-    if let Err(e) = std::fs::write(target_path, &new_content) {
+    if let Err(e) = atomic_write(target_path, &new_content) {
         return serde_json::json!({ "error": format!("Failed to write patched file: {e}") });
     }
 

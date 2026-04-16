@@ -133,7 +133,7 @@ impl WeixinAdapter {
     fn is_duplicate(&self, message_id: &str) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let mut seen = self.seen_messages.lock();
         // Purge expired entries
@@ -145,7 +145,7 @@ impl WeixinAdapter {
     fn record_seen(&self, message_id: String) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let mut seen = self.seen_messages.lock();
         seen.push(DedupEntry {

@@ -186,7 +186,8 @@ impl JobStore {
     /// Create a new job store, loading from disk.
     pub fn new() -> Result<Self> {
         let path = get_jobs_path();
-        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| {
+        let parent = path.parent().expect("jobs path should have a parent directory");
+        std::fs::create_dir_all(parent).map_err(|e| {
             HermesError::new(
                 hermes_core::errors::ErrorCategory::InternalError,
                 format!("Failed to create jobs directory: {e}"),
@@ -384,9 +385,15 @@ impl JobStore {
         })?;
 
         let last_run = job.last_run_at.as_ref().map(|s| {
-            DateTime::parse_from_rfc3339(s)
-                .unwrap_or_else(|_| DateTime::parse_from_rfc3339(&Utc::now().to_rfc3339()).unwrap())
-                .with_timezone(&Utc)
+            match DateTime::parse_from_rfc3339(s) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(_) => {
+                    tracing::warn!("Corrupt last_run_at timestamp for job '{id}', using None: {s}");
+                    DateTime::parse_from_rfc3339(&Utc::now().to_rfc3339())
+                        .unwrap_or_else(|_| Utc::now().fixed_offset())
+                        .with_timezone(&Utc)
+                }
+            }
         });
         job.next_run_at = compute_next_run(&job.schedule, last_run);
         self.save()
@@ -404,11 +411,9 @@ impl JobStore {
 
             let Some(next) = &job.next_run_at else {
                 // One-shot with no next_run — check recoverable grace
-                if let Some(recovered) = recoverable_oneshot_run_at(&job.schedule, now, job.last_run_at.as_deref()) {
+                if let Some(_recovered) = recoverable_oneshot_run_at(&job.schedule, now, job.last_run_at.as_deref()) {
                     // Job is still within grace window, treat as due
-                    let mut recovered_job = job.clone();
-                    recovered_job.next_run_at = Some(recovered);
-                    due.push(self.jobs.get(&recovered_job.id).unwrap());
+                    due.push(job);
                 }
                 continue;
             };
@@ -448,7 +453,9 @@ impl JobStore {
         let job_ids: Vec<String> = self.jobs.keys().cloned().collect();
 
         for id in job_ids {
-            let job = self.jobs.get(&id).unwrap();
+            let Some(job) = self.jobs.get(&id) else {
+                continue;
+            };
             if !job.enabled || job.state == "paused" || job.state == "completed" {
                 continue;
             }

@@ -125,11 +125,9 @@ pub fn choose_cheap_model_route(user_message: &str, config: &RoutingConfig) -> O
 
 /// Parse a routing config from a JSON value.
 pub fn parse_routing_config(value: &serde_json::Value) -> RoutingConfig {
-    let obj = value.as_object();
-    if obj.is_none() {
+    let Some(obj) = value.as_object() else {
         return RoutingConfig::default();
-    }
-    let obj = obj.unwrap();
+    };
 
     let enabled = obj.get("enabled").is_some_and(|v| {
         v.as_bool().unwrap_or(false)

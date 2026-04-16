@@ -28,7 +28,7 @@ pub fn cmd_backup(output: Option<&str>, include_sessions: bool) -> anyhow::Resul
 }
 
 /// Extended backup with quick mode and custom label.
-pub fn cmd_backup_extended(output: Option<&str>, include_sessions: bool, quick: bool, label: Option<&str>) -> anyhow::Result<()> {
+pub fn cmd_backup_extended(output: Option<&str>, include_sessions: bool, _quick: bool, _label: Option<&str>) -> anyhow::Result<()> {
     let home = get_hermes_home();
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!("hermes_backup_{timestamp}");
@@ -161,12 +161,11 @@ pub fn cmd_restore(backup_path: &str, force: bool) -> anyhow::Result<()> {
         println!("{}", dim().apply_to(&content));
     }
 
-    if !force {
-        if !super::confirm(&format!("Restore to {}? This may overwrite existing files.", home.display()))? {
+    if !force
+        && !super::confirm(&format!("Restore to {}? This may overwrite existing files.", home.display()))? {
             println!("  {} Restore cancelled.", dim().apply_to("○"));
             return Ok(());
         }
-    }
 
     std::fs::create_dir_all(&home)?;
 
@@ -281,12 +280,11 @@ pub fn cmd_import(archive_path: &str, force: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !force {
-        if !super::confirm(&format!("Restore backup from {}?", archive_path))? {
+    if !force
+        && !super::confirm(&format!("Restore backup from {}?", archive_path))? {
             println!("  {}", dim().apply_to("Import cancelled."));
             return Ok(());
         }
-    }
 
     println!("  {} Extracting backup...", cyan().apply_to("→"));
 

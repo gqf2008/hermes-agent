@@ -99,9 +99,29 @@ impl DedupCache {
     fn insert(&self, key: String) {
         let mut set = self.entries.lock();
         if set.len() >= self.max_size {
-            set.clear();
+            // Evict oldest entry instead of clearing all
+            if let Some(oldest) = set.iter().next().cloned() {
+                set.remove(&oldest);
+            }
         }
         set.insert(key);
+    }
+}
+
+/// Cached token with expiry tracking.
+struct CachedToken {
+    token: String,
+    expires_at: std::time::Instant,
+}
+
+impl CachedToken {
+    fn new(token: String, expire_secs: u64) -> Self {
+        // Refresh 5 minutes early
+        let refresh_buffer = std::time::Duration::from_secs(300);
+        let expires_at = std::time::Instant::now()
+            + std::time::Duration::from_secs(expire_secs)
+            - refresh_buffer;
+        Self { token, expires_at }
     }
 }
 
@@ -129,8 +149,8 @@ pub struct FeishuAdapter {
     config: FeishuConfig,
     client: Client,
     dedup: Arc<DedupCache>,
-    /// Access token cached from Feishu API.
-    access_token: RwLock<Option<String>>,
+    /// Access token cached from Feishu API (with expiry).
+    access_token: RwLock<Option<CachedToken>>,
 }
 
 impl FeishuAdapter {
@@ -148,8 +168,14 @@ impl FeishuAdapter {
 
     /// Get/refresh the Feishu tenant access token.
     async fn get_access_token(&self) -> Result<String, String> {
-        if let Some(token) = self.access_token.read().await.clone() {
-            return Ok(token);
+        // Check cache with expiry
+        {
+            let guard = self.access_token.read().await;
+            if let Some(cached) = guard.as_ref() {
+                if cached.expires_at > std::time::Instant::now() {
+                    return Ok(cached.token.clone());
+                }
+            }
         }
 
         let resp = self
@@ -170,7 +196,7 @@ impl FeishuAdapter {
 
         let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
-            return Err(format!("Token request failed: code={code}, msg={}", body.get("msg").unwrap()));
+            return Err(format!("Token request failed: code={code}, msg={}", body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown")));
         }
 
         let token = body
@@ -179,7 +205,8 @@ impl FeishuAdapter {
             .ok_or("Missing tenant_access_token in response")?
             .to_string();
 
-        *self.access_token.write().await = Some(token.clone());
+        // Feishu tokens expire in 7200 seconds (2 hours)
+        *self.access_token.write().await = Some(CachedToken::new(token.clone(), 7200));
         Ok(token)
     }
 

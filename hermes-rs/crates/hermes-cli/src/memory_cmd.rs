@@ -77,11 +77,11 @@ pub fn cmd_memory_setup() -> anyhow::Result<()> {
     let choice: usize = input.trim().parse().unwrap_or(0);
 
     let mut config = load_config()?;
-    let mapping = config.as_mapping_mut().unwrap();
+    let mapping = config.as_mapping_mut().ok_or_else(|| anyhow::anyhow!("Config file is not a YAML mapping"))?;
 
     if choice == 0 {
         // Remove existing provider config
-        mapping.remove(&serde_yaml::Value::String("memory_provider".to_string()));
+        mapping.remove(serde_yaml::Value::String("memory_provider".to_string()));
         save_config(&config)?;
         println!("  {} External memory disabled. Using built-in memory only.", green().apply_to("✓"));
     } else if choice <= PROVIDERS.len() {
@@ -164,8 +164,8 @@ pub fn cmd_memory_status() -> anyhow::Result<()> {
 /// Disable external memory provider.
 pub fn cmd_memory_off() -> anyhow::Result<()> {
     let mut config = load_config()?;
-    let mapping = config.as_mapping_mut().unwrap();
-    mapping.remove(&serde_yaml::Value::String("memory_provider".to_string()));
+    let mapping = config.as_mapping_mut().ok_or_else(|| anyhow::anyhow!("Config file is not a YAML mapping"))?;
+    mapping.remove(serde_yaml::Value::String("memory_provider".to_string()));
     save_config(&config)?;
     println!("  {} External memory disabled. Using built-in memory only.", green().apply_to("✓"));
     Ok(())
