@@ -45,7 +45,9 @@ impl HermesApp {
         _skip_memory: bool,
         _voice: bool,
     ) -> Result<()> {
-        let model_name = model.unwrap_or_else(|| "anthropic/claude-opus-4.6".to_string());
+        let model_name = model
+            .or_else(|| self.config.model.name.clone())
+            .unwrap_or_else(|| "anthropic/claude-opus-4.6".to_string());
 
         // Build tool registry
         let mut registry = ToolRegistry::new();
@@ -81,6 +83,10 @@ impl HermesApp {
             max_iterations,
             skip_context_files: skip_context,
             terminal_cwd: std::env::current_dir().ok(),
+            base_url: self.config.model.base_url.clone(),
+            api_key: self.config.model.api_key.clone(),
+            provider: self.config.model.provider.clone(),
+            api_mode: self.config.model.api_mode.clone(),
             ..AgentConfig::default()
         };
 

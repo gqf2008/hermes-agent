@@ -193,7 +193,10 @@ async fn call_anthropic(request: &LlmRequest) -> Result<LlmResponse, ClassifiedE
 
     let (body_str, headers, url) = builder.build();
 
+    // Set default user-agent at the client level to avoid empty user-agent
+    // issues with some proxies. The headers HashMap may override this.
     let client = HttpClient::builder()
+        .user_agent("reqwest/0.12.12")
         .timeout(Duration::from_secs(request.timeout_secs.unwrap_or(300)))
         .build()
         .map_err(|e| classify_api_error("anthropic", &request.model, None,

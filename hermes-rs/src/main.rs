@@ -1325,7 +1325,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Skills { action }) => {
             match action {
                 Some(SkillAction::List { source }) => {
-                    hermes_cli::skills_hub_cmd::cmd_skills(&source, None, None, &source, 20, 1, "", false)?;
+                    hermes_cli::skills_hub_cmd::cmd_skills("list", None, None, &source, 20, 1, "", false)?;
                 }
                 Some(SkillAction::Search { query, source, limit }) => {
                     hermes_cli::skills_hub_cmd::cmd_skills("search", None, Some(&query), &source, limit, 1, "", false)?;

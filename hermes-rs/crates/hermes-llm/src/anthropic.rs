@@ -204,6 +204,7 @@ pub fn requires_bearer_auth(base_url: Option<&str>) -> bool {
 }
 
 /// Determine the auth type for the given API key and base URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthType {
     /// Regular API key → x-api-key header
     ApiKey,
@@ -722,7 +723,9 @@ impl AnthropicRequestBuilder {
         // Auth header
         match auth_type {
             AuthType::ApiKey | AuthType::ThirdParty => {
-                headers.insert("x-api-key".to_string(), self.api_key.clone());
+                if !self.api_key.is_empty() {
+                    headers.insert("x-api-key".to_string(), self.api_key.clone());
+                }
             }
             AuthType::OAuth => {
                 headers.insert("authorization".to_string(), format!("Bearer {}", self.api_key));
