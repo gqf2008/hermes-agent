@@ -76,9 +76,10 @@ hermes chat [OPTIONS]
 
 ```bash
 hermes setup
+hermes setup model            # 仅配置模型
+hermes setup --non-interactive
+hermes setup --reset          # 重置为默认值
 ```
-
-引导式配置：模型提供商、API Key、默认模型、工具集。
 
 ### gateway — 消息平台网关
 
@@ -117,6 +118,16 @@ hermes config edit
 hermes config set agent.model anthropic/claude-sonnet-4-20250514
 hermes config set compression.enabled true
 hermes config set terminal.backend docker
+
+# 查看配置文件路径
+hermes config path
+hermes config env-path
+
+# 检查配置
+hermes config check
+
+# 迁移配置
+hermes config migrate
 ```
 
 ### tools — 工具管理
@@ -161,8 +172,17 @@ hermes sessions export --session-id <id> --output session.json
 # 删除会话
 hermes sessions delete --session-id <id>
 
+# 重命名会话
+hermes sessions rename --session-id <id> --new-name <name>
+
+# 修剪旧会话
+hermes sessions prune
+
 # 会话统计
 hermes sessions stats
+
+# 浏览会话
+hermes sessions browse
 ```
 
 ### profiles — 多 Profile 管理
@@ -179,6 +199,195 @@ hermes profiles use <name>
 ```
 
 所有命令都支持 `--hermes-home <path>` 临时指定数据目录。
+
+### models — 列出可用模型
+
+```bash
+hermes models
+```
+
+### auth — 认证管理
+
+```bash
+# 添加 API Key
+hermes auth add
+
+# 列出已配置的密钥
+hermes auth list
+
+# 移除密钥
+hermes auth remove <provider>
+
+# 重置密钥
+hermes auth reset
+
+# 查看登录状态
+hermes auth status
+```
+
+### login — OAuth 登录
+
+```bash
+hermes login <provider>     # google, anthropic, openai
+hermes login google --no-browser
+```
+
+### logout — 清除凭据
+
+```bash
+hermes logout               # 清除所有提供商
+hermes logout --provider openai
+```
+
+### status — 组件状态
+
+```bash
+hermes status
+hermes status --deep        # 深度检查
+hermes status --all         # 显示脱敏详情
+```
+
+### insights — 会话分析
+
+```bash
+hermes insights             # 默认最近 30 天
+hermes insights --days 7    # 最近 7 天
+hermes insights --source telegram
+```
+
+### backup — 备份状态
+
+```bash
+# 创建备份
+hermes backup
+hermes backup --quick       # 仅关键数据
+hermes backup --label v1    # 添加标签
+
+# 恢复备份
+hermes restore /path/to/backup
+
+# 从 zip 归档恢复
+hermes import /path/to/backup.zip
+
+# 列出可用备份
+hermes backup-list
+```
+
+### logs — 查看日志
+
+```bash
+hermes logs                 # 最近 50 行 agent 日志
+hermes logs agent -n 200    # 最近 200 行
+hermes logs gateway         # 网关日志
+hermes logs errors          # 错误日志
+hermes logs --follow        # 实时跟踪
+hermes logs --level warn    # 仅警告
+hermes logs --since 1h      # 最近 1 小时以来的日志
+```
+
+### mcp — MCP 服务器管理
+
+```bash
+hermes mcp list
+hermes mcp add <name> --url <server-url>
+hermes mcp remove <name>
+```
+
+### memory — 外部记忆管理
+
+```bash
+hermes memory list
+hermes memory set <provider>
+```
+
+### plugins — 插件管理
+
+```bash
+hermes plugins list
+hermes plugins enable <plugin>
+hermes plugins disable <plugin>
+```
+
+### webhook — Webhook 订阅
+
+```bash
+hermes webhook list
+hermes webhook subscribe <url>
+hermes webhook remove <id>
+```
+
+### model — 模型管理
+
+```bash
+hermes model                # 交互式选择模型
+hermes model list           # 列出已配置模型
+```
+
+### update — 自我更新
+
+```bash
+hermes update
+hermes update --preview     # 预发布版本
+hermes update --force       # 强制更新
+```
+
+### uninstall — 卸载
+
+```bash
+hermes uninstall
+hermes uninstall --keep-data --keep-config
+```
+
+### dashboard — 分析仪表板
+
+```bash
+hermes dashboard            # 默认 http://127.0.0.1:8080
+hermes dashboard --port 3000
+```
+
+### debug / dump — 调试
+
+```bash
+hermes debug                # 打印调试信息
+hermes debug-share          # 生成调试报告并分享
+hermes dump                 # 转储会话数据
+hermes dump <session-id> --show-keys
+```
+
+### completion — Shell 补全
+
+```bash
+hermes completion           # bash（默认）
+hermes completion --shell zsh
+hermes completion --shell fish
+```
+
+### acp — IDE 集成
+
+```bash
+hermes acp                  # Agent Client Protocol
+hermes acp --editor vscode
+```
+
+### whatsapp — WhatsApp 配置
+
+```bash
+hermes whatsapp setup
+hermes whatsapp status
+```
+
+### pairing — 设备配对
+
+```bash
+hermes pairing list
+hermes pairing register
+```
+
+### version — 版本信息
+
+```bash
+hermes version
+```
 
 ### claw — OpenClaw 迁移
 
@@ -217,6 +426,9 @@ hermes batch distributions
 
 # 查看批处理状态
 hermes batch status
+
+# 列出批处理任务
+hermes batch list
 ```
 
 ### cron — 定时任务
@@ -234,12 +446,25 @@ hermes cron delete --id <job-id>
 # 暂停/恢复
 hermes cron pause --id <job-id>
 hermes cron resume --id <job-id>
+
+# 编辑任务
+hermes cron edit --id <job-id>
+
+# 手动执行任务
+hermes cron run --id <job-id>
+
+# 查看任务状态
+hermes cron status --id <job-id>
+
+# 移除任务
+hermes cron remove --id <job-id>
 ```
 
 ### doctor — 诊断
 
 ```bash
 hermes doctor
+hermes doctor --fix         # 自动修复发现的问题
 ```
 
 检查：
