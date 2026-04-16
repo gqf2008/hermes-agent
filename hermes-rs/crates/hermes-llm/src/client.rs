@@ -26,6 +26,40 @@ pub struct LlmRequest {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub timeout_secs: Option<u64>,
+    /// Provider preferences (only sent to OpenRouter endpoints).
+    pub provider_preferences: Option<ProviderPreferences>,
+}
+
+/// Provider preferences for OpenRouter model routing.
+///
+/// Mirrors Python: `provider_preferences` in `run_agent.py:6540-6606`.
+/// Only sent when `_is_openrouter` is true.
+#[derive(Debug, Clone)]
+pub struct ProviderPreferences {
+    pub only: Option<Vec<String>>,
+    pub ignore: Option<Vec<String>>,
+    pub order: Option<Vec<String>>,
+    pub sort: Option<String>,
+}
+
+impl ProviderPreferences {
+    /// Serialize to OpenRouter's `extra_body["provider"]` format.
+    pub fn to_extra_body_value(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(ref only) = self.only {
+            obj.insert("only".to_string(), serde_json::json!(only));
+        }
+        if let Some(ref ignore) = self.ignore {
+            obj.insert("ignore".to_string(), serde_json::json!(ignore));
+        }
+        if let Some(ref order) = self.order {
+            obj.insert("order".to_string(), serde_json::json!(order));
+        }
+        if let Some(ref sort) = self.sort {
+            obj.insert("sort".to_string(), serde_json::json!(sort));
+        }
+        Value::Object(obj)
+    }
 }
 
 /// LLM response.
@@ -120,6 +154,19 @@ async fn call_openai_compat(request: &LlmRequest) -> Result<LlmResponse, Classif
             &format!("Failed to build request: {e}"))
     })?;
 
+    // Add provider preferences only for OpenRouter endpoints.
+    // Mirrors Python: `if provider_preferences and _is_openrouter` (run_agent.py:6605).
+    let is_openrouter = base_url.contains("openrouter") || request.model.starts_with("openrouter/");
+    if is_openrouter {
+        if let Some(ref prefs) = request.provider_preferences {
+            // async-openai 0.27 doesn't support extra_body, so we inject it via JSON serialization.
+            // Serialize the request, add provider, then send via raw HTTP.
+            return send_openrouter_with_provider_prefs(
+                &base_url, &api_key, chat_req, prefs, request.timeout_secs.unwrap_or(300),
+            ).await;
+        }
+    }
+
     let result = client.chat().create(chat_req).await;
 
     match result {
@@ -164,6 +211,85 @@ async fn call_openai_compat(request: &LlmRequest) -> Result<LlmResponse, Classif
             Err(classify_api_error("openai_compat", &request.model, status, &e.to_string()))
         }
     }
+}
+
+/// Send OpenRouter request with provider preferences via raw HTTP.
+///
+/// async-openai 0.27 doesn't support `extra_body`, so we serialize to JSON,
+/// inject the provider field, and send via reqwest directly.
+async fn send_openrouter_with_provider_prefs(
+    base_url: &str,
+    api_key: &str,
+    chat_req: async_openai::types::CreateChatCompletionRequest,
+    prefs: &ProviderPreferences,
+    timeout_secs: u64,
+) -> Result<LlmResponse, ClassifiedError> {
+    // Serialize the built request
+    let mut body = serde_json::to_value(&chat_req).map_err(|e| {
+        classify_api_error("openrouter", "openrouter", None,
+            &format!("Failed to serialize request: {e}"))
+    })?;
+
+    // Inject provider preferences into extra_body["provider"]
+    if let Some(obj) = body.as_object_mut() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("provider".to_string(), prefs.to_extra_body_value());
+        obj.insert("extra_body".to_string(), Value::Object(extra));
+    }
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let client = HttpClient::builder()
+        .user_agent("reqwest/0.12.12")
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| classify_api_error("openrouter", "openrouter", None,
+            &format!("Failed to build HTTP client: {e}")))?;
+
+    let resp = client.post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| classify_api_error("openrouter", "openrouter", None,
+            &format!("Request failed: {e}")))?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status >= 400 {
+        return Err(classify_api_error("openrouter", "openrouter", Some(status), &text));
+    }
+
+    let json: Value = serde_json::from_str(&text).map_err(|e| {
+        classify_api_error("openrouter", "openrouter", Some(status),
+            &format!("Failed to parse response: {e}"))
+    })?;
+
+    let choice = json.get("choices").and_then(Value::as_array).and_then(|c| c.first());
+    let content = choice.and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content")).and_then(Value::as_str).map(String::from);
+
+    let finish_reason = choice.and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str).map(String::from);
+
+    let tool_calls = choice.and_then(|c| c.get("message"))
+        .and_then(|m| m.get("tool_calls")).and_then(Value::as_array)
+        .map(|tc| tc.iter().map(|t| t.clone()).collect::<Vec<_>>());
+
+    let usage = json.get("usage").map(|u| UsageInfo {
+        prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+        completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+        total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
+    });
+
+    Ok(LlmResponse {
+        content,
+        tool_calls,
+        model: json.get("model").and_then(Value::as_str).unwrap_or("openrouter").to_string(),
+        usage,
+        finish_reason,
+    })
 }
 
 /// Call Anthropic Messages API.
@@ -635,6 +761,7 @@ mod tests {
             base_url: Some(format!("{base}/chat")),
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .unwrap();
@@ -707,6 +834,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .unwrap();
@@ -753,6 +881,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("test-anthropic-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .unwrap();
@@ -807,6 +936,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("anthropic-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .unwrap();
@@ -839,6 +969,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -881,6 +1012,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("invalid-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -911,6 +1043,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -939,6 +1072,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -967,6 +1101,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -997,6 +1132,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -1025,6 +1161,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await
         .expect_err("Expected error");
@@ -1069,6 +1206,7 @@ mod tests {
             base_url: Some(_server.url()),
             api_key: Some("or-key".to_string()),
             timeout_secs: Some(10),
+            provider_preferences: None,
         })
         .await;
 
@@ -1091,6 +1229,7 @@ mod tests {
             base_url: None,
             api_key: Some("test-key".to_string()),
             timeout_secs: None,
+            provider_preferences: None,
         })
         .await;
 

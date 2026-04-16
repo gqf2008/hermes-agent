@@ -230,11 +230,135 @@ pub fn toolsets() -> HashMap<&'static str, ToolsetDef> {
         includes: &["web", "file", "browser", "skills", "vision", "organization"],
     });
 
-    // Platform toolsets
+    // Platform toolsets — all reference HERMES_CORE_TOOLS.
+    // Mirrors Python toolsets.py:68-396.
+
     map.insert("hermes-cli", ToolsetDef {
         description: "CLI platform — all core tools",
         tools: HERMES_CORE_TOOLS,
         includes: &[],
+    });
+
+    map.insert("hermes-telegram", ToolsetDef {
+        description: "Telegram platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-discord", ToolsetDef {
+        description: "Discord platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-whatsapp", ToolsetDef {
+        description: "WhatsApp platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-slack", ToolsetDef {
+        description: "Slack platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-signal", ToolsetDef {
+        description: "Signal platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-bluebubbles", ToolsetDef {
+        description: "BlueBubbles (iMessage) platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-homeassistant", ToolsetDef {
+        description: "Home Assistant platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-email", ToolsetDef {
+        description: "Email platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-sms", ToolsetDef {
+        description: "SMS platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-mattermost", ToolsetDef {
+        description: "Mattermost platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-matrix", ToolsetDef {
+        description: "Matrix platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-dingtalk", ToolsetDef {
+        description: "DingTalk platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-feishu", ToolsetDef {
+        description: "Feishu platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-weixin", ToolsetDef {
+        description: "Weixin (WeChat) platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-qqbot", ToolsetDef {
+        description: "QQ Bot platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-wecom", ToolsetDef {
+        description: "WeCom platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-wecom-callback", ToolsetDef {
+        description: "WeCom callback platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    map.insert("hermes-webhook", ToolsetDef {
+        description: "Generic webhook platform tools",
+        tools: HERMES_CORE_TOOLS,
+        includes: &[],
+    });
+
+    // Gateway toolset: union of all platforms
+    map.insert("hermes-gateway", ToolsetDef {
+        description: "Gateway — union of all platform toolsets",
+        tools: &[],
+        includes: &[
+            "hermes-telegram", "hermes-discord", "hermes-whatsapp",
+            "hermes-slack", "hermes-signal", "hermes-bluebubbles",
+            "hermes-homeassistant", "hermes-email", "hermes-sms",
+            "hermes-mattermost", "hermes-matrix", "hermes-dingtalk",
+            "hermes-feishu", "hermes-weixin", "hermes-qqbot",
+            "hermes-wecom", "hermes-wecom-callback", "hermes-webhook",
+        ],
     });
 
     map
@@ -324,5 +448,39 @@ mod tests {
         assert!(validate_toolset("all"));
         assert!(validate_toolset("*"));
         assert!(!validate_toolset("nonexistent"));
+    }
+
+    #[test]
+    fn test_platform_toolsets_exist() {
+        let platforms = [
+            "hermes-cli", "hermes-telegram", "hermes-discord",
+            "hermes-whatsapp", "hermes-slack", "hermes-signal",
+            "hermes-bluebubbles", "hermes-homeassistant", "hermes-email",
+            "hermes-sms", "hermes-mattermost", "hermes-matrix",
+            "hermes-dingtalk", "hermes-feishu", "hermes-weixin",
+            "hermes-qqbot", "hermes-wecom", "hermes-wecom-callback",
+            "hermes-webhook", "hermes-gateway",
+        ];
+        let ts = toolsets();
+        for platform in platforms {
+            assert!(ts.contains_key(platform), "Missing platform toolset: {}", platform);
+        }
+    }
+
+    #[test]
+    fn test_platform_toolset_has_core_tools() {
+        let tools = resolve_toolset("hermes-telegram").unwrap();
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(tools.contains(&"terminal".to_string()));
+        assert!(tools.contains(&"send_message".to_string()));
+    }
+
+    #[test]
+    fn test_gateway_includes_all_platforms() {
+        let tools = resolve_toolset("hermes-gateway").unwrap();
+        // Gateway should include all core tools via platform includes
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(tools.contains(&"browser_navigate".to_string()));
+        assert!(tools.contains(&"send_message".to_string()));
     }
 }

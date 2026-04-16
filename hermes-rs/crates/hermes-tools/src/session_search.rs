@@ -190,6 +190,7 @@ async fn summarize_session(
         base_url: None,
         api_key: None,
         timeout_secs: Some(60),
+        provider_preferences: None,
     };
 
     let max_retries = 3;

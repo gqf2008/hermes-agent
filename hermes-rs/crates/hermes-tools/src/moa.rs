@@ -95,6 +95,7 @@ async fn run_reference_model(
             base_url: None,
             api_key: None,
             timeout_secs: Some(120),
+            provider_preferences: None,
         };
 
         match call_llm(request).await {
@@ -162,6 +163,7 @@ async fn run_aggregator(
         base_url: None,
         api_key: None,
         timeout_secs: Some(120),
+        provider_preferences: None,
     };
 
     call_llm(request).await

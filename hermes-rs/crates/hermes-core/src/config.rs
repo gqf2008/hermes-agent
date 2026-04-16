@@ -3,14 +3,23 @@
 //! Mirrors the Python `hermes_cli/config.py` DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 //! All configuration is loaded from YAML config + environment variables with
 //! env vars taking precedence.
+//!
+//! ## Config Version Migration
+//!
+//! Config files are tracked via `_config_version` (current: 18, matching Python).
+//! On load, older configs are automatically migrated through each version step.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::errors::{ErrorCategory, HermesError, Result};
 use crate::hermes_home::get_hermes_home;
+
+/// Current config schema version. Mirrors Python `_config_version = 18`.
+const LATEST_CONFIG_VERSION: u32 = 18;
 
 /// Custom deserializer for context_length that accepts both integers and
 /// string values like "256K". Emits a warning for non-integer values,
@@ -65,6 +74,14 @@ where
 pub struct HermesConfig {
     /// LLM model configuration
     pub model: ModelConfig,
+    /// Named custom providers (e.g., {openrouter: {base_url: ..., api_key: ...}})
+    pub providers: HashMap<String, CustomProviderConfig>,
+    /// Credential pool strategies for failover/rotation
+    pub credential_pool_strategies: HashMap<String, CredentialPoolStrategyConfig>,
+    /// Ordered fallback provider chain
+    pub fallback_providers: Vec<String>,
+    /// Provider preferences for OpenRouter
+    pub provider: Option<ProviderPreferencesConfig>,
     /// Terminal execution configuration
     pub terminal: TerminalConfig,
     /// File operation configuration
@@ -95,6 +112,9 @@ pub struct HermesConfig {
     pub disabled_toolsets: Vec<String>,
     /// Platform-specific disabled skills
     pub skills_platform_disabled: HashMap<String, Vec<String>>,
+    /// Config version for migration (current: 18)
+    #[serde(rename = "_config_version", skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,10 +323,236 @@ pub struct SecurityConfig {
     pub website_policy_rules: Option<PathBuf>,
 }
 
+/// Named custom provider configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomProviderConfig {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub api_mode: Option<String>,
+}
+
+/// Credential pool strategy for a provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CredentialPoolStrategyConfig {
+    /// List of credential entries with api_key, base_url, label
+    pub credentials: Vec<serde_json::Value>,
+    /// Rotation mode: "round_robin", "failover"
+    pub mode: Option<String>,
+}
+
+/// Provider preferences sent only to OpenRouter endpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderPreferencesConfig {
+    /// Only use these providers
+    pub allowed: Option<Vec<String>>,
+    /// Ignore these providers
+    pub ignored: Option<Vec<String>>,
+    /// Preferred order
+    pub order: Option<Vec<String>>,
+    /// Sort criterion
+    pub sort: Option<String>,
+    /// Require parameters
+    pub require_parameters: Option<bool>,
+    /// Data collection preference
+    pub data_collection: Option<String>,
+}
+
+/// Recursively expand ${VAR_NAME} references in config values.
+///
+/// Mirrors Python `_expand_env_vars` in `hermes_cli/config.py:2487`.
+/// Only string values are processed; unresolved references are kept verbatim.
+fn expand_env_vars(value: Value) -> Value {
+    match value {
+        Value::String(s) => {
+            static ENV_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let re = ENV_RE.get_or_init(|| regex::Regex::new(r"\$\{([^}]+)\}").unwrap());
+
+            let expanded = re.replace_all(&s, |caps: &regex::Captures| {
+                std::env::var(&caps[1]).unwrap_or_else(|_| caps[0].to_string())
+            });
+            Value::String(expanded.into_owned())
+        }
+        Value::Object(map) => {
+            Value::Object(map.into_iter().map(|(k, v)| (k, expand_env_vars(v))).collect())
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(expand_env_vars).collect())
+        }
+        other => other,
+    }
+}
+
+/// Migrate config through all version steps to LATEST_CONFIG_VERSION.
+///
+/// Mirrors Python `migrate_config` in `hermes_cli/config.py:2037`.
+/// Each step handles the delta between consecutive versions.
+fn migrate_config(config: &mut Value) {
+    let version = config.get("_config_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as u32;
+
+    if version >= LATEST_CONFIG_VERSION {
+        return;
+    }
+
+    for v in version..LATEST_CONFIG_VERSION {
+        match v {
+            1 => migrate_v1_to_v2(config),
+            2 => migrate_v2_to_v3(config),
+            3 => migrate_v3_to_v4(config),  // tool progress: .env -> config.yaml
+            4 => migrate_v4_to_v5(config),  // add timezone
+            5 => migrate_v5_to_v6(config),  // add browser config section
+            6 => migrate_v6_to_v7(config),  // add security config
+            7 => migrate_v7_to_v8(config),  // add auxiliary model config
+            8 => migrate_v8_to_v9(config),  // clear ANTHROPIC_TOKEN from .env
+            9 => migrate_v9_to_v10(config), // add Tavily API key
+            10 => migrate_v10_to_v11(config), // add terminal.modal_mode
+            11 => migrate_v11_to_v12(config), // custom_providers list -> providers dict
+            12 => migrate_v12_to_v13(config), // clear dead LLM_MODEL env vars
+            13 => migrate_v13_to_v14(config), // migrate legacy stt.model
+            14 => migrate_v14_to_v15(config), // add credential_pool_strategies
+            15 => migrate_v15_to_v16(config), // add provider preferences
+            16 => migrate_v16_to_v17(config), // add fallback_providers
+            17 => migrate_v17_to_v18(config), // add memory.backend default
+            _ => {}
+        }
+    }
+
+    config["_config_version"] = Value::Number(serde_json::Number::from(LATEST_CONFIG_VERSION));
+}
+
+// Migration step implementations (minimal — mostly add missing sections)
+
+fn migrate_v1_to_v2(config: &mut Value) {
+    // Add compression section if missing
+    if config.get("compression").is_none() {
+        config["compression"] = serde_json::json!({"enabled": true, "threshold": 0.50, "target_ratio": 0.20});
+    }
+}
+
+fn migrate_v2_to_v3(config: &mut Value) {
+    // Add terminal section defaults
+    if config.get("terminal").is_none() {
+        config["terminal"] = serde_json::json!({"backend": "local", "max_output_size": 100000, "lifetime_seconds": 3600});
+    }
+}
+
+fn migrate_v3_to_v4(_config: &mut Value) {
+    // Tool progress migration: read from .env -> config.yaml
+    // No-op for Rust; env vars are expanded at load time
+}
+
+fn migrate_v4_to_v5(_config: &mut Value) {
+    // Add timezone field
+    // No-op: timezone is optional, defaults to system
+}
+
+fn migrate_v5_to_v6(config: &mut Value) {
+    // Add browser config section
+    if config.get("browser").is_none() {
+        config["browser"] = serde_json::json!({"inactivity_timeout": 120, "command_timeout": 30});
+    }
+}
+
+fn migrate_v6_to_v7(config: &mut Value) {
+    // Add security config
+    if config.get("security").is_none() {
+        config["security"] = serde_json::json!({"osv_check": false});
+    }
+}
+
+fn migrate_v7_to_v8(config: &mut Value) {
+    // Add auxiliary model config
+    if config.get("auxiliary_model").is_none() {
+        config["auxiliary_model"] = serde_json::json!({});
+    }
+}
+
+fn migrate_v8_to_v9(_config: &mut Value) {
+    // Clear ANTHROPIC_TOKEN from .env
+    // No-op for Rust; env vars are read fresh each load
+}
+
+fn migrate_v9_to_v10(_config: &mut Value) {
+    // TAVILY_API_KEY added to OPTIONAL_ENV_VARS
+    // No-op: env var expansion handles it
+}
+
+fn migrate_v10_to_v11(config: &mut Value) {
+    // Add terminal.modal_mode
+    if let Some(terminal) = config.get_mut("terminal") {
+        if terminal.get("modal_mode").is_none() {
+            terminal["modal_mode"] = Value::Null;
+        }
+    }
+}
+
+fn migrate_v11_to_v12(config: &mut Value) {
+    // Migrate custom_providers (list) -> providers (dict)
+    if let Some(providers_list) = config.get("custom_providers").cloned() {
+        if let Value::Array(entries) = providers_list {
+            let mut providers_map = serde_json::Map::new();
+            for (i, entry) in entries.into_iter().enumerate() {
+                let name = entry.get("name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("custom_{}", i));
+                providers_map.insert(name, entry);
+            }
+            config["providers"] = Value::Object(providers_map);
+        }
+        config.as_object_mut().map(|m| m.remove("custom_providers"));
+    }
+}
+
+fn migrate_v12_to_v13(_config: &mut Value) {
+    // Clear dead LLM_MODEL / OPENAI_MODEL env vars
+    // No-op for Rust
+}
+
+fn migrate_v13_to_v14(_config: &mut Value) {
+    // Migrate legacy flat stt.model to provider section
+    // No-op: STT config is platform-specific
+}
+
+fn migrate_v14_to_v15(config: &mut Value) {
+    // Add credential_pool_strategies section
+    if config.get("credential_pool_strategies").is_none() {
+        config["credential_pool_strategies"] = Value::Object(serde_json::Map::new());
+    }
+}
+
+fn migrate_v15_to_v16(config: &mut Value) {
+    // Add provider preferences section
+    if config.get("provider").is_none() {
+        config["provider"] = Value::Null;
+    }
+}
+
+fn migrate_v16_to_v17(config: &mut Value) {
+    // Add fallback_providers
+    if config.get("fallback_providers").is_none() {
+        config["fallback_providers"] = Value::Array(vec![]);
+    }
+}
+
+fn migrate_v17_to_v18(config: &mut Value) {
+    // Add memory.backend default
+    if let Some(memory) = config.get_mut("memory") {
+        if memory.get("backend").is_none() {
+            memory["backend"] = Value::Null;
+        }
+    }
+}
+
 impl HermesConfig {
     /// Load configuration from the default config file.
     ///
     /// Reads from `~/.hermes/config.yaml` or `./cli-config.yaml` (local override).
+    /// Applies config version migration, then expands ${VAR} references.
     /// Falls back to defaults if the file doesn't exist.
     pub fn load() -> Result<Self> {
         let hermes_home = get_hermes_home();
@@ -330,10 +576,31 @@ impl HermesConfig {
                 e.into(),
             ))?;
 
-        let config: HermesConfig = serde_yaml::from_str(&content)
+        // Parse YAML as JSON Value for manipulation
+        let yaml_value: serde_yaml::Value = serde_yaml::from_str(&content)
             .map_err(|e| HermesError::with_source(
                 ErrorCategory::ConfigError,
                 format!("Failed to parse config: {}", path.display()),
+                e.into(),
+            ))?;
+        let mut json: Value = serde_json::to_value(yaml_value)
+            .map_err(|e| HermesError::with_source(
+                ErrorCategory::ConfigError,
+                "Failed to convert config to JSON".to_string(),
+                e.into(),
+            ))?;
+
+        // Step 1: Migrate config version
+        migrate_config(&mut json);
+
+        // Step 2: Expand ${VAR} references from environment
+        json = expand_env_vars(json);
+
+        // Step 3: Deserialize into typed struct
+        let config: HermesConfig = serde_json::from_value(json)
+            .map_err(|e| HermesError::with_source(
+                ErrorCategory::ConfigError,
+                "Failed to deserialize config".to_string(),
                 e.into(),
             ))?;
 
@@ -346,7 +613,13 @@ impl HermesConfig {
         std::fs::create_dir_all(&hermes_home)?;
         let config_path = hermes_home.join("config.yaml");
 
-        let content = serde_yaml::to_string(self)
+        // Ensure config version is set on save
+        let config = HermesConfig {
+            config_version: Some(LATEST_CONFIG_VERSION),
+            ..self.clone()
+        };
+
+        let content = serde_yaml::to_string(&config)
             .map_err(|e| HermesError::with_source(
                 ErrorCategory::ConfigError,
                 "Failed to serialize config",
@@ -395,5 +668,82 @@ mod tests {
         let loaded: HermesConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(loaded.model.name, Some("openai/gpt-4o".to_string()));
         assert_eq!(loaded.terminal.backend, "docker");
+    }
+
+    #[test]
+    fn test_expand_env_vars_string() {
+        std::env::set_var("TEST_API_KEY", "test-key-123");
+        let input = Value::String("${TEST_API_KEY}".to_string());
+        let output = expand_env_vars(input);
+        assert_eq!(output, Value::String("test-key-123".to_string()));
+        std::env::remove_var("TEST_API_KEY");
+    }
+
+    #[test]
+    fn test_expand_env_vars_unresolved_kept() {
+        let input = Value::String("${UNLIKELY_VAR_XYZ}".to_string());
+        let output = expand_env_vars(input);
+        assert_eq!(output, Value::String("${UNLIKELY_VAR_XYZ}".to_string()));
+    }
+
+    #[test]
+    fn test_expand_env_vars_nested() {
+        std::env::set_var("TEST_HOST", "api.example.com");
+        std::env::set_var("TEST_PORT", "8080");
+        let input = serde_json::json!({
+            "host": "${TEST_HOST}",
+            "port": "${TEST_PORT}",
+            "nested": {
+                "url": "https://${TEST_HOST}:${TEST_PORT}"
+            }
+        });
+        let output = expand_env_vars(input);
+        assert_eq!(output["host"], Value::String("api.example.com".to_string()));
+        assert_eq!(output["port"], Value::String("8080".to_string()));
+        assert_eq!(output["nested"]["url"], Value::String("https://api.example.com:8080".to_string()));
+        std::env::remove_var("TEST_HOST");
+        std::env::remove_var("TEST_PORT");
+    }
+
+    #[test]
+    fn test_migrate_old_config_to_latest() {
+        let mut config = serde_json::json!({
+            "_config_version": 1,
+            "model": {"name": "openai/gpt-4"},
+            "terminal": {"backend": "local"}
+        });
+        migrate_config(&mut config);
+        assert_eq!(config["_config_version"], Value::Number(serde_json::Number::from(18)));
+        // Check added sections
+        assert!(config.get("compression").is_some());
+        assert!(config.get("browser").is_some());
+        assert!(config.get("security").is_some());
+        assert!(config.get("credential_pool_strategies").is_some());
+        assert!(config.get("fallback_providers").is_some());
+    }
+
+    #[test]
+    fn test_migrate_v11_custom_providers() {
+        let mut config = serde_json::json!({
+            "_config_version": 11,
+            "custom_providers": [
+                {"name": "my-provider", "base_url": "https://custom.api.com"}
+            ]
+        });
+        migrate_config(&mut config);
+        assert!(config.get("custom_providers").is_none());
+        assert!(config.get("providers").is_some());
+        assert!(config["providers"].get("my-provider").is_some());
+    }
+
+    #[test]
+    fn test_migrate_recent_config_no_changes() {
+        let mut config = serde_json::json!({
+            "_config_version": 18,
+            "model": {"name": "anthropic/claude-opus-4-6"}
+        });
+        migrate_config(&mut config);
+        assert_eq!(config["_config_version"], Value::Number(serde_json::Number::from(18)));
+        assert_eq!(config["model"]["name"], Value::String("anthropic/claude-opus-4-6".to_string()));
     }
 }

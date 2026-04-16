@@ -59,6 +59,40 @@ impl CredentialPool {
     pub fn reset(&self) {
         self.index.store(0, Ordering::SeqCst);
     }
+
+    /// Mark current credential as exhausted and advance to next.
+    /// Returns true if there's another credential available.
+    ///
+    /// Mirrors Python `pool.mark_exhausted_and_rotate()` (run_agent.py:4891).
+    pub fn mark_exhausted_and_rotate(&self) -> bool {
+        if self.credentials.len() <= 1 {
+            return false;
+        }
+        // Advance past the current exhausted credential
+        let current = self.index.load(Ordering::SeqCst);
+        let next = (current + 1) % self.credentials.len();
+        self.index.store(next, Ordering::SeqCst);
+        true
+    }
+
+    /// Try to refresh the current credential.
+    /// Hook for external refresh (e.g., OAuth token refresh).
+    /// Default: returns false (no refresh available).
+    /// Override by wrapping with an external refresh function.
+    pub fn try_refresh_current(&self) -> bool {
+        // Default implementation: no refresh mechanism built-in.
+        // Subclasses or wrappers would implement OAuth/token refresh.
+        false
+    }
+
+    /// Get the current credential without advancing.
+    pub fn current(&self) -> Option<&Credential> {
+        if self.credentials.is_empty() {
+            return None;
+        }
+        let idx = self.index.load(Ordering::SeqCst) % self.credentials.len();
+        self.credentials.get(idx)
+    }
 }
 
 /// Load credentials from environment variables for a given provider.
@@ -163,5 +197,48 @@ mod tests {
     fn test_from_entries_empty() {
         let pool = from_entries("openai", vec![]);
         assert!(pool.is_none());
+    }
+
+    #[test]
+    fn test_mark_exhausted_and_rotate() {
+        let pool = CredentialPool::new("test".to_string(), vec![
+            Credential { api_key: "key1".to_string(), base_url: None, label: None },
+            Credential { api_key: "key2".to_string(), base_url: None, label: None },
+            Credential { api_key: "key3".to_string(), base_url: None, label: None },
+        ]);
+
+        assert_eq!(pool.current().unwrap().api_key, "key1");
+        assert!(pool.mark_exhausted_and_rotate());
+        assert_eq!(pool.current().unwrap().api_key, "key2");
+        assert!(pool.mark_exhausted_and_rotate());
+        assert_eq!(pool.current().unwrap().api_key, "key3");
+        // Wraps around to first
+        assert!(pool.mark_exhausted_and_rotate());
+        assert_eq!(pool.current().unwrap().api_key, "key1");
+    }
+
+    #[test]
+    fn test_mark_exhausted_single_credential() {
+        let pool = CredentialPool::new("test".to_string(), vec![
+            Credential { api_key: "only-key".to_string(), base_url: None, label: None },
+        ]);
+        assert!(!pool.mark_exhausted_and_rotate()); // No other credential
+    }
+
+    #[test]
+    fn test_try_refresh_current_default() {
+        let pool = CredentialPool::new("test".to_string(), vec![
+            Credential { api_key: "key".to_string(), base_url: None, label: None },
+        ]);
+        assert!(!pool.try_refresh_current()); // Default: no refresh
+    }
+
+    #[test]
+    fn test_current_without_select() {
+        let pool = CredentialPool::new("test".to_string(), vec![
+            Credential { api_key: "key1".to_string(), base_url: None, label: None },
+        ]);
+        // current() should return the first credential at index 0
+        assert_eq!(pool.current().unwrap().api_key, "key1");
     }
 }

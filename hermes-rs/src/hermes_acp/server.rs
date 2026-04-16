@@ -583,6 +583,8 @@ async fn run_agent(
         skill_nudge_interval: 0,   // disabled in ACP
         memory_flush_min_turns: 6,
         self_evolution_enabled: false,  // disabled in ACP
+        credential_pool: None,
+        fallback_providers: Vec::new(),
     };
 
     let mut registry = ToolRegistry::new();

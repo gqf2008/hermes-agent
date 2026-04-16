@@ -140,6 +140,107 @@ impl<'a> Iterator for FallbackChain<'a> {
     }
 }
 
+/// Credential-aware retry wrapper.
+///
+/// Mirrors Python `_recover_with_credential_pool` (run_agent.py:4856-4938).
+/// On errors, classifies the failure and may rotate credentials before retrying.
+///
+/// Rotation rules:
+/// - **Billing (402)**: Immediately rotate and retry
+/// - **Rate limit (429)**: First occurrence does NOT rotate; second consecutive failure rotates
+/// - **Auth (401)**: Try refresh first, then rotate if refresh fails
+pub async fn call_with_credential_pool<F, Fut, T>(
+    pool: &crate::credential_pool::CredentialPool,
+    max_retries: u32,
+    mut make_request: F,
+) -> std::result::Result<T, crate::error_classifier::ClassifiedError>
+where
+    F: FnMut(&crate::credential_pool::Credential) -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<T, crate::error_classifier::ClassifiedError>,
+    >,
+{
+    let mut consecutive_429 = false;
+    let mut last_err: Option<crate::error_classifier::ClassifiedError> = None;
+
+    for attempt in 0..=max_retries {
+        let cred = match pool.current().or_else(|| pool.first()) {
+            Some(c) => c,
+            None => {
+                // No credentials available — try with a default empty credential
+                return make_request(&crate::credential_pool::Credential {
+                    api_key: String::new(),
+                    base_url: None,
+                    label: None,
+                })
+                .await;
+            }
+        };
+
+        match make_request(cred).await {
+            Ok(value) => return Ok(value),
+            Err(classified) => {
+                use crate::error_classifier::FailoverReason;
+                last_err = Some(classified.clone());
+
+                match classified.reason {
+                    FailoverReason::Billing => {
+                        // Immediately rotate and retry
+                        if pool.mark_exhausted_and_rotate() {
+                            consecutive_429 = false;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                    FailoverReason::RateLimit => {
+                        if consecutive_429 {
+                            // Second consecutive 429 — rotate
+                            if pool.mark_exhausted_and_rotate() {
+                                consecutive_429 = false;
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                        } else {
+                            // First 429 — don't rotate, set flag
+                            consecutive_429 = true;
+                        }
+                    }
+                    FailoverReason::Auth => {
+                        // Try refresh first
+                        if pool.try_refresh_current() {
+                            // Refresh succeeded, retry with same credential
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        // Refresh failed — rotate
+                        if pool.mark_exhausted_and_rotate() {
+                            consecutive_429 = false;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                    _ => {
+                        // Other errors: apply normal retry with backoff
+                        if attempt < max_retries {
+                            let delay = backoff_delay(
+                                &RetryConfig::default(),
+                                attempt,
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+                }
+
+                // No rotation available or max retries reached
+                return Err(classified);
+            }
+        }
+    }
+
+    Err(last_err.unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

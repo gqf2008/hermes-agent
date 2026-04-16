@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod budget;
+pub mod failover;
 pub mod memory_manager;
 pub mod memory_provider;
 pub mod message_loop;

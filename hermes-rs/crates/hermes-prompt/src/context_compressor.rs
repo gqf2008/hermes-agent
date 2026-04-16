@@ -795,6 +795,7 @@ The focus topic sections should receive roughly 60-70% of the summary token budg
             base_url: self.config.summary_base_url.clone(),
             api_key: self.config.summary_api_key.clone(),
             timeout_secs: Some(120),
+            provider_preferences: None,
         };
 
         // compress() is sync but call_llm is async. Try block_on if in a runtime.

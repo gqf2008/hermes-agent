@@ -43,6 +43,7 @@ pub async fn generate_title(
         base_url,
         api_key,
         timeout_secs: Some(timeout_secs),
+        provider_preferences: None,
     };
 
     let response = match hermes_llm::client::call_llm(request).await {
