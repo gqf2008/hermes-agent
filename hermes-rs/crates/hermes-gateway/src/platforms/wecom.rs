@@ -15,7 +15,6 @@
 
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,34 +22,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tracing::{debug, error, info, warn};
 
-/// Deduplication cache for inbound messages.
-struct DedupCache {
-    entries: parking_lot::Mutex<HashSet<String>>,
-    max_size: usize,
-}
-
-impl DedupCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: parking_lot::Mutex::new(HashSet::with_capacity(max_size)),
-            max_size,
-        }
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.entries.lock().contains(key)
-    }
-
-    fn insert(&self, key: String) {
-        let mut set = self.entries.lock();
-        if set.len() >= self.max_size {
-            if let Some(oldest) = set.iter().next().cloned() {
-                set.remove(&oldest);
-            }
-        }
-        set.insert(key);
-    }
-}
+use crate::dedup::MessageDeduplicator;
 
 /// Truncate text to at most `max_chars` characters (UTF-8 safe).
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -128,7 +100,7 @@ struct WsState {
 pub struct WeComAdapter {
     config: WeComConfig,
     client: Client,
-    dedup: DedupCache,
+    dedup: MessageDeduplicator,
     /// WebSocket state, set when connected.
     ws_state: Mutex<Option<Arc<WsState>>>,
     /// Counter for generating unique req_ids.
@@ -144,7 +116,7 @@ impl WeComAdapter {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client"),
-            dedup: DedupCache::new(2048),
+            dedup: MessageDeduplicator::new(),
             config,
             ws_state: Mutex::new(None),
             seq: AtomicUsize::new(0),
@@ -324,7 +296,7 @@ impl WeComAdapter {
             .unwrap_or("")
             .to_string();
 
-        if !msg_id.is_empty() && self.dedup.contains(msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(msg_id) {
             debug!("WeCom dedup: skipping {msg_id}");
             return None;
         }

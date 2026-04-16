@@ -17,6 +17,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::dedup::MessageDeduplicator;
+
 /// Feishu connection mode.
 #[derive(Debug, Clone, Default)]
 pub enum FeishuConnectionMode {
@@ -78,36 +80,6 @@ impl FeishuConfig {
     }
 }
 
-/// Deduplication cache for inbound messages.
-struct DedupCache {
-    entries: parking_lot::Mutex<HashSet<String>>,
-    max_size: usize,
-}
-
-impl DedupCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: parking_lot::Mutex::new(HashSet::with_capacity(max_size)),
-            max_size,
-        }
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.entries.lock().contains(key)
-    }
-
-    fn insert(&self, key: String) {
-        let mut set = self.entries.lock();
-        if set.len() >= self.max_size {
-            // Evict oldest entry instead of clearing all
-            if let Some(oldest) = set.iter().next().cloned() {
-                set.remove(&oldest);
-            }
-        }
-        set.insert(key);
-    }
-}
-
 /// Cached token with expiry tracking.
 struct CachedToken {
     token: String,
@@ -148,7 +120,7 @@ pub struct FeishuMessageEvent {
 pub struct FeishuAdapter {
     config: FeishuConfig,
     client: Client,
-    dedup: Arc<DedupCache>,
+    dedup: Arc<MessageDeduplicator>,
     /// Access token cached from Feishu API (with expiry).
     access_token: RwLock<Option<CachedToken>>,
 }
@@ -160,7 +132,7 @@ impl FeishuAdapter {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client"),
-            dedup: Arc::new(DedupCache::new(2048)),
+            dedup: Arc::new(MessageDeduplicator::new()),
             access_token: RwLock::new(None),
             config,
         }
@@ -247,7 +219,7 @@ impl FeishuAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        if !msg_id.is_empty() && self.dedup.contains(msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(msg_id) {
             debug!("Feishu dedup: skipping {msg_id}");
             return None;
         }
@@ -328,14 +300,6 @@ mod tests {
         // Should have defaults when no env vars set
         assert_eq!(config.webhook_port, 8765);
         assert_eq!(config.webhook_path, "/feishu/webhook");
-    }
-
-    #[test]
-    fn test_dedup_cache() {
-        let cache = DedupCache::new(2);
-        cache.insert("msg1".to_string());
-        assert!(cache.contains("msg1"));
-        assert!(!cache.contains("msg2"));
     }
 
     #[test]

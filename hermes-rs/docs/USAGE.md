@@ -180,6 +180,32 @@ hermes profiles use <name>
 
 所有命令都支持 `--hermes-home <path>` 临时指定数据目录。
 
+### claw — OpenClaw 迁移
+
+从 OpenClaw（或 Clawdbot/Moltbot）迁移配置、记忆、技能到 Hermes。
+
+```bash
+# 预览迁移（默认，不修改文件）
+hermes claw migrate --dry-run
+
+# 执行迁移（确认后进行）
+hermes claw migrate
+
+# 完整迁移，跳过确认
+hermes claw migrate --preset full --yes
+
+# 仅迁移用户数据（不含 API 密钥）
+hermes claw migrate --preset user-data
+
+# 从自定义路径迁移
+hermes claw migrate --source /path/to/.openclaw
+
+# 清理迁移后的 OpenClaw 目录
+hermes claw cleanup
+```
+
+注意：OpenClaw 迁移依赖 Python 3.11+ 和 `openclaw_to_hermes.py` 脚本。
+
 ### batch — 批量处理
 
 ```bash

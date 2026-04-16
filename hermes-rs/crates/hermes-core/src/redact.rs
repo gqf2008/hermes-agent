@@ -96,6 +96,18 @@ static DB_CONNSTR_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:]+:)([^@]+)(@)").unwrap()
 });
 
+/// JWT tokens — header.payload[.signature], always start with "eyJ" (base64 for "{").
+/// Mirrors Python `_JWT_RE` (commit ee9c0a3e).
+static JWT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}").unwrap()
+});
+
+/// Discord user/role mentions: <@snowflake> or <@!snowflake>.
+/// Snowflake IDs are 17–20 digit integers. Mirrors Python `_DISCORD_MENTION_RE` (commit ee9c0a3e).
+static DISCORD_MENTION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"<@!?(\d{17,20})>").unwrap()
+});
+
 /// E.164 phone numbers — no lookahead (unsupported), post-filter handles boundary.
 static SIGNAL_PHONE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(\+[1-9]\d{6,14})").unwrap()
@@ -169,6 +181,23 @@ pub fn redact_sensitive_text(text: &str) -> String {
     result = DB_CONNSTR_RE
         .replace_all(&result, |caps: &regex::Captures| {
             format!("{}***{}", &caps[1], &caps[3])
+        })
+        .to_string();
+
+    // JWT tokens (eyJ... — base64-encoded JSON headers)
+    result = JWT_RE
+        .replace_all(&result, |caps: &regex::Captures| mask_token(&caps[0]))
+        .to_string();
+
+    // Discord user/role mentions (<@snowflake_id>)
+    result = DISCORD_MENTION_RE
+        .replace_all(&result, |caps: &regex::Captures| {
+            let has_bang = caps[0].chars().nth(2) == Some('!');
+            if has_bang {
+                "<@!***>".to_string()
+            } else {
+                "<@***>".to_string()
+            }
         })
         .to_string();
 
@@ -255,5 +284,32 @@ mod tests {
         let text = "Hello world, this is clean text";
         let result = redact_sensitive_text(text);
         assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_redact_jwt_three_part() {
+        // Full JWT: header.payload.signature
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let text = format!("auth={jwt}");
+        let result = redact_sensitive_text(&text);
+        assert!(!result.contains("eyJhbGciOiJIUzI1NiIs"));
+        assert!(result.contains("eyJhbG..."));
+    }
+
+    #[test]
+    fn test_redact_jwt_two_part() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.dGVzdA";
+        let text = format!("token {jwt}");
+        let result = redact_sensitive_text(&text);
+        assert!(!result.contains("eyJhbGciOiJIUzI1NiJ9"));
+    }
+
+    #[test]
+    fn test_redact_discord_mention() {
+        let text = "Hello <@123456789012345678> and <@!987654321098765432>!";
+        let result = redact_sensitive_text(text);
+        assert!(result.contains("<@***>"));
+        assert!(result.contains("<@!***>"));
+        assert!(!result.contains("123456789012345678"));
     }
 }

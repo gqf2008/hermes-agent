@@ -4,6 +4,7 @@
 //! Mirrors the Python `gateway/` directory.
 
 pub mod config;
+pub mod dedup;
 pub mod runner;
 pub mod session;
 pub mod platforms;

@@ -26,42 +26,14 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use crate::dedup::MessageDeduplicator;
+
 type HmacSha256 = Hmac<Sha256>;
-
-/// Deduplication cache for inbound messages.
-struct DedupCache {
-    entries: parking_lot::Mutex<HashSet<String>>,
-    max_size: usize,
-}
-
-impl DedupCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: parking_lot::Mutex::new(HashSet::with_capacity(max_size)),
-            max_size,
-        }
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.entries.lock().contains(key)
-    }
-
-    fn insert(&self, key: String) {
-        let mut set = self.entries.lock();
-        if set.len() >= self.max_size {
-            if let Some(oldest) = set.iter().next().cloned() {
-                set.remove(&oldest);
-            }
-        }
-        set.insert(key);
-    }
-}
 
 /// Dingtalk platform configuration.
 #[derive(Debug, Clone)]
@@ -194,7 +166,7 @@ struct CachedToken {
 pub struct DingtalkAdapter {
     config: DingtalkConfig,
     client: Client,
-    dedup: Arc<DedupCache>,
+    dedup: Arc<MessageDeduplicator>,
     /// Access token cached from Dingtalk API (with TTL).
     access_token: Arc<RwLock<Option<CachedToken>>>,
     /// Session webhook cache for proactive sends.
@@ -210,7 +182,7 @@ impl DingtalkAdapter {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client"),
-            dedup: Arc::new(DedupCache::new(2048)),
+            dedup: Arc::new(MessageDeduplicator::new()),
             access_token: Arc::new(RwLock::new(None)),
             webhook_cache: Arc::new(WebhookCache::new(500)),
             handler_semaphore: Arc::new(Semaphore::new(100)),
@@ -343,7 +315,7 @@ impl DingtalkAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        if !msg_id.is_empty() && self.dedup.contains(msg_id) {
+        if !msg_id.is_empty() && self.dedup.is_duplicate(msg_id) {
             debug!("Dingtalk dedup: skipping {msg_id}");
             return None;
         }

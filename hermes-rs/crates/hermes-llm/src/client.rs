@@ -6,6 +6,7 @@
 //! Provider is resolved from model prefix: `anthropic/...` → Anthropic,
 //! `openai/...` → OpenAI, `openrouter/...` → OpenAI-compatible.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::Client as HttpClient;
@@ -68,6 +69,11 @@ async fn call_openai_compat(request: &LlmRequest) -> Result<LlmResponse, Classif
     let base_url = request.base_url.clone()
         .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    // Fail-fast validation of malformed base URLs (mirrors Python f4724803)
+    if let Err(e) = hermes_core::validate_base_url(&base_url) {
+        return Err(classify_api_error("openai_compat", &request.model, None, &e));
+    }
 
     let config = async_openai::config::OpenAIConfig::new()
         .with_api_key(&api_key)
@@ -447,10 +453,20 @@ fn build_anthropic_messages(messages: &[Value]) -> Result<Vec<Value>, Classified
     Ok(result)
 }
 
+/// Cached proxy env validation result — proxy vars rarely change at runtime.
+static PROXY_ENV_CHECK: OnceLock<Result<(), String>> = OnceLock::new();
+
 fn build_client(
     request: &LlmRequest,
     config: &async_openai::config::OpenAIConfig,
 ) -> Result<async_openai::Client<async_openai::config::OpenAIConfig>, ClassifiedError> {
+    // Fail-fast validation of malformed proxy env vars (mirrors Python f4724803)
+    if let Err(e) = PROXY_ENV_CHECK
+        .get_or_init(hermes_core::validate_proxy_env_urls)
+    {
+        return Err(classify_api_error("openai_compat", &request.model, None, e));
+    }
+
     if let Some(secs) = request.timeout_secs {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(secs))
