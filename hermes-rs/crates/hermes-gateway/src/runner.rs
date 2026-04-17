@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{Platform, PlatformConfig};
 use crate::platforms::api_server::{ApiServerAdapter, ApiServerConfig, ApiServerState};
+use crate::session::SessionStore;
 use crate::platforms::dingtalk::{DingtalkAdapter, DingtalkConfig};
 use crate::platforms::discord::{DiscordAdapter, DiscordConfig};
 use crate::platforms::feishu::{FeishuAdapter, FeishuConfig, FeishuConnectionMode, FeishuMessageEvent};
@@ -105,6 +106,8 @@ pub struct GatewayRunner {
     running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
     /// Busy ack timestamps for debouncing (chat_id -> last ack time).
     busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    /// Session store for persistence and auto-reset.
+    session_store: Arc<SessionStore>,
 }
 
 impl GatewayRunner {
@@ -127,6 +130,10 @@ impl GatewayRunner {
             running: Arc::new(AtomicBool::new(false)),
             running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             busy_ack_ts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_store: Arc::new(SessionStore::new(
+                hermes_core::get_hermes_home().join("gateway_sessions"),
+                crate::config::GatewayConfig::default(),
+            )),
         }
     }
 
@@ -254,8 +261,9 @@ impl GatewayRunner {
             let running = self.running.clone();
             let running_sessions = self.running_sessions.clone();
             let busy_ack_ts = self.busy_ack_ts.clone();
+            let session_store = self.session_store.clone();
             let handle = tokio::spawn(async move {
-                run_weixin_poll(adapter, handler, running, running_sessions, busy_ack_ts).await;
+                run_weixin_poll(adapter, handler, running, running_sessions, busy_ack_ts, session_store).await;
             });
             handles.push(handle);
         }
@@ -267,8 +275,9 @@ impl GatewayRunner {
             let running = self.running.clone();
             let running_sessions = self.running_sessions.clone();
             let busy_ack_ts = self.busy_ack_ts.clone();
+            let session_store = self.session_store.clone();
             let handle = tokio::spawn(async move {
-                run_telegram_poll(adapter, handler, running, running_sessions, busy_ack_ts).await;
+                run_telegram_poll(adapter, handler, running, running_sessions, busy_ack_ts, session_store).await;
             });
             handles.push(handle);
         }
@@ -498,6 +507,7 @@ async fn run_weixin_poll(
     running: Arc<AtomicBool>,
     running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
     busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    session_store: Arc<SessionStore>,
 ) {
     let mut poll_interval = interval(Duration::from_secs(2));
     let mut consecutive_errors = 0u32;
@@ -520,7 +530,7 @@ async fn run_weixin_poll(
 
                     route_weixin_message(
                         &adapter, handler_ref.as_ref(), &event,
-                        &running_sessions, &busy_ack_ts,
+                        &running_sessions, &busy_ack_ts, &session_store,
                     ).await;
                 }
             }
@@ -555,6 +565,7 @@ async fn route_weixin_message(
     event: &WeixinMessageEvent,
     running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
     busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    session_store: &Arc<SessionStore>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -641,15 +652,15 @@ async fn route_weixin_message(
             // Clear busy ack timestamp
             busy_ack_ts.lock().unwrap().remove(chat_id);
 
-            // Compression exhaustion — log warning so gateway operator
-            // knows to implement session auto-reset policy.
-            // Mirrors Python PR c5688e7c.
+            // Compression exhaustion — auto-reset session and notify user.
+            // Mirrors Python gateway/run.py behavior.
             if result.compression_exhausted {
-                warn!(
-                    "Session {}: compression exhausted — context too large after max attempts. \
-                     Consider resetting the session.",
-                    chat_id
-                );
+                let session_key = format!("weixin:{}", chat_id);
+                session_store.reset_session(&session_key);
+                warn!("Session {chat_id}: compression exhausted — auto-reset performed");
+                let reset_msg = "Session reset: conversation context grew too large. \
+                    Starting fresh — previous context has been cleared.";
+                let _ = adapter.send_text(chat_id, reset_msg).await;
             }
             if !result.response.is_empty() {
                 if let Err(e) = adapter.send_text(chat_id, &result.response).await {
@@ -677,6 +688,7 @@ async fn run_telegram_poll(
     running: Arc<AtomicBool>,
     running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
     busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    session_store: Arc<SessionStore>,
 ) {
     let mut poll_interval = interval(Duration::from_secs(1));
     let mut consecutive_errors = 0u32;
@@ -700,6 +712,7 @@ async fn run_telegram_poll(
                         &event,
                         &running_sessions,
                         &busy_ack_ts,
+                        &session_store,
                     )
                     .await;
                 }
@@ -726,6 +739,7 @@ async fn route_telegram_message(
     event: &TelegramMessageEvent,
     running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
     busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    session_store: &Arc<SessionStore>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -802,11 +816,14 @@ async fn route_telegram_message(
             running_sessions.lock().unwrap().remove(chat_id);
             busy_ack_ts.lock().unwrap().remove(chat_id);
 
+            // Compression exhaustion — auto-reset session and notify user.
             if result.compression_exhausted {
-                warn!(
-                    "Session {}: compression exhausted — context too large after max attempts.",
-                    chat_id
-                );
+                let session_key = format!("telegram:{}", chat_id);
+                session_store.reset_session(&session_key);
+                warn!("Session {chat_id}: compression exhausted — auto-reset performed");
+                let reset_msg = "Session reset: conversation context grew too large. \
+                    Starting fresh — previous context has been cleared.";
+                let _ = adapter.send_text(chat_id, reset_msg).await;
             }
             if !result.response.is_empty() {
                 if let Err(e) = adapter.send_text(chat_id, &result.response).await {
