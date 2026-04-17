@@ -7,5 +7,6 @@ pub mod api_server;
 pub mod dingtalk;
 pub mod feishu;
 pub mod feishu_ws;
+pub mod telegram;
 pub mod wecom;
 pub mod weixin;

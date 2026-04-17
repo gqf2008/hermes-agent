@@ -18,6 +18,7 @@ use crate::config::{Platform, PlatformConfig};
 use crate::platforms::api_server::{ApiServerAdapter, ApiServerConfig, ApiServerState};
 use crate::platforms::dingtalk::{DingtalkAdapter, DingtalkConfig};
 use crate::platforms::feishu::{FeishuAdapter, FeishuConfig, FeishuConnectionMode, FeishuMessageEvent};
+use crate::platforms::telegram::{TelegramAdapter, TelegramConfig, TelegramMessageEvent};
 use crate::platforms::wecom::{WeComAdapter, WeComConfig};
 use crate::platforms::weixin::{WeixinAdapter, WeixinConfig, WeixinMessageEvent};
 
@@ -85,12 +86,14 @@ pub struct GatewayRunner {
     config: GatewayConfig,
     feishu_adapter: Option<Arc<FeishuAdapter>>,
     weixin_adapter: Option<Arc<WeixinAdapter>>,
+    telegram_adapter: Option<Arc<TelegramAdapter>>,
     api_server_adapter: Option<Arc<ApiServerAdapter>>,
     dingtalk_adapter: Option<Arc<DingtalkAdapter>>,
     wecom_adapter: Option<Arc<WeComAdapter>>,
     api_server_shutdown_tx: Vec<oneshot::Sender<()>>,
     dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
     feishu_shutdown_tx: Vec<oneshot::Sender<()>>,
+    telegram_shutdown_tx: Vec<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
     /// Track which sessions are currently running (chat_id -> start timestamp).
@@ -107,12 +110,14 @@ impl GatewayRunner {
             config,
             feishu_adapter: None,
             weixin_adapter: None,
+            telegram_adapter: None,
             api_server_adapter: None,
             dingtalk_adapter: None,
             wecom_adapter: None,
             api_server_shutdown_tx: Vec::new(),
             dingtalk_shutdown_tx: Vec::new(),
             feishu_shutdown_tx: Vec::new(),
+            telegram_shutdown_tx: Vec::new(),
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -149,6 +154,15 @@ impl GatewayRunner {
                         self.weixin_adapter = Some(Arc::new(WeixinAdapter::new(weixin_config)));
                     } else {
                         warn!("Weixin enabled but not configured (missing WEIXIN_SESSION_KEY)");
+                    }
+                }
+                Platform::Telegram => {
+                    let telegram_config = TelegramConfig::from_env();
+                    if !telegram_config.bot_token.is_empty() {
+                        info!("Initializing Telegram adapter...");
+                        self.telegram_adapter = Some(Arc::new(TelegramAdapter::new(telegram_config)));
+                    } else {
+                        warn!("Telegram enabled but not configured (missing TELEGRAM_BOT_TOKEN)");
                     }
                 }
                 Platform::ApiServer => {
@@ -192,6 +206,7 @@ impl GatewayRunner {
 
         let feishu_count = self.feishu_adapter.is_some() as usize;
         let weixin_count = self.weixin_adapter.is_some() as usize;
+        let telegram_count = self.telegram_adapter.is_some() as usize;
         let api_server_count = self.api_server_adapter.is_some() as usize;
         let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
         let wecom_count = self.wecom_adapter.is_some() as usize;
@@ -200,7 +215,7 @@ impl GatewayRunner {
             .unwrap_or(false) as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
-            feishu_count + weixin_count + api_server_count + dingtalk_count + wecom_count
+            feishu_count + weixin_count + telegram_count + api_server_count + dingtalk_count + wecom_count
         );
         if feishu_webhook_count > 0 {
             info!("Feishu webhook: port={} path={}",
@@ -226,6 +241,19 @@ impl GatewayRunner {
             let busy_ack_ts = self.busy_ack_ts.clone();
             let handle = tokio::spawn(async move {
                 run_weixin_poll(adapter, handler, running, running_sessions, busy_ack_ts).await;
+            });
+            handles.push(handle);
+        }
+
+        // Telegram: start polling loop
+        if let Some(adapter) = &self.telegram_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let running = self.running.clone();
+            let running_sessions = self.running_sessions.clone();
+            let busy_ack_ts = self.busy_ack_ts.clone();
+            let handle = tokio::spawn(async move {
+                run_telegram_poll(adapter, handler, running, running_sessions, busy_ack_ts).await;
             });
             handles.push(handle);
         }
@@ -383,6 +411,11 @@ impl GatewayRunner {
         for tx in senders {
             let _ = tx.send(());
         }
+        // Trigger Telegram graceful shutdown
+        let senders = std::mem::take(&mut self.telegram_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
         self.running.store(false, Ordering::SeqCst);
         // Clear tracking state so it doesn't leak across stop/restart cycles.
         self.running_sessions.lock().unwrap().clear();
@@ -401,6 +434,7 @@ impl GatewayRunner {
             running: self.is_running(),
             feishu_configured: self.feishu_adapter.is_some(),
             weixin_configured: self.weixin_adapter.is_some(),
+            telegram_configured: self.telegram_adapter.is_some(),
             api_server_configured: self.api_server_adapter.is_some(),
             dingtalk_configured: self.dingtalk_adapter.is_some(),
             wecom_configured: self.wecom_adapter.is_some(),
@@ -415,6 +449,7 @@ pub struct GatewayStatus {
     pub running: bool,
     pub feishu_configured: bool,
     pub weixin_configured: bool,
+    pub telegram_configured: bool,
     pub api_server_configured: bool,
     pub dingtalk_configured: bool,
     pub wecom_configured: bool,
@@ -600,6 +635,162 @@ async fn route_weixin_message(
     }
 }
 
+/// Poll Telegram for inbound messages and route to the agent.
+async fn run_telegram_poll(
+    adapter: Arc<TelegramAdapter>,
+    handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
+    running: Arc<AtomicBool>,
+    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+) {
+    let mut poll_interval = interval(Duration::from_secs(1));
+    let mut consecutive_errors = 0u32;
+
+    info!("Telegram poll loop started");
+
+    while running.load(Ordering::SeqCst) {
+        poll_interval.tick().await;
+
+        match adapter.get_updates().await {
+            Ok(events) => {
+                consecutive_errors = 0;
+                for event in events {
+                    let handler_guard = handler.lock().await;
+                    let handler_ref = handler_guard.as_ref().cloned();
+                    drop(handler_guard);
+
+                    route_telegram_message(
+                        &adapter,
+                        handler_ref.as_ref(),
+                        &event,
+                        &running_sessions,
+                        &busy_ack_ts,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors > 5 {
+                    warn!("Telegram: {consecutive_errors} consecutive errors: {e}");
+                } else {
+                    error!("Telegram poll error: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    info!("Telegram poll loop stopped");
+}
+
+/// Route a Telegram message to the agent handler.
+async fn route_telegram_message(
+    adapter: &TelegramAdapter,
+    handler: Option<&Arc<dyn MessageHandler>>,
+    event: &TelegramMessageEvent,
+    running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if event.content.is_empty() && event.media.is_empty() {
+        return;
+    }
+
+    let chat_id = &event.chat_id;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    // Check if this session is already running (busy session handling)
+    let busy_elapsed_min: Option<f64> = {
+        let sessions = running_sessions.lock().unwrap();
+        sessions.get(chat_id).map(|&start_ts| {
+            let elapsed_secs = now - start_ts;
+            elapsed_secs / 60.0
+        })
+    };
+
+    if let Some(elapsed_min) = busy_elapsed_min {
+        let should_ack = {
+            let mut ack_map = busy_ack_ts.lock().unwrap();
+            let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
+            if now - last_ack < 30.0 {
+                false
+            } else {
+                ack_map.insert(chat_id.to_string(), now);
+                true
+            }
+        };
+
+        if should_ack {
+            if let Some(h) = handler {
+                h.interrupt(chat_id, &event.content);
+            }
+            info!(
+                "Session {chat_id}: busy — agent interrupted after {elapsed_min:.1} min"
+            );
+
+            let busy_msg = format!(
+                "Still processing your previous message ({elapsed_min:.0}m elapsed). \
+                 Please wait for my response before sending another prompt."
+            );
+            let _ = adapter.send_text(chat_id, &busy_msg).await;
+        }
+        return;
+    }
+
+    info!(
+        "Telegram message from {}: {}",
+        chat_id,
+        event.content.chars().take(50).collect::<String>(),
+    );
+
+    {
+        let mut sessions = running_sessions.lock().unwrap();
+        sessions.insert(chat_id.clone(), now);
+    }
+
+    let Some(handler_ref) = handler else {
+        running_sessions.lock().unwrap().remove(chat_id);
+        warn!("No message handler registered for Telegram messages");
+        return;
+    };
+
+    match handler_ref
+        .handle_message(Platform::Telegram, chat_id, &event.content)
+        .await
+    {
+        Ok(result) => {
+            running_sessions.lock().unwrap().remove(chat_id);
+            busy_ack_ts.lock().unwrap().remove(chat_id);
+
+            if result.compression_exhausted {
+                warn!(
+                    "Session {}: compression exhausted — context too large after max attempts.",
+                    chat_id
+                );
+            }
+            if !result.response.is_empty() {
+                if let Err(e) = adapter.send_text(chat_id, &result.response).await {
+                    error!("Telegram send failed: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            running_sessions.lock().unwrap().remove(chat_id);
+            busy_ack_ts.lock().unwrap().remove(chat_id);
+
+            error!("Agent handler failed for Telegram message: {e}");
+            let _ = adapter
+                .send_text(chat_id, "Sorry, I encountered an error processing your message.")
+                .await;
+        }
+    }
+}
+
 /// Load gateway config from config.yaml.
 pub fn load_gateway_config() -> GatewayConfig {
     use hermes_core::hermes_home::get_hermes_home;
@@ -683,6 +874,13 @@ pub fn load_gateway_config() -> GatewayConfig {
                 config: PlatformConfig::default(),
             });
         }
+        if std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Telegram,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
     }
 
     GatewayConfig {
@@ -713,6 +911,7 @@ mod tests {
         assert!(!status.running);
         assert!(!status.feishu_configured);
         assert!(!status.weixin_configured);
+        assert!(!status.telegram_configured);
         assert!(!status.api_server_configured);
         assert!(!status.dingtalk_configured);
         assert!(!status.wecom_configured);
