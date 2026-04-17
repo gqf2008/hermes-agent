@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 use crate::config::{Platform, PlatformConfig};
 use crate::platforms::api_server::{ApiServerAdapter, ApiServerConfig, ApiServerState};
 use crate::platforms::dingtalk::{DingtalkAdapter, DingtalkConfig};
+use crate::platforms::discord::{DiscordAdapter, DiscordConfig};
 use crate::platforms::feishu::{FeishuAdapter, FeishuConfig, FeishuConnectionMode, FeishuMessageEvent};
 use crate::platforms::telegram::{TelegramAdapter, TelegramConfig, TelegramMessageEvent};
 use crate::platforms::wecom::{WeComAdapter, WeComConfig};
@@ -87,6 +88,7 @@ pub struct GatewayRunner {
     feishu_adapter: Option<Arc<FeishuAdapter>>,
     weixin_adapter: Option<Arc<WeixinAdapter>>,
     telegram_adapter: Option<Arc<TelegramAdapter>>,
+    discord_adapter: Option<Arc<DiscordAdapter>>,
     api_server_adapter: Option<Arc<ApiServerAdapter>>,
     dingtalk_adapter: Option<Arc<DingtalkAdapter>>,
     wecom_adapter: Option<Arc<WeComAdapter>>,
@@ -94,6 +96,7 @@ pub struct GatewayRunner {
     dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
     feishu_shutdown_tx: Vec<oneshot::Sender<()>>,
     telegram_shutdown_tx: Vec<oneshot::Sender<()>>,
+    discord_shutdown_tx: Vec<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
     /// Track which sessions are currently running (chat_id -> start timestamp).
@@ -111,6 +114,7 @@ impl GatewayRunner {
             feishu_adapter: None,
             weixin_adapter: None,
             telegram_adapter: None,
+            discord_adapter: None,
             api_server_adapter: None,
             dingtalk_adapter: None,
             wecom_adapter: None,
@@ -118,6 +122,7 @@ impl GatewayRunner {
             dingtalk_shutdown_tx: Vec::new(),
             feishu_shutdown_tx: Vec::new(),
             telegram_shutdown_tx: Vec::new(),
+            discord_shutdown_tx: Vec::new(),
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -165,6 +170,15 @@ impl GatewayRunner {
                         warn!("Telegram enabled but not configured (missing TELEGRAM_BOT_TOKEN)");
                     }
                 }
+                Platform::Discord => {
+                    let discord_config = DiscordConfig::from_env();
+                    if !discord_config.bot_token.is_empty() {
+                        info!("Initializing Discord adapter...");
+                        self.discord_adapter = Some(Arc::new(DiscordAdapter::new(discord_config)));
+                    } else {
+                        warn!("Discord enabled but not configured (missing DISCORD_BOT_TOKEN)");
+                    }
+                }
                 Platform::ApiServer => {
                     let api_config = ApiServerConfig::from_env();
                     info!(
@@ -207,6 +221,7 @@ impl GatewayRunner {
         let feishu_count = self.feishu_adapter.is_some() as usize;
         let weixin_count = self.weixin_adapter.is_some() as usize;
         let telegram_count = self.telegram_adapter.is_some() as usize;
+        let discord_count = self.discord_adapter.is_some() as usize;
         let api_server_count = self.api_server_adapter.is_some() as usize;
         let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
         let wecom_count = self.wecom_adapter.is_some() as usize;
@@ -215,7 +230,7 @@ impl GatewayRunner {
             .unwrap_or(false) as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
-            feishu_count + weixin_count + telegram_count + api_server_count + dingtalk_count + wecom_count
+            feishu_count + weixin_count + telegram_count + discord_count + api_server_count + dingtalk_count + wecom_count
         );
         if feishu_webhook_count > 0 {
             info!("Feishu webhook: port={} path={}",
@@ -255,6 +270,19 @@ impl GatewayRunner {
             let handle = tokio::spawn(async move {
                 run_telegram_poll(adapter, handler, running, running_sessions, busy_ack_ts).await;
             });
+            handles.push(handle);
+        }
+
+        // Discord: start Gateway WebSocket loop
+        if let Some(adapter) = &self.discord_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let running = self.running.clone();
+            let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                adapter.run(handler, running).await;
+            });
+            self.discord_shutdown_tx.push(shutdown_tx);
             handles.push(handle);
         }
 
@@ -416,6 +444,11 @@ impl GatewayRunner {
         for tx in senders {
             let _ = tx.send(());
         }
+        // Trigger Discord graceful shutdown
+        let senders = std::mem::take(&mut self.discord_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
         self.running.store(false, Ordering::SeqCst);
         // Clear tracking state so it doesn't leak across stop/restart cycles.
         self.running_sessions.lock().unwrap().clear();
@@ -435,6 +468,7 @@ impl GatewayRunner {
             feishu_configured: self.feishu_adapter.is_some(),
             weixin_configured: self.weixin_adapter.is_some(),
             telegram_configured: self.telegram_adapter.is_some(),
+            discord_configured: self.discord_adapter.is_some(),
             api_server_configured: self.api_server_adapter.is_some(),
             dingtalk_configured: self.dingtalk_adapter.is_some(),
             wecom_configured: self.wecom_adapter.is_some(),
@@ -450,6 +484,7 @@ pub struct GatewayStatus {
     pub feishu_configured: bool,
     pub weixin_configured: bool,
     pub telegram_configured: bool,
+    pub discord_configured: bool,
     pub api_server_configured: bool,
     pub dingtalk_configured: bool,
     pub wecom_configured: bool,
@@ -881,6 +916,13 @@ pub fn load_gateway_config() -> GatewayConfig {
                 config: PlatformConfig::default(),
             });
         }
+        if std::env::var("DISCORD_BOT_TOKEN").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Discord,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
     }
 
     GatewayConfig {
@@ -912,6 +954,7 @@ mod tests {
         assert!(!status.feishu_configured);
         assert!(!status.weixin_configured);
         assert!(!status.telegram_configured);
+        assert!(!status.discord_configured);
         assert!(!status.api_server_configured);
         assert!(!status.dingtalk_configured);
         assert!(!status.wecom_configured);

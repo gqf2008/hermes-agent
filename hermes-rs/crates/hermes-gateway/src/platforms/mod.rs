@@ -5,6 +5,7 @@
 
 pub mod api_server;
 pub mod dingtalk;
+pub mod discord;
 pub mod feishu;
 pub mod feishu_ws;
 pub mod telegram;
