@@ -20,6 +20,7 @@ use crate::session::SessionStore;
 use crate::platforms::dingtalk::{DingtalkAdapter, DingtalkConfig};
 use crate::platforms::discord::{DiscordAdapter, DiscordConfig};
 use crate::platforms::feishu::{FeishuAdapter, FeishuConfig, FeishuConnectionMode, FeishuMessageEvent};
+use crate::platforms::slack::{SlackAdapter, SlackConfig, SlackMessageEvent};
 use crate::platforms::telegram::{TelegramAdapter, TelegramConfig, TelegramMessageEvent};
 use crate::platforms::wecom::{WeComAdapter, WeComConfig};
 use crate::platforms::weixin::{WeixinAdapter, WeixinConfig, WeixinMessageEvent};
@@ -90,6 +91,7 @@ pub struct GatewayRunner {
     weixin_adapter: Option<Arc<WeixinAdapter>>,
     telegram_adapter: Option<Arc<TelegramAdapter>>,
     discord_adapter: Option<Arc<DiscordAdapter>>,
+    slack_adapter: Option<Arc<SlackAdapter>>,
     api_server_adapter: Option<Arc<ApiServerAdapter>>,
     dingtalk_adapter: Option<Arc<DingtalkAdapter>>,
     wecom_adapter: Option<Arc<WeComAdapter>>,
@@ -98,6 +100,7 @@ pub struct GatewayRunner {
     feishu_shutdown_tx: Vec<oneshot::Sender<()>>,
     telegram_shutdown_tx: Vec<oneshot::Sender<()>>,
     discord_shutdown_tx: Vec<oneshot::Sender<()>>,
+    slack_shutdown_tx: Vec<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
     /// Track which sessions are currently running (chat_id -> start timestamp).
@@ -118,6 +121,7 @@ impl GatewayRunner {
             weixin_adapter: None,
             telegram_adapter: None,
             discord_adapter: None,
+            slack_adapter: None,
             api_server_adapter: None,
             dingtalk_adapter: None,
             wecom_adapter: None,
@@ -126,6 +130,7 @@ impl GatewayRunner {
             feishu_shutdown_tx: Vec::new(),
             telegram_shutdown_tx: Vec::new(),
             discord_shutdown_tx: Vec::new(),
+            slack_shutdown_tx: Vec::new(),
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -186,6 +191,15 @@ impl GatewayRunner {
                         warn!("Discord enabled but not configured (missing DISCORD_BOT_TOKEN)");
                     }
                 }
+                Platform::Slack => {
+                    let slack_config = SlackConfig::from_env();
+                    if !slack_config.bot_token.is_empty() && !slack_config.signing_secret.is_empty() {
+                        info!("Initializing Slack adapter...");
+                        self.slack_adapter = Some(Arc::new(SlackAdapter::new(slack_config)));
+                    } else {
+                        warn!("Slack enabled but not configured (missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET)");
+                    }
+                }
                 Platform::ApiServer => {
                     let api_config = ApiServerConfig::from_env();
                     info!(
@@ -229,6 +243,7 @@ impl GatewayRunner {
         let weixin_count = self.weixin_adapter.is_some() as usize;
         let telegram_count = self.telegram_adapter.is_some() as usize;
         let discord_count = self.discord_adapter.is_some() as usize;
+        let slack_count = self.slack_adapter.is_some() as usize;
         let api_server_count = self.api_server_adapter.is_some() as usize;
         let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
         let wecom_count = self.wecom_adapter.is_some() as usize;
@@ -237,7 +252,7 @@ impl GatewayRunner {
             .unwrap_or(false) as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
-            feishu_count + weixin_count + telegram_count + discord_count + api_server_count + dingtalk_count + wecom_count
+            feishu_count + weixin_count + telegram_count + discord_count + slack_count + api_server_count + dingtalk_count + wecom_count
         );
         if feishu_webhook_count > 0 {
             info!("Feishu webhook: port={} path={}",
@@ -292,6 +307,114 @@ impl GatewayRunner {
                 adapter.run(handler, running).await;
             });
             self.discord_shutdown_tx.push(shutdown_tx);
+            handles.push(handle);
+        }
+
+        // Slack: start Event API webhook server
+        if let Some(adapter) = &self.slack_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let running = self.running.clone();
+            let running_sessions = self.running_sessions.clone();
+            let busy_ack_ts = self.busy_ack_ts.clone();
+            let session_store = self.session_store.clone();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let adapter_for_run = adapter.clone();
+            let handle = tokio::spawn(async move {
+                let on_msg = move |event: SlackMessageEvent| {
+                    let handler = handler.clone();
+                    let running = running.clone();
+                    let adapter = adapter.clone();
+                    let running_sessions = running_sessions.clone();
+                    let busy_ack_ts = busy_ack_ts.clone();
+                    let session_store = session_store.clone();
+                    tokio::spawn(async move {
+                        if !running.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let guard = handler.lock().await;
+                        if let Some(h) = guard.as_ref() {
+                            let chat_id = &event.channel_id;
+                            let content = &event.content;
+                            info!(
+                                "Slack message from {} via {}: {}",
+                                event.user_id,
+                                chat_id,
+                                content.chars().take(50).collect::<String>(),
+                            );
+
+                            // Check busy session
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let is_busy = {
+                                let sessions = running_sessions.lock().unwrap();
+                                sessions.contains_key(chat_id)
+                            };
+
+                            if is_busy {
+                                let should_ack = {
+                                    let mut ack_map = busy_ack_ts.lock().unwrap();
+                                    let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
+                                    if now - last_ack < 30.0 {
+                                        false
+                                    } else {
+                                        ack_map.insert(chat_id.to_string(), now);
+                                        true
+                                    }
+                                };
+                                if should_ack {
+                                    h.interrupt(chat_id, content);
+                                    let _ = adapter.send_text(chat_id,
+                                        "Still processing your previous message. Please wait.").await;
+                                }
+                                return;
+                            }
+
+                            {
+                                let mut sessions = running_sessions.lock().unwrap();
+                                sessions.insert(chat_id.clone(), now);
+                            }
+
+                            match h.handle_message(Platform::Slack, chat_id, content).await {
+                                Ok(result) => {
+                                    running_sessions.lock().unwrap().remove(chat_id);
+                                    busy_ack_ts.lock().unwrap().remove(chat_id);
+
+                                    if result.compression_exhausted {
+                                        let session_key = format!("slack:{}", chat_id);
+                                        session_store.reset_session(&session_key);
+                                        let _ = adapter.send_text(chat_id,
+                                            "Session reset: conversation context grew too large. Starting fresh.").await;
+                                    }
+                                    if !result.response.is_empty() {
+                                        let target = if let Some(ref ts) = event.thread_ts {
+                                            adapter.send_text_in_thread(chat_id, &result.response, ts).await
+                                        } else {
+                                            adapter.send_text(chat_id, &result.response).await
+                                        };
+                                        if let Err(e) = target {
+                                            error!("Slack send failed: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    running_sessions.lock().unwrap().remove(chat_id);
+                                    busy_ack_ts.lock().unwrap().remove(chat_id);
+                                    error!("Agent handler failed for Slack message: {e}");
+                                    let _ = adapter.send_text(chat_id,
+                                        "Sorry, I encountered an error processing your message.").await;
+                                }
+                            }
+                        }
+                    });
+                };
+                if let Err(e) = adapter_for_run.run(on_msg, shutdown_rx).await {
+                    error!("Slack webhook error: {e}");
+                }
+            });
+            self.slack_shutdown_tx.push(shutdown_tx);
             handles.push(handle);
         }
 
@@ -458,6 +581,11 @@ impl GatewayRunner {
         for tx in senders {
             let _ = tx.send(());
         }
+        // Trigger Slack graceful shutdown
+        let senders = std::mem::take(&mut self.slack_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
         self.running.store(false, Ordering::SeqCst);
         // Clear tracking state so it doesn't leak across stop/restart cycles.
         self.running_sessions.lock().unwrap().clear();
@@ -478,6 +606,7 @@ impl GatewayRunner {
             weixin_configured: self.weixin_adapter.is_some(),
             telegram_configured: self.telegram_adapter.is_some(),
             discord_configured: self.discord_adapter.is_some(),
+            slack_configured: self.slack_adapter.is_some(),
             api_server_configured: self.api_server_adapter.is_some(),
             dingtalk_configured: self.dingtalk_adapter.is_some(),
             wecom_configured: self.wecom_adapter.is_some(),
@@ -494,6 +623,7 @@ pub struct GatewayStatus {
     pub weixin_configured: bool,
     pub telegram_configured: bool,
     pub discord_configured: bool,
+    pub slack_configured: bool,
     pub api_server_configured: bool,
     pub dingtalk_configured: bool,
     pub wecom_configured: bool,
@@ -872,6 +1002,7 @@ pub fn load_gateway_config() -> GatewayConfig {
                                     "wecom" => Platform::Wecom,
                                     "telegram" => Platform::Telegram,
                                     "discord" => Platform::Discord,
+                                    "slack" => Platform::Slack,
                                     "api_server" => Platform::ApiServer,
                                     _ => Platform::Local,
                                 };
@@ -940,6 +1071,13 @@ pub fn load_gateway_config() -> GatewayConfig {
                 config: PlatformConfig::default(),
             });
         }
+        if std::env::var("SLACK_BOT_TOKEN").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Slack,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
     }
 
     GatewayConfig {
@@ -972,6 +1110,7 @@ mod tests {
         assert!(!status.weixin_configured);
         assert!(!status.telegram_configured);
         assert!(!status.discord_configured);
+        assert!(!status.slack_configured);
         assert!(!status.api_server_configured);
         assert!(!status.dingtalk_configured);
         assert!(!status.wecom_configured);

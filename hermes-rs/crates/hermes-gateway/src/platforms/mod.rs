@@ -8,6 +8,7 @@ pub mod dingtalk;
 pub mod discord;
 pub mod feishu;
 pub mod feishu_ws;
+pub mod slack;
 pub mod telegram;
 pub mod wecom;
 pub mod weixin;
