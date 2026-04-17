@@ -27,6 +27,10 @@ pub struct FailoverState {
     pub sanitize_passes: u32,
     /// Total retry attempts.
     pub retry_count: u32,
+    /// Whether OAuth auth refresh has been attempted this turn.
+    pub auth_refresh_attempted: bool,
+    /// Whether context tier has been reduced this turn.
+    pub tier_reduced: bool,
 }
 
 const MAX_SANITIZE_PASSES: u32 = 2;
@@ -116,11 +120,13 @@ fn strip_inline_reasoning(content: &str) -> String {
 /// Apply the failover chain for an LLM error.
 ///
 /// Returns `FailoverAction` indicating what the caller should do.
+/// Mirrors Python failover sequence (run_agent.py:9350-10127).
 pub fn apply_failover(
     error: &ClassifiedError,
     state: &mut FailoverState,
     pool: Option<&CredentialPool>,
     has_compressor: bool,
+    had_prior_success: bool,
 ) -> FailoverAction {
     state.retry_count += 1;
 
@@ -137,16 +143,33 @@ pub fn apply_failover(
     if error.reason == FailoverReason::RateLimit {
         if state.consecutive_429 > 0 {
             state.consecutive_429 = 0;
-            if pool.is_some() {
+            if pool.is_some_and(|p| p.has_available()) {
                 return FailoverAction::RotateCredential;
             }
+            // Pool exhausted — eager fallback (Python: run_agent.py:9729-9750)
+            return FailoverAction::TryFallback;
         } else {
             state.consecutive_429 += 1;
         }
         return FailoverAction::RetryWithBackoff;
     }
 
-    // 3. Credential pool rotation (non-rate-limit errors)
+    // 3. Provider-specific auth refresh (OAuth 401 → try refresh before rotate)
+    // Mirrors Python: Codex/Nous/Anthropic 401 refresh (run_agent.py:9500-9570)
+    if error.reason == FailoverReason::Auth {
+        match error.provider.as_str() {
+            "anthropic" | "codex" | "nous" => {
+                if !state.auth_refresh_attempted {
+                    state.auth_refresh_attempted = true;
+                    return FailoverAction::RefreshProviderAuth;
+                }
+                // Refresh already attempted, fall through to rotation
+            }
+            _ => {}
+        }
+    }
+
+    // 4. Credential pool rotation (non-rate-limit errors)
     if error.should_rotate_credential {
         match error.reason {
             FailoverReason::Billing | FailoverReason::Auth => {
@@ -156,33 +179,49 @@ pub fn apply_failover(
         }
     }
 
-    // 3. Thinking signature recovery (one-shot)
+    // 5. Thinking signature recovery (one-shot)
     if error.reason == FailoverReason::ThinkingSignature && !state.thinking_stripped {
         state.thinking_stripped = true;
         return FailoverAction::StripThinkingSignature;
     }
 
-    // 4. Context overflow → compress
+    // 6. Context tier reduction (before compression — cheaper first)
+    // Mirrors Python: degrade probe tier / reduce max_tokens (run_agent.py:9800-9900)
+    if error.reason == FailoverReason::ContextOverflow && !state.tier_reduced {
+        state.tier_reduced = true;
+        return FailoverAction::ReduceContextTier;
+    }
+
+    // 7. Context overflow → compress
     if error.reason == FailoverReason::ContextOverflow && has_compressor {
         return FailoverAction::CompressContext;
     }
 
-    // 5. Payload too large → compress
+    // 8. Payload too large → compress
     if error.reason == FailoverReason::PayloadTooLarge && has_compressor {
         return FailoverAction::CompressContext;
     }
 
-    // 6. Retryable errors → backoff
+    // 9. Rollback to last assistant turn (truncated response after success)
+    // Mirrors Python: rollback on incomplete response after successful API call
+    if had_prior_success && error.retryable
+        && error.reason != FailoverReason::ContextOverflow
+        && error.reason != FailoverReason::PayloadTooLarge
+    {
+        return FailoverAction::RollbackToLastAssistant;
+    }
+
+    // 10. Retryable errors → backoff
     if error.retryable {
         return FailoverAction::RetryWithBackoff;
     }
 
-    // 7. Fallback recommended
+    // 11. Fallback recommended
     if error.should_fallback {
         return FailoverAction::TryFallback;
     }
 
-    // 8. Abort
+    // 12. Abort
     FailoverAction::Abort
 }
 
@@ -193,12 +232,19 @@ pub enum FailoverAction {
     SanitizeUnicode,
     /// Rotate to next credential in pool and retry.
     RotateCredential,
+    /// Refresh auth token for current provider (OAuth refresh).
+    RefreshProviderAuth,
     /// Strip reasoning from messages and retry (one-shot).
     StripThinkingSignature,
     /// Compress context and retry.
     CompressContext,
+    /// Reduce context tier (degrade probing level, remove oldest turns).
+    ReduceContextTier,
     /// Retry with exponential backoff.
     RetryWithBackoff,
+    /// Roll back messages to last complete assistant turn and retry.
+    /// Mirrors Python `_rollback_to_last_assistant()` (run_agent.py:~2497).
+    RollbackToLastAssistant,
     /// Try fallback provider.
     TryFallback,
     /// No recovery available — abort.
@@ -207,6 +253,8 @@ pub enum FailoverAction {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use hermes_llm::error_classifier::classify_api_error;
 
@@ -260,24 +308,28 @@ mod tests {
     fn test_apply_failover_billing() {
         let err = classify_api_error("openrouter", "model", Some(402), "Billing exceeded");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
-        assert!(matches!(action, FailoverAction::RetryWithBackoff | FailoverAction::TryFallback));
-        // Billing errors set should_fallback = true
+        let action = apply_failover(&err, &mut state, None, false, false);
+        // Billing errors have should_rotate_credential=true → RotateCredential
+        assert!(matches!(action, FailoverAction::RotateCredential));
     }
 
     #[test]
     fn test_apply_failover_context_overflow() {
         let err = classify_api_error("anthropic", "claude", Some(400), "context length exceeded");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, true);
-        assert!(matches!(action, FailoverAction::CompressContext));
+        // First context overflow → ReduceContextTier (one-shot, before compression)
+        let action = apply_failover(&err, &mut state, None, true, false);
+        assert!(matches!(action, FailoverAction::ReduceContextTier));
+        // Second overflow → CompressContext (tier already reduced)
+        let action2 = apply_failover(&err, &mut state, None, true, false);
+        assert!(matches!(action2, FailoverAction::CompressContext));
     }
 
     #[test]
     fn test_apply_failover_thinking_signature() {
         let err = classify_api_error("anthropic", "claude", Some(400), "thinking signature invalid");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
+        let action = apply_failover(&err, &mut state, None, false, false);
         assert!(matches!(action, FailoverAction::StripThinkingSignature));
     }
 
@@ -288,16 +340,16 @@ mod tests {
             thinking_stripped: true,
             ..Default::default()
         };
-        let action = apply_failover(&err, &mut state, None, false);
-        // After thinking is already stripped, should fallback
-        assert!(matches!(action, FailoverAction::TryFallback));
+        let action = apply_failover(&err, &mut state, None, false, false);
+        // Thinking signature error is retryable, so when already stripped → RetryWithBackoff
+        assert!(matches!(action, FailoverAction::RetryWithBackoff));
     }
 
     #[test]
     fn test_apply_failover_rate_limit_first() {
         let err = classify_api_error("openai", "gpt-4", Some(429), "Rate limit exceeded");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
+        let action = apply_failover(&err, &mut state, None, false, false);
         // First 429: retry with backoff (don't rotate yet)
         assert!(matches!(action, FailoverAction::RetryWithBackoff));
         assert_eq!(state.consecutive_429, 1);
@@ -307,17 +359,27 @@ mod tests {
     fn test_apply_failover_retryable_unknown() {
         let err = classify_api_error("unknown", "model", None, "Something weird");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
+        let action = apply_failover(&err, &mut state, None, false, false);
         assert!(matches!(action, FailoverAction::RetryWithBackoff));
     }
 
     #[test]
-    fn test_apply_failover_abort_on_non_retryable() {
-        // Non-retryable error with no fallback available should abort
-        let err = classify_api_error("anthropic", "claude", Some(400), "Invalid request");
+    fn test_apply_failover_abort_no_fallback() {
+        // Construct an error that is neither retryable nor has fallback
+        let err = ClassifiedError {
+            reason: FailoverReason::Unknown,
+            status_code: None,
+            provider: "custom".to_string(),
+            model: "model".to_string(),
+            message: "unrecoverable error".to_string(),
+            error_context: HashMap::new(),
+            retryable: false,
+            should_compress: false,
+            should_rotate_credential: false,
+            should_fallback: false,
+        };
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
-        // 400 client error is not retryable, no fallback → abort
+        let action = apply_failover(&err, &mut state, None, false, false);
         assert!(matches!(action, FailoverAction::Abort));
     }
 
@@ -326,7 +388,7 @@ mod tests {
         // Unicode encoding error should trigger sanitize, then retry
         let err = classify_api_error("openai", "model", Some(400), "encoding error: invalid byte");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
+        let action = apply_failover(&err, &mut state, None, false, false);
         assert!(matches!(action, FailoverAction::SanitizeUnicode));
         assert_eq!(state.sanitize_passes, 1);
     }
@@ -336,18 +398,94 @@ mod tests {
         // After 2 sanitize passes, should fall back to retry/abort
         let mut state = FailoverState { sanitize_passes: 2, ..Default::default() };
         let err = classify_api_error("openai", "model", Some(400), "encoding error: invalid byte");
-        let action = apply_failover(&err, &mut state, None, false);
+        let action = apply_failover(&err, &mut state, None, false, false);
         // Max passes reached, should not sanitize again
         assert!(!matches!(action, FailoverAction::SanitizeUnicode));
     }
 
     #[test]
     fn test_apply_failover_billing_with_pool() {
-        // Billing error with credential pool should still retry (billing → no rotation)
+        // Billing error triggers credential rotation in the failover chain
         let err = classify_api_error("openrouter", "model", Some(402), "Billing exceeded");
         let mut state = FailoverState::default();
-        let action = apply_failover(&err, &mut state, None, false);
-        // Billing without rotation → retry with backoff or fallback
-        assert!(matches!(action, FailoverAction::RetryWithBackoff | FailoverAction::TryFallback));
+        let action = apply_failover(&err, &mut state, None, false, false);
+        // Billing errors have should_rotate_credential=true → RotateCredential
+        assert!(matches!(action, FailoverAction::RotateCredential));
+    }
+
+    #[test]
+    fn test_apply_failover_rollback_after_success() {
+        // Retryable error after a successful API call → rollback
+        let err = classify_api_error("openai", "model", None, "server disconnected");
+        let mut state = FailoverState::default();
+        let action = apply_failover(&err, &mut state, None, false, true);
+        assert!(matches!(action, FailoverAction::RollbackToLastAssistant));
+    }
+
+    #[test]
+    fn test_apply_failover_rollback_not_without_prior_success() {
+        // Retryable error without prior success → backoff, not rollback
+        let err = classify_api_error("openai", "model", None, "server disconnected");
+        let mut state = FailoverState::default();
+        let action = apply_failover(&err, &mut state, None, false, false);
+        assert!(matches!(action, FailoverAction::RetryWithBackoff));
+    }
+
+    #[test]
+    fn test_apply_failover_rate_limit_eager_fallback() {
+        // Second 429 without pool → TryFallback
+        let err = classify_api_error("openai", "gpt-4", Some(429), "Rate limit exceeded");
+        let mut state = FailoverState {
+            consecutive_429: 1,
+            ..Default::default()
+        };
+        let action = apply_failover(&err, &mut state, None, false, false);
+        // No pool available → eager fallback
+        assert!(matches!(action, FailoverAction::TryFallback));
+    }
+
+    #[test]
+    fn test_apply_failover_provider_auth_refresh() {
+        // Anthropic 401 → RefreshProviderAuth (one-shot)
+        let err = classify_api_error("anthropic", "claude", Some(401), "invalid api key");
+        let mut state = FailoverState::default();
+        let action = apply_failover(&err, &mut state, None, false, false);
+        assert!(matches!(action, FailoverAction::RefreshProviderAuth));
+        assert!(state.auth_refresh_attempted);
+    }
+
+    #[test]
+    fn test_apply_failover_provider_auth_refresh_already_attempted() {
+        // Auth refresh already attempted → falls through to RotateCredential
+        let err = classify_api_error("anthropic", "claude", Some(401), "invalid api key");
+        let mut state = FailoverState {
+            auth_refresh_attempted: true,
+            ..Default::default()
+        };
+        let action = apply_failover(&err, &mut state, None, false, false);
+        // After refresh already attempted, auth error with should_rotate_credential → Rotate
+        assert!(matches!(action, FailoverAction::RotateCredential));
+    }
+
+    #[test]
+    fn test_apply_failover_context_tier_reduction() {
+        // Context overflow → ReduceContextTier (one-shot, before compression)
+        let err = classify_api_error("anthropic", "claude", Some(400), "context length exceeded");
+        let mut state = FailoverState::default();
+        let action = apply_failover(&err, &mut state, None, true, false);
+        assert!(matches!(action, FailoverAction::ReduceContextTier));
+        assert!(state.tier_reduced);
+    }
+
+    #[test]
+    fn test_apply_failover_context_tier_already_reduced() {
+        // Tier already reduced → compress context
+        let err = classify_api_error("anthropic", "claude", Some(400), "context length exceeded");
+        let mut state = FailoverState {
+            tier_reduced: true,
+            ..Default::default()
+        };
+        let action = apply_failover(&err, &mut state, None, true, false);
+        assert!(matches!(action, FailoverAction::CompressContext));
     }
 }

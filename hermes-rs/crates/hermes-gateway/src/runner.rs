@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::config::{Platform, PlatformConfig};
 use crate::platforms::api_server::{ApiServerAdapter, ApiServerConfig, ApiServerState};
 use crate::platforms::dingtalk::{DingtalkAdapter, DingtalkConfig};
-use crate::platforms::feishu::{FeishuAdapter, FeishuConfig};
+use crate::platforms::feishu::{FeishuAdapter, FeishuConfig, FeishuConnectionMode, FeishuMessageEvent};
 use crate::platforms::wecom::{WeComAdapter, WeComConfig};
 use crate::platforms::weixin::{WeixinAdapter, WeixinConfig, WeixinMessageEvent};
 
@@ -90,6 +90,7 @@ pub struct GatewayRunner {
     wecom_adapter: Option<Arc<WeComAdapter>>,
     api_server_shutdown_tx: Vec<oneshot::Sender<()>>,
     dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
+    feishu_shutdown_tx: Vec<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
     /// Track which sessions are currently running (chat_id -> start timestamp).
@@ -111,6 +112,7 @@ impl GatewayRunner {
             wecom_adapter: None,
             api_server_shutdown_tx: Vec::new(),
             dingtalk_shutdown_tx: Vec::new(),
+            feishu_shutdown_tx: Vec::new(),
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -193,10 +195,19 @@ impl GatewayRunner {
         let api_server_count = self.api_server_adapter.is_some() as usize;
         let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
         let wecom_count = self.wecom_adapter.is_some() as usize;
+        let feishu_webhook_count = self.feishu_adapter.as_ref()
+            .map(|a| matches!(a.config.connection_mode, FeishuConnectionMode::Webhook))
+            .unwrap_or(false) as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
             feishu_count + weixin_count + api_server_count + dingtalk_count + wecom_count
         );
+        if feishu_webhook_count > 0 {
+            info!("Feishu webhook: port={} path={}",
+                self.feishu_adapter.as_ref().unwrap().config.webhook_port,
+                self.feishu_adapter.as_ref().unwrap().config.webhook_path
+            );
+        }
     }
 
     /// Start the gateway main loop.
@@ -219,9 +230,83 @@ impl GatewayRunner {
             handles.push(handle);
         }
 
-        // Feishu WebSocket/Webhook would be started here
-        if self.feishu_adapter.is_some() {
-            info!("Feishu adapter ready (WebSocket/Webhook mode requires separate setup)");
+        // Feishu: start webhook server (Webhook mode) or log WebSocket mode
+        if let Some(adapter) = &self.feishu_adapter {
+            let adapter = adapter.clone();
+            let handler = self.message_handler.clone();
+            let running = self.running.clone();
+
+            match adapter.config.connection_mode {
+                FeishuConnectionMode::Webhook => {
+                    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+                    let handle = tokio::spawn(async move {
+                        // Set up the on_message callback to route to handler
+                        let adapter_for_cb = adapter.clone();
+                        adapter.on_message.write().await.replace(Arc::new(
+                            move |event: FeishuMessageEvent| {
+                                let handler = handler.clone();
+                                let running = running.clone();
+                                let adapter = adapter_for_cb.clone();
+                                let event = event;
+                                tokio::spawn(async move {
+                                    if !running.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    let guard = handler.lock().await;
+                                    if let Some(h) = guard.as_ref() {
+                                        info!(
+                                            "Feishu message from {} via {}: {}",
+                                            event.sender_id,
+                                            event.chat_id,
+                                            event.content.chars().take(50).collect::<String>(),
+                                        );
+                                        match h
+                                            .handle_message(
+                                                Platform::Feishu,
+                                                &event.chat_id,
+                                                &event.content,
+                                            )
+                                            .await
+                                        {
+                                            Ok(result) => {
+                                                if !result.response.is_empty() {
+                                                    if let Err(e) =
+                                                        adapter.send_text_or_post(&event.chat_id, &result.response).await
+                                                    {
+                                                        error!("Feishu send failed: {e}");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Agent handler failed for Feishu message: {e}");
+                                                let _ = adapter
+                                                    .send_text(
+                                                        &event.chat_id,
+                                                        "Sorry, I encountered an error processing your message.",
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                });
+                            },
+                        ));
+
+                        if let Err(e) = adapter.run_webhook(shutdown_rx).await {
+                            error!("Feishu webhook error: {e}");
+                        }
+                    });
+                    self.feishu_shutdown_tx.push(shutdown_tx);
+                    handles.push(handle);
+                }
+                FeishuConnectionMode::WebSocket => {
+                    let ws_client = crate::platforms::feishu_ws::FeishuWsClient::new(adapter.config.clone());
+                    let handle = tokio::spawn(async move {
+                        ws_client.run(handler).await;
+                    });
+                    handles.push(handle);
+                }
+            }
         }
 
         // API Server: start HTTP server
@@ -290,6 +375,11 @@ impl GatewayRunner {
         }
         // Trigger Dingtalk webhook graceful shutdown
         let senders = std::mem::take(&mut self.dingtalk_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
+        // Trigger Feishu webhook graceful shutdown
+        let senders = std::mem::take(&mut self.feishu_shutdown_tx);
         for tx in senders {
             let _ = tx.send(());
         }

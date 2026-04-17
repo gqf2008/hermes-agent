@@ -18,7 +18,11 @@ use serde_json::Value;
 use crate::errors::{ErrorCategory, HermesError, Result};
 use crate::hermes_home::get_hermes_home;
 
-/// Current config schema version. Mirrors Python `_config_version = 18`.
+/// Current config schema version.
+/// Kept at 18 to stay aligned with Python `hermes_cli/config.py`.
+/// Rust-specific additions (credential pool, provider prefs, fallbacks, memory)
+/// are added without bumping the version number so that configs remain
+/// interchangeable between Python and Rust implementations.
 const LATEST_CONFIG_VERSION: u32 = 18;
 
 /// Custom deserializer for context_length that accepts both integers and
@@ -312,6 +316,8 @@ pub struct AuxiliaryTaskConfig {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Request timeout in seconds.
+    pub timeout: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -330,6 +336,16 @@ pub struct CustomProviderConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub api_mode: Option<String>,
+    /// Alternative URL field (alias for base_url).
+    pub url: Option<String>,
+    /// API endpoint field (alias for base_url).
+    pub api: Option<String>,
+    /// Human-readable display name.
+    pub name: Option<String>,
+    /// Default model for this provider.
+    pub default_model: Option<String>,
+    /// Env var name containing the API key.
+    pub key_env: Option<String>,
 }
 
 /// Credential pool strategy for a provider.
@@ -413,10 +429,10 @@ fn migrate_config(config: &mut Value) {
             11 => migrate_v11_to_v12(config), // custom_providers list -> providers dict
             12 => migrate_v12_to_v13(config), // clear dead LLM_MODEL env vars
             13 => migrate_v13_to_v14(config), // migrate legacy stt.model
-            14 => migrate_v14_to_v15(config), // add credential_pool_strategies
-            15 => migrate_v15_to_v16(config), // add provider preferences
-            16 => migrate_v16_to_v17(config), // add fallback_providers
-            17 => migrate_v17_to_v18(config), // add memory.backend default
+            14 => migrate_v14_to_v15(config), // display.interim_assistant_messages (Python aligned)
+            15 => migrate_v15_to_v16(config), // tool_progress_overrides → display.platforms (Python aligned)
+            16 => migrate_v16_to_v17(config), // compression.summary_* → auxiliary.compression (Python aligned)
+            17 => migrate_v17_to_v18(config), // add credential_pool_strategies (aligned with Python v18)
             _ => {}
         }
     }
@@ -519,32 +535,127 @@ fn migrate_v13_to_v14(_config: &mut Value) {
 }
 
 fn migrate_v14_to_v15(config: &mut Value) {
-    // Add credential_pool_strategies section
+    // Python v14→v15: add display.interim_assistant_messages=true
+    // Mirrors Python config.py:2240-2252
+    if let Some(display) = config.get_mut("display") {
+        if display.get("interim_assistant_messages").is_none() {
+            display["interim_assistant_messages"] = Value::Bool(true);
+        }
+    } else {
+        config["display"] = serde_json::json!({"interim_assistant_messages": true});
+    }
+}
+
+fn migrate_v15_to_v16(config: &mut Value) {
+    // Python v15→v16: migrate tool_progress_overrides → display.platforms
+    // Mirrors Python config.py:2254-2276
+    if let Some(display) = config.get_mut("display") {
+        if let Some(overrides) = display.get("tool_progress_overrides").cloned() {
+            if overrides.is_object() {
+                let mut platforms = display.get("platforms")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                if let (Some(platforms_obj), Some(overrides_obj)) = (platforms.as_object_mut(), overrides.as_object()) {
+                    for (plat, mode) in overrides_obj {
+                        if !platforms_obj.contains_key(plat) {
+                            let mut plat_obj = serde_json::Map::new();
+                            plat_obj.insert("tool_progress".to_string(), mode.clone());
+                            platforms_obj.insert(plat.clone(), Value::Object(plat_obj));
+                        }
+                    }
+                }
+                display["platforms"] = platforms;
+            }
+            display.as_object_mut().map(|m| m.remove("tool_progress_overrides"));
+        }
+    }
+}
+
+fn migrate_v16_to_v17(config: &mut Value) {
+    // Python v16→v17: migrate compression.summary_* → auxiliary.compression
+    // Mirrors Python config.py:2278-2313
+    if let Some(comp) = config.get_mut("compression") {
+        if let Some(comp_obj) = comp.as_object_mut() {
+            let s_model = comp_obj.remove("summary_model");
+            let s_provider = comp_obj.remove("summary_provider");
+            let s_base_url = comp_obj.remove("summary_base_url");
+
+            let should_set_aux = matches!(&s_model, Some(Value::String(s)) if !s.is_empty())
+                || matches!(&s_provider, Some(Value::String(s)) if !s.is_empty())
+                || matches!(&s_base_url, Some(Value::String(s)) if !s.is_empty());
+
+            if should_set_aux {
+                let mut auxiliary = config.get("auxiliary")
+                    .cloned()
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                if let Some(aux_obj) = auxiliary.as_object_mut() {
+                    if !aux_obj.contains_key("compression") {
+                        let mut comp_sub = serde_json::Map::new();
+                        if let Some(Some(model)) = s_model.map(|v| v.as_str().map(String::from)) {
+                            if !model.is_empty() {
+                                comp_sub.insert("model".to_string(), Value::String(model));
+                            }
+                        }
+                        if let Some(Some(provider)) = s_provider.map(|v| v.as_str().map(String::from)) {
+                            if !provider.is_empty() {
+                                comp_sub.insert("provider".to_string(), Value::String(provider));
+                            }
+                        }
+                        if let Some(Some(base_url)) = s_base_url.map(|v| v.as_str().map(String::from)) {
+                            if !base_url.is_empty() {
+                                comp_sub.insert("base_url".to_string(), Value::String(base_url));
+                            }
+                        }
+                        if !comp_sub.is_empty() {
+                            aux_obj.insert("compression".to_string(), Value::Object(comp_sub));
+                        }
+                    }
+                }
+                if let Some(aux) = config.get_mut("auxiliary") {
+                    if let Some(new_aux) = auxiliary.as_object() {
+                        for (k, v) in new_aux {
+                            if let Some(obj) = aux.as_object_mut() {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                } else {
+                    config["auxiliary"] = auxiliary;
+                }
+            }
+        }
+    }
+}
+
+fn migrate_v17_to_v18(config: &mut Value) {
+    // Rust-specific: add credential_pool_strategies section
     if config.get("credential_pool_strategies").is_none() {
         config["credential_pool_strategies"] = Value::Object(serde_json::Map::new());
     }
 }
 
-fn migrate_v15_to_v16(config: &mut Value) {
-    // Add provider preferences section
+/// Ensure Rust-specific config fields have their default values.
+///
+/// These fields are not part of the Python v18 schema, so we unconditionally
+/// initialise them after migration so that Rust can rely on their presence.
+fn ensure_rust_defaults(config: &mut Value) {
+    if config.get("credential_pool_strategies").is_none() {
+        config["credential_pool_strategies"] = Value::Object(serde_json::Map::new());
+    }
     if config.get("provider").is_none() {
         config["provider"] = Value::Null;
     }
-}
-
-fn migrate_v16_to_v17(config: &mut Value) {
-    // Add fallback_providers
     if config.get("fallback_providers").is_none() {
         config["fallback_providers"] = Value::Array(vec![]);
     }
-}
-
-fn migrate_v17_to_v18(config: &mut Value) {
-    // Add memory.backend default
     if let Some(memory) = config.get_mut("memory") {
         if memory.get("backend").is_none() {
             memory["backend"] = Value::Null;
         }
+    }
+    if config.get("disabled_tools").is_none() {
+        config["disabled_tools"] = Value::Array(vec![]);
     }
 }
 
@@ -592,6 +703,9 @@ impl HermesConfig {
 
         // Step 1: Migrate config version
         migrate_config(&mut json);
+
+        // Step 1b: Ensure Rust-specific fields have defaults (not part of Python v18)
+        ensure_rust_defaults(&mut json);
 
         // Step 2: Expand ${VAR} references from environment
         json = expand_env_vars(json);
@@ -713,6 +827,7 @@ mod tests {
             "terminal": {"backend": "local"}
         });
         migrate_config(&mut config);
+        ensure_rust_defaults(&mut config);
         assert_eq!(config["_config_version"], Value::Number(serde_json::Number::from(18)));
         // Check added sections
         assert!(config.get("compression").is_some());
@@ -743,6 +858,7 @@ mod tests {
             "model": {"name": "anthropic/claude-opus-4-6"}
         });
         migrate_config(&mut config);
+        ensure_rust_defaults(&mut config);
         assert_eq!(config["_config_version"], Value::Number(serde_json::Number::from(18)));
         assert_eq!(config["model"]["name"], Value::String("anthropic/claude-opus-4-6".to_string()));
     }

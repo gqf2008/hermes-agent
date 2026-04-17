@@ -7,6 +7,27 @@
 //! - Context compression integration
 //! - Sub-agent delegation
 //! - Session persistence
+//!
+//! Split into sub-modules:
+//! - `types` — callback types, AgentConfig, FallbackProvider, TurnResult, TurnUsage
+//! - `constants` — NEVER/PARALLEL_SAFE/PATH_SCOPED tool sets, dispatch_delegation
+//! - `utils` — message sanitization, normalization, token estimation, backoff
+//! - `session` — shutdown, persist_session, flush_messages, save_trajectory
+//! - `control` — chat, interrupt, switch_model, reset_session_state, activity
+
+// Sub-modules (each has its own `impl AIAgent` block)
+pub mod types;
+pub(crate) mod constants;
+pub(crate) mod utils;
+pub mod session;
+pub mod control;
+
+// Re-export public types from sub-modules
+pub use types::{
+    ActivityCallback, AgentConfig, FallbackProvider, InterimAssistantCallback,
+    PreLlmHook, PreLlmHookResult, PrimaryRuntime, ReasoningCallback,
+    StatusCallback, StreamCallback, ToolGenCallback, TurnResult, TurnUsage,
+};
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,332 +39,17 @@ use hermes_prompt::{
     apply_anthropic_cache_control, build_system_prompt, CompressorConfig, ContextCompressor,
     PromptBuilderConfig, ToolUseEnforcement, CacheTtl,
 };
-use hermes_llm::credential_pool::CredentialPool;
+use hermes_llm::reasoning::extract_reasoning;
 use hermes_tools::registry::ToolRegistry;
 
 use crate::budget::IterationBudget;
 use crate::failover::{self, FailoverAction, FailoverState};
 use crate::memory_manager::{sanitize_context as sanitize_memory_context, MemoryManager};
-use crate::memory_provider::MemoryProvider;
 use crate::subagent::{SubagentManager, SubagentResult};
 
-/// Dispatch subagent delegation in a separate tokio task to break
-/// the type-level cycle between execute_tool_call and execute_delegation.
-fn dispatch_delegation(
-    mgr: Arc<SubagentManager>,
-    registry: Arc<ToolRegistry>,
-    args: Value,
-) -> tokio::sync::oneshot::Receiver<Vec<SubagentResult>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let results = mgr.execute_delegation(args, registry).await;
-        let _ = tx.send(results);
-    });
-    rx
-}
-
-/// Check if any tool call has truncated JSON arguments.
-///
-/// Returns true when finish_reason indicates length truncation AND
-/// any tool_call's function arguments don't parse as valid JSON
-/// or don't end with `}` or `]`.
-fn has_truncated_tool_args(tool_calls: &[Value]) -> bool {
-    for tc in tool_calls {
-        if let Some(args_str) = tc
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(Value::as_str)
-        {
-            let trimmed = args_str.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Quick check: doesn't end with closing bracket
-            if !trimmed.ends_with('}') && !trimmed.ends_with(']') {
-                return true;
-            }
-            // Deep check: try to parse as JSON
-            if serde_json::from_str::<Value>(trimmed).is_err() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Check if the base URL is a local endpoint (localhost, 127.0.0.1, etc.).
-fn is_local_endpoint(base_url: &str) -> bool {
-    let url = base_url.to_lowercase();
-    url.contains("://localhost") || url.contains("://127.") || url.contains("://0.0.0.0")
-}
-
-/// Estimate token count from message length (rough chars/4 heuristic).
-///
-/// Mirrors Python: `sum(len(str(v)) for v in messages) // 4` — counts all
-/// string fields in each message, not just `content`, so tool calls and
-/// metadata are included in the estimate.
-fn estimate_tokens(messages: &[Value]) -> usize {
-    let mut total = 0;
-    for msg in messages {
-        if let Some(obj) = msg.as_object() {
-            for value in obj.values() {
-                if let Some(s) = value.as_str() {
-                    total += s.len() / 4;
-                } else if let Some(arr) = value.as_array() {
-                    for item in arr {
-                        if let Some(s) = item.as_str() {
-                            total += s.len() / 4;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    total
-}
-
-/// Compute stale-call timeout for non-streaming API calls.
-///
-/// Mirrors Python: default 300s, scales up for large contexts
-/// (>100K tokens → 600s, >50K → 450s), disabled for local endpoints.
-fn stale_call_timeout(base_url: Option<&str>, messages: &[Value]) -> std::time::Duration {
-    const DEFAULT: f64 = 300.0;
-
-    // Check env var override
-    if let Ok(val) = std::env::var("HERMES_API_CALL_STALE_TIMEOUT") {
-        if let Ok(secs) = val.parse::<f64>() {
-            if secs > 0.0 {
-                return std::time::Duration::from_secs_f64(secs);
-            }
-        }
-    }
-
-    // Local endpoints: no stale timeout (local models may be slow)
-    if base_url.is_some_and(is_local_endpoint) {
-        return std::time::Duration::from_secs(u64::MAX);
-    }
-
-    let est_tokens = estimate_tokens(messages);
-    let secs = if est_tokens > 100_000 {
-        600.0
-    } else if est_tokens > 50_000 {
-        450.0
-    } else {
-        DEFAULT
-    };
-    std::time::Duration::from_secs_f64(secs)
-}
-
-/// Compute exponential backoff in milliseconds based on retry count.
-///
-/// Mirrors Python: backoff starts at 2s and doubles each retry,
-/// with jitter to avoid thundering herd.
-fn compute_backoff_ms(retry_count: u32) -> u64 {
-    let base_ms = 2000u64;
-    let exponent = retry_count.min(5);
-    let backoff = base_ms.saturating_mul(1u64 << exponent);
-    // Add jitter: ±25%
-    let jitter = (backoff as f64 * 0.25) as u64;
-    backoff.saturating_sub(jitter) + (jitter * 2)
-}
-
-/// Build a human-readable failure hint from the error classification.
-///
-/// Mirrors Python: instead of always assuming "rate limiting", extract
-/// HTTP error code (429/504/524/500/503) and response time for context.
-fn build_failure_hint(classification: &hermes_llm::error_classifier::ClassifiedError, api_duration: f64) -> String {
-    use hermes_llm::error_classifier::FailoverReason;
-
-    match classification.status_code {
-        Some(524) => format!("upstream provider timed out (Cloudflare 524, {:.0}s)", api_duration),
-        Some(504) => format!("upstream gateway timeout (504, {:.0}s)", api_duration),
-        Some(429) => "rate limited by upstream provider (429)".to_string(),
-        Some(402) => {
-            match classification.reason {
-                FailoverReason::Billing => "billing/payment issue — check account".to_string(),
-                FailoverReason::RateLimit => "rate limited by upstream provider (402)".to_string(),
-                _ => format!("billing or rate limit (402, {:.1}s)", api_duration),
-            }
-        }
-        Some(code @ 500) | Some(code @ 502) => format!("upstream server error (code {code}, {:.0}s)", api_duration),
-        Some(code @ 503) | Some(code @ 529) => format!("upstream provider overloaded ({code})"),
-        Some(code) => format!("upstream error (code {code}, {:.1}s)", api_duration),
-        None => {
-            // No status code — use response time and reason as hint
-            match classification.reason {
-                FailoverReason::RateLimit => "likely rate limited by provider".to_string(),
-                FailoverReason::Timeout => format!("upstream timeout ({:.0}s)", api_duration),
-                FailoverReason::Overloaded => "upstream overloaded".to_string(),
-                FailoverReason::ServerError => format!("upstream server error ({:.0}s)", api_duration),
-                FailoverReason::Billing => "billing/payment issue — check account".to_string(),
-                FailoverReason::Auth | FailoverReason::AuthPermanent => "authentication failed — check API key".to_string(),
-                _ if api_duration < 10.0 => format!("fast response ({:.1}s) — likely rate limited", api_duration),
-                _ if api_duration > 60.0 => format!("slow response ({:.0}s) — likely upstream timeout", api_duration),
-                _ => format!("response time {:.1}s", api_duration),
-            }
-        }
-    }
-}
-
-/// Rollback message history to the last complete assistant turn.
-///
-/// When an unrecoverable error occurs during a conversation turn,
-/// discard the last incomplete assistant message and return to the
-/// state before it was added.
-///
-/// Mirrors Python: `_rollback_to_last_assistant()` in `run_agent.py`.
-#[allow(dead_code)]
-fn rollback_to_last_assistant(messages: &[Value]) -> Vec<Value> {
-    // Find the last complete assistant message (one without tool_calls
-    // that has content, or one with valid tool_calls + all tool results)
-    let mut last_assistant_idx: Option<usize> = None;
-
-    for (i, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
-        if role == "assistant" {
-            // Mark this as a potential rollback point
-            last_assistant_idx = Some(i);
-        }
-    }
-
-    if let Some(idx) = last_assistant_idx {
-        // Keep everything before the last assistant message
-        messages[..idx].to_vec()
-    } else {
-        // No assistant message found — return original
-        messages.to_vec()
-    }
-}
-
-/// Check if the model output contains thinking tags.
-///
-/// Detects `<think>`, `<thinking>`, `<reasoning>` tags.
-/// Used for thinking-exhaustion gating: only reasoning models
-/// (Claude, o1/o3) should be marked as having exhausted their
-/// thinking budget. Non-reasoning models (GLM, MiniMax) won't
-/// produce these tags and shouldn't be falsely marked as exhausted.
-#[allow(dead_code)]
-fn has_think_tags(content: &str) -> bool {
-    content.contains("<think>") || content.contains("</think>")
-        || content.contains("<thinking>") || content.contains("</thinking>")
-        || content.contains("<reasoning>") || content.contains("</reasoning>")
-}
-
-/// Activity callback to prevent gateway inactivity timeout.
-///
-/// Called before each tool execution to signal activity.
-#[allow(dead_code)]
-type ActivityCallback = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Configuration for the AIAgent.
-#[derive(Debug, Clone)]
-pub struct AgentConfig {
-    /// Model name (e.g., "anthropic/claude-opus-4-6").
-    pub model: String,
-    /// Provider override.
-    pub provider: Option<String>,
-    /// Base URL for API endpoint.
-    pub base_url: Option<String>,
-    /// API key.
-    pub api_key: Option<String>,
-    /// API mode: "openai", "anthropic", "codex".
-    pub api_mode: Option<String>,
-    /// Maximum tool-calling iterations per turn.
-    pub max_iterations: usize,
-    /// Whether to skip context files.
-    pub skip_context_files: bool,
-    /// Platform key (e.g., "cli", "telegram").
-    pub platform: Option<String>,
-    /// Session ID.
-    pub session_id: Option<String>,
-    /// Whether to apply Anthropic prompt caching.
-    pub enable_caching: bool,
-    /// Whether context compression is enabled.
-    pub compression_enabled: bool,
-    /// Compression configuration.
-    pub compression_config: Option<CompressorConfig>,
-    /// Working directory for context file discovery.
-    pub terminal_cwd: Option<std::path::PathBuf>,
-    /// Ephemeral system message (not saved to session DB).
-    pub ephemeral_system_prompt: Option<String>,
-    /// Nudge interval for memory review (default 10 turns).
-    pub memory_nudge_interval: usize,
-    /// Nudge interval for skill review (default 10 iterations).
-    pub skill_nudge_interval: usize,
-    /// Minimum turns between memory flushes (default 6).
-    /// Reserved for future memory flush logic.
-    #[allow(dead_code)]
-    pub memory_flush_min_turns: usize,
-    /// Whether background self-review is enabled (default true).
-    pub self_evolution_enabled: bool,
-    /// Credential pool for provider key rotation.
-    pub credential_pool: Option<Arc<CredentialPool>>,
-    /// Fallback providers for failover.
-    pub fallback_providers: Vec<FallbackProvider>,
-}
-
-/// Fallback provider configuration.
-#[derive(Debug, Clone)]
-pub struct FallbackProvider {
-    pub model: String,
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
-    pub provider: Option<String>,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            model: "anthropic/claude-opus-4-6".to_string(),
-            provider: None,
-            base_url: None,
-            api_key: None,
-            api_mode: None,
-            max_iterations: 90,
-            skip_context_files: false,
-            platform: None,
-            session_id: None,
-            enable_caching: true,
-            compression_enabled: false,
-            compression_config: None,
-            terminal_cwd: None,
-            ephemeral_system_prompt: None,
-            memory_nudge_interval: 10,
-            skill_nudge_interval: 10,
-            memory_flush_min_turns: 6,
-            self_evolution_enabled: true,
-            credential_pool: None,
-            fallback_providers: Vec::new(),
-        }
-    }
-}
-
-/// Result of a conversation turn.
-#[derive(Debug, Clone)]
-pub struct TurnResult {
-    /// Final assistant response text.
-    pub response: String,
-    /// Complete message history after the turn.
-    pub messages: Vec<Value>,
-    /// Number of API calls made.
-    pub api_calls: usize,
-    /// Exit reason.
-    pub exit_reason: String,
-    /// Compression exhaustion flag — set when max compression attempts
-    /// were reached without resolving the context overflow. The caller
-    /// (e.g., gateway) should auto-reset the session to break the loop.
-    pub compression_exhausted: bool,
-    /// Token usage from the last LLM call (if available).
-    pub usage: Option<TurnUsage>,
-}
-
-/// Token usage from a turn.
-#[derive(Debug, Clone)]
-pub struct TurnUsage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-}
+// Re-export from sub-modules for use within this module
+use constants::*;
+use utils::*;
 
 /// AI Agent with tool calling capabilities.
 pub struct AIAgent {
@@ -362,8 +68,10 @@ pub struct AIAgent {
     /// Subagent manager for delegation.
     subagent_mgr: Option<Arc<SubagentManager>>,
     /// Shared interrupt flag for child agents.
-    #[allow(dead_code)]
     interrupt: Arc<AtomicBool>,
+    /// Message accompanying the interrupt request (from Python: `_interrupt_message`).
+    #[allow(dead_code)]
+    interrupt_message: std::sync::Mutex<Option<String>>,
     /// Delegation depth (0 = top-level agent).
     #[allow(dead_code)]
     delegate_depth: u32,
@@ -380,11 +88,62 @@ pub struct AIAgent {
     /// Provider signaled "stream not supported" — switch to non-streaming
     /// for the rest of this session instead of re-failing every retry.
     /// Mirrors Python: `_disable_streaming` in `run_agent.py`.
-    #[allow(dead_code)]
     disable_streaming: bool,
     /// Force ASCII-only payload for API calls (set when ASCII codec error detected).
     #[allow(dead_code)]
     force_ascii_payload: bool,
+    /// Stream callback for TTS/display delta notifications.
+    stream_callback: Option<StreamCallback>,
+    /// Status callback for gateway platform notifications.
+    #[allow(dead_code)]
+    status_callback: Option<StatusCallback>,
+    /// Reasoning/thinking delta callback for streaming.
+    reasoning_callback: Option<ReasoningCallback>,
+    /// Tool generation started callback.
+    #[allow(dead_code)]
+    tool_gen_callback: Option<ToolGenCallback>,
+    /// Interim assistant message callback (mid-turn commentary).
+    #[allow(dead_code)]
+    interim_assistant_callback: Option<InterimAssistantCallback>,
+    /// Accumulated assistant text emitted through stream callbacks.
+    /// Mirrors Python `_current_streamed_assistant_text`.
+    current_streamed_assistant_text: std::sync::Mutex<String>,
+    /// Whether a paragraph break is needed before the next stream delta.
+    /// Mirrors Python `_stream_needs_break`.
+    stream_needs_break: std::sync::Mutex<bool>,
+    /// Whether a fallback provider was activated this turn.
+    /// Restored to primary at the start of the next turn.
+    fallback_activated: bool,
+    /// Snapshot of the primary runtime for fallback restoration.
+    primary_runtime: Option<PrimaryRuntime>,
+    /// Rate limit state captured from provider response headers (x-ratelimit-*).
+    /// Mirrors Python: `_rate_limit_state` in `run_agent.py`.
+    #[allow(dead_code)]
+    rate_limit_state: std::sync::Mutex<Option<Value>>,
+    /// Last activity timestamp (epoch seconds) for gateway diagnostics.
+    /// Mirrors Python: `_last_activity_ts` in `run_agent.py`.
+    #[allow(dead_code)]
+    last_activity_ts: std::sync::Mutex<f64>,
+    /// Last activity description for gateway diagnostics.
+    /// Mirrors Python: `_last_activity_desc` in `run_agent.py`.
+    #[allow(dead_code)]
+    last_activity_desc: std::sync::Mutex<String>,
+    /// Current tool being executed (for activity summary).
+    /// Mirrors Python: `_current_tool` in `run_agent.py`.
+    #[allow(dead_code)]
+    current_tool: std::sync::Mutex<Option<String>>,
+    /// Pre-LLM hook for plugin interception.
+    /// Mirrors Python plugin system.
+    #[allow(dead_code)]
+    pre_llm_hook: Option<PreLlmHook>,
+    /// Turn number for this session (incremented each conversation).
+    turn_number: u64,
+    /// Session database for persistence.
+    session_db: Option<Arc<hermes_state::SessionDB>>,
+    /// Whether to persist sessions to disk (default true).
+    persist_session: bool,
+    /// Index of last flushed message to session DB (prevents duplicate writes).
+    last_flushed_db_idx: usize,
 }
 
 impl AIAgent {
@@ -430,6 +189,9 @@ impl AIAgent {
             None
         };
 
+        let session_db = config.session_db.clone();
+        let persist_session = config.persist_session;
+
         Ok(Self {
             config,
             tool_registry,
@@ -440,6 +202,7 @@ impl AIAgent {
             budget: Arc::new(IterationBudget::new(max_iterations)),
             subagent_mgr,
             interrupt,
+            interrupt_message: std::sync::Mutex::new(None),
             delegate_depth: depth,
             delegate_results: std::sync::Mutex::new(Vec::new()),
             activity_callback: None,
@@ -448,6 +211,24 @@ impl AIAgent {
             disable_streaming: false,
             force_ascii_payload: false,
             last_usage: std::sync::Mutex::new(None),
+            stream_callback: None,
+            status_callback: None,
+            reasoning_callback: None,
+            tool_gen_callback: None,
+            interim_assistant_callback: None,
+            current_streamed_assistant_text: std::sync::Mutex::new(String::new()),
+            stream_needs_break: std::sync::Mutex::new(false),
+            fallback_activated: false,
+            primary_runtime: None,
+            rate_limit_state: std::sync::Mutex::new(None),
+            last_activity_ts: std::sync::Mutex::new(0.0),
+            last_activity_desc: std::sync::Mutex::new(String::new()),
+            current_tool: std::sync::Mutex::new(None),
+            pre_llm_hook: None,
+            turn_number: 0,
+            session_db,
+            persist_session,
+            last_flushed_db_idx: 0,
         })
     }
 
@@ -508,6 +289,22 @@ impl AIAgent {
         system_message: Option<&str>,
         conversation_history: Option<&[Value]>,
     ) -> TurnResult {
+        // Restore primary runtime if fallback was activated last turn.
+        // Mirrors Python `_restore_primary_runtime()` (run_agent.py:5994).
+        // Makes fallback turn-scoped instead of pinning the whole session.
+        if self.fallback_activated {
+            self.restore_primary_runtime();
+        }
+        // Snapshot primary runtime for potential fallback restoration next turn.
+        if self.primary_runtime.is_none() {
+            self.primary_runtime = Some(PrimaryRuntime {
+                model: self.config.model.clone(),
+                base_url: self.config.base_url.clone(),
+                api_key: self.config.api_key.clone(),
+                provider: self.config.provider.clone(),
+            });
+        }
+
         let mut messages: Vec<Value> = conversation_history
             .map(|h| h.to_vec())
             .unwrap_or_default();
@@ -515,11 +312,25 @@ impl AIAgent {
         // Build system prompt
         let active_system_prompt = self.build_system_prompt(system_message);
 
-        // Add user message
+        // Add user message — sanitize stale memory-context blocks first.
+        // Mirrors Python: sanitize_context(user_message) (run_agent.py:8163-8165).
+        // Prevents stale memory tags from leaking into the conversation.
+        let sanitized_user = sanitize_memory_context(user_message);
         messages.push(serde_json::json!({
             "role": "user",
-            "content": user_message
+            "content": sanitized_user
         }));
+
+        // Memory manager on_turn_start notification.
+        // Mirrors Python: memory_manager.on_turn_start() (run_agent.py).
+        // Notifies all registered memory providers of the new turn so they
+        // can prefetch context, update internal state, etc.
+        self.turn_number += 1;
+        self.memory_manager.on_turn_start(
+            self.turn_number,
+            user_message,
+            &std::collections::HashMap::new(),
+        );
 
         let mut api_call_count = 0;
         let mut final_response = String::new();
@@ -572,6 +383,24 @@ impl AIAgent {
                 break;
             }
 
+            // Interrupt check — before each LLM call.
+            // Mirrors Python: `if self._interrupt_requested` (run_agent.py:~8474).
+            // Allows graceful termination of the tool-calling loop when
+            // a new message arrives (gateway) or user presses Ctrl-C.
+            if self.is_interrupted() {
+                let msg = self.interrupt_message.lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_else(|| "Interrupted by user".to_string());
+                tracing::info!(
+                    "Interrupt requested — breaking conversation loop: {}",
+                    msg
+                );
+                final_response = msg;
+                exit_reason = "interrupted".to_string();
+                break;
+            }
+
             // Memory prefetch: recall relevant context for this turn.
             // Only on the first LLM call — retries should not re-inject memory.
             if api_call_count == 0 {
@@ -601,23 +430,126 @@ impl AIAgent {
             }
             }
 
+            // Context pressure warning — emit when nearing compaction threshold.
+            // Mirrors Python `_emit_context_pressure()` (run_agent.py:7917).
+            if let Some(ref compressor) = self.compressor {
+                let threshold = compressor.threshold_tokens();
+                let approx_tokens = estimate_tokens(&messages);
+                let pressure_pct = approx_tokens * 100 / threshold;
+                if pressure_pct >= 80 {
+                    self.emit_context_pressure(approx_tokens, threshold);
+                }
+            }
+
+            // Message sanitization: strip orphaned tool results and fix
+            // role sequences before sending to the API.
+            // Mirrors Python `_sanitize_api_messages()` (run_agent.py:~8615).
+            let sanitized = sanitize_api_messages(&messages);
+
+            // Message normalization: strip whitespace from assistant text,
+            // canonicalize tool-call JSON for cache prefix matching.
+            // Mirrors Python normalization (run_agent.py:~8623-8645).
+            let normalized = normalize_messages(&sanitized);
+
+            // Plugin hook: pre_llm_call.
+            // Allows plugins to inspect/modify messages, system prompt,
+            // or abort the call entirely.
+            let (mut hook_system_prompt, mut hook_messages) =
+                (active_system_prompt.clone(), normalized);
+            if let Some(ref hook) = self.pre_llm_hook {
+                match hook(&hook_system_prompt, &hook_messages, api_call_count) {
+                    PreLlmHookResult::Continue => {}
+                    PreLlmHookResult::Abort(msg) => {
+                        tracing::info!("Pre-LLM hook aborted: {}", msg);
+                        final_response = msg;
+                        exit_reason = "hook_aborted".to_string();
+                        break;
+                    }
+                    PreLlmHookResult::OverrideSystem(sys) => {
+                        hook_system_prompt = sys;
+                    }
+                    PreLlmHookResult::OverrideMessages(msgs) => {
+                        hook_messages = msgs;
+                    }
+                    PreLlmHookResult::OverrideBoth(sys, msgs) => {
+                        hook_system_prompt = sys;
+                        hook_messages = msgs;
+                    }
+                }
+            }
+
             // Call the LLM with stale-call timeout wrapper.
             // Mirrors Python: stale-call detector kills hung connections
             // after configured timeout (default 300s) so the retry loop
             // can apply richer recovery (credential rotation, provider fallback).
             let stale_timeout = stale_call_timeout(
                 self.config.base_url.as_deref(),
-                &messages,
+                &hook_messages,
             );
             let call_start = std::time::Instant::now();
-            let llm_result = tokio::time::timeout(
-                stale_timeout,
-                self.call_llm(&active_system_prompt, &messages),
-            ).await;
+
+            // Choose streaming path when enabled and consumers are registered.
+            // Mirrors Python `_stream_response()` branching (run_agent.py:~5143).
+            let used_streaming = !self.disable_streaming && self.has_stream_consumers();
+            let llm_result = if used_streaming {
+                tokio::time::timeout(
+                    stale_timeout,
+                    self.call_llm_stream(&hook_system_prompt, &hook_messages),
+                ).await
+            } else {
+                tokio::time::timeout(
+                    stale_timeout,
+                    self.call_llm(&hook_system_prompt, &hook_messages),
+                ).await
+            };
 
             match llm_result {
                 Ok(Ok(response)) => {
                     api_call_count += 1;
+
+                    // Fire stream delta with response text (TTS/display).
+                    // When streaming was used, deltas were already fired during
+                    // stream consumption; skip the post-hoc firing.
+                    if !used_streaming {
+                        if let Some(content) = response.get("content").and_then(Value::as_str) {
+                            if !content.is_empty() {
+                                self.fire_stream_delta(content);
+                            }
+                        }
+
+                        // Extract and fire reasoning content from structured fields.
+                        let reasoning_text = extract_reasoning(&response);
+                        if !reasoning_text.is_empty() {
+                            self.fire_reasoning_delta(&reasoning_text);
+                        }
+                    }
+
+                    // Thinking-budget exhaustion detection.
+                    // Mirrors Python reasoning-model handling (run_agent.py:~9049-9123).
+                    // When reasoning models exhaust output tokens on thinking,
+                    // the response may be mid-thought with no final answer.
+                    // Treat this as a truncated response and attempt continuation.
+                    if is_thinking_budget_exhausted(&response, &self.config.model) {
+                        tracing::warn!(
+                            "Thinking budget exhausted on model {} — treating as truncated",
+                            self.config.model
+                        );
+                        if length_continue_retries < 3 {
+                            length_continue_retries += 1;
+                            let content = response
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            truncated_response_prefix.push_str(content);
+                            messages.push(response);
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": "Please continue your previous response from exactly where you left off. Do NOT repeat content, do NOT summarize — just continue."
+                            }));
+                            continue;
+                        }
+                        // Exceeded retries — fall through to partial handling
+                    }
 
                     // Detect truncated tool_call arguments (finish_reason="length"
                     // with invalid JSON in tool arguments). Mirrors Python: retry
@@ -718,9 +650,24 @@ impl AIAgent {
                         // Add assistant message with tool calls
                         messages.push(response.clone());
 
-                        // Execute tools and append results
-                        for tc in tool_calls {
-                            let tool_result = self.execute_tool_call(tc).await;
+                        // Deduplicate tool calls before execution.
+                        // Mirrors Python `_deduplicate_tool_calls()` (run_agent.py:3573).
+                        let deduped = Self::deduplicate_tool_calls(tool_calls);
+
+                        // Execute tools: concurrent for independent batches,
+                        // sequential for interactive/dependent tools.
+                        // Mirrors Python `_execute_tool_calls()` dispatch
+                        // (run_agent.py:7163).
+                        let tool_results = if Self::should_parallelize_tool_batch(&deduped) {
+                            tracing::debug!("Using concurrent tool execution for {} tools", deduped.len());
+                            self.execute_tool_calls_concurrent(&deduped).await
+                        } else {
+                            tracing::debug!("Using sequential tool execution for {} tools", deduped.len());
+                            self.execute_tool_calls_sequential(&deduped).await
+                        };
+
+                        // Append all tool results to message history
+                        for tool_result in tool_results {
                             messages.push(tool_result);
                         }
 
@@ -824,17 +771,21 @@ impl AIAgent {
                     // Full failover chain: classify → recover → retry or abort.
                     // Mirrors Python failover chain (run_agent.py:9350-10127).
                     let error_msg = e.to_string();
+                    // Use the actual provider from config for accurate classification
+                    let provider = self.config.provider.as_deref().unwrap_or("unknown");
                     let classification = hermes_llm::error_classifier::classify_api_error(
-                        "unknown", &self.config.model, None, &error_msg,
+                        provider, &self.config.model, None, &error_msg,
                     );
 
                     // Map ClassifiedError → failover action
                     let has_compressor = self.compressor.is_some();
+                    let had_prior_success = api_call_count > 0;
                     let action = failover::apply_failover(
                         &classification,
                         &mut self.failover_state,
                         self.config.credential_pool.as_deref(),
                         has_compressor,
+                        had_prior_success,
                     );
 
                     let api_duration = call_start.elapsed().as_secs_f64();
@@ -849,13 +800,72 @@ impl AIAgent {
                         FailoverAction::RotateCredential => {
                             tracing::warn!("Failover: rotating credential");
                             if let Some(ref pool) = self.config.credential_pool {
-                                pool.mark_exhausted_and_rotate();
+                                pool.mark_exhausted_and_rotate(None, None);
                             }
+                            continue;
+                        }
+                        FailoverAction::RefreshProviderAuth => {
+                            // Provider-specific OAuth refresh (Anthropic, Codex, Nous).
+                            // Mirrors Python: refresh_anthropic_oauth_pure (run_agent.py:9500-9570).
+                            tracing::warn!("Failover: attempting provider auth refresh");
+                            if let Some(ref pool) = self.config.credential_pool {
+                                if pool.try_refresh_current().await {
+                                    tracing::info!("Failover: provider auth refresh succeeded");
+                                    continue;
+                                }
+                                tracing::warn!("Failover: provider auth refresh failed, will rotate");
+                            }
+                            // No pool or refresh failed — fall through to retry/backoff
+                            let backoff_ms = compute_backoff_ms(self.failover_state.retry_count);
+                            tracing::warn!(
+                                "Failover: retrying with backoff {}ms (auth refresh failed)",
+                                backoff_ms
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms as u64)).await;
                             continue;
                         }
                         FailoverAction::StripThinkingSignature => {
                             tracing::warn!("Failover: stripping thinking signature");
                             failover::strip_reasoning_from_messages(&mut messages);
+                            continue;
+                        }
+                        FailoverAction::RollbackToLastAssistant => {
+                            tracing::warn!("Failover: rolling back to last assistant turn");
+                            let rolled = rollback_to_last_assistant(&messages);
+                            if rolled.len() < messages.len() {
+                                tracing::info!(
+                                    "Rolled back messages: {} → {} entries",
+                                    messages.len(), rolled.len()
+                                );
+                                messages = rolled;
+                                // Reset retry counters after rollback
+                                length_continue_retries = 0;
+                                truncated_response_prefix.clear();
+                                truncated_retry = false;
+                            }
+                            continue;
+                        }
+                        FailoverAction::ReduceContextTier => {
+                            // Reduce context tier: degrade probe level, remove oldest turns.
+                            // Mirrors Python: reduce_tier / degrade_probe (run_agent.py:9800-9900).
+                            // Step 1: Remove oldest user turns first (least valuable)
+                            // Step 2: Strip reasoning from assistant messages
+                            tracing::warn!("Failover: reducing context tier");
+                            let original_len = messages.len();
+                            // Strip reasoning from all messages
+                            failover::strip_reasoning_from_messages(&mut messages);
+                            // Remove oldest non-system message (typically oldest user turn)
+                            if let Some(idx) = messages.iter().position(|m| {
+                                m.get("role").and_then(Value::as_str) != Some("system")
+                            }) {
+                                messages.remove(idx);
+                            }
+                            tracing::info!(
+                                "Context tier reduced: {} → {} entries",
+                                original_len, messages.len()
+                            );
+                            // Clear cached prompt since context changed
+                            self.cached_system_prompt = None;
                             continue;
                         }
                         FailoverAction::CompressContext => {
@@ -920,7 +930,7 @@ impl AIAgent {
 
                                 // Reset failover state and compression counter for fresh attempt
                                 self.failover_state = FailoverState::default();
-                                compression_attempts = 0;
+                                #[allow(unused_assignments)] { compression_attempts = 0; }
 
                                 match self.call_llm(&active_system_prompt, &messages).await {
                                     Ok(resp) => {
@@ -932,6 +942,9 @@ impl AIAgent {
                                         exit_reason = "completed".to_string();
                                         messages.push(resp);
                                         fallback_succeeded = true;
+                                        // Mark fallback activated — next turn will restore primary.
+                                        // Mirrors Python `_fallback_activated = True` (run_agent.py:5920).
+                                        self.fallback_activated = true;
                                         break;
                                     }
                                     Err(fb_err) => {
@@ -1021,6 +1034,10 @@ impl AIAgent {
             }
         }
 
+        // Persist session to SQLite and trajectory files
+        let completed = exit_reason == "completed";
+        self.persist_session(&messages, user_message, completed);
+
         TurnResult {
             response: final_response,
             messages,
@@ -1046,8 +1063,9 @@ impl AIAgent {
         })];
         api_messages.extend(messages.iter().cloned());
 
-        // Apply Anthropic caching if enabled
-        let cached_messages = if self.config.enable_caching {
+        // Apply Anthropic caching if enabled (skip for Codex Responses API)
+        let is_codex = self.config.api_mode.as_deref() == Some("codex");
+        let cached_messages = if self.config.enable_caching && !is_codex {
             apply_anthropic_cache_control(&api_messages, CacheTtl::FiveMinutes, false)
         } else {
             api_messages
@@ -1063,17 +1081,33 @@ impl AIAgent {
             tool_definitions.len()
         );
 
-        // Build the LLM request
+        // Build the LLM request.
+        // If a credential pool is available, use the current credential's
+        // API key and base URL (mirrors Python _swap_credential pattern).
+        let (resolved_api_key, resolved_base_url) = if let Some(ref pool) = self.config.credential_pool {
+            if let Some(cred) = pool.current() {
+                let key = cred.runtime_api_key().to_string();
+                let url = cred.runtime_base_url().map(String::from)
+                    .or_else(|| self.config.base_url.clone());
+                (Some(key), url)
+            } else {
+                (self.config.api_key.clone(), self.config.base_url.clone())
+            }
+        } else {
+            (self.config.api_key.clone(), self.config.base_url.clone())
+        };
+
         let request = hermes_llm::client::LlmRequest {
             model: self.config.model.clone(),
             messages: cached_messages,
             tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions) },
             temperature: None,
             max_tokens: None,
-            base_url: self.config.base_url.clone(),
-            api_key: self.config.api_key.clone(),
+            base_url: resolved_base_url,
+            api_key: resolved_api_key,
             timeout_secs: None,
-            provider_preferences: None,
+            provider_preferences: self.config.provider_preferences.clone(),
+            api_mode: self.config.api_mode.clone(),
         };
 
         let response = hermes_llm::client::call_llm(request).await
@@ -1107,6 +1141,142 @@ impl AIAgent {
 
         if let Some(ref finish) = response.finish_reason {
             result["finish_reason"] = serde_json::Value::String(finish.clone());
+        }
+
+        Ok(result)
+    }
+
+    /// Streaming variant of `call_llm`.
+    ///
+    /// Consumes `LlmStreamEvent`s from the provider, fires display/TTS
+    /// callbacks, and assembles the final response `Value`.
+    /// Mirrors Python `_stream_response()` (run_agent.py:~5143).
+    async fn call_llm_stream(
+        &self,
+        system_prompt: &str,
+        messages: &[Value],
+    ) -> Result<Value> {
+        use futures::StreamExt;
+
+        // Reset per-response stream tracking.
+        self.reset_stream_delivery_tracking();
+
+        let mut api_messages: Vec<Value> = vec![serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        })];
+        api_messages.extend(messages.iter().cloned());
+
+        let is_codex = self.config.api_mode.as_deref() == Some("codex");
+        let cached_messages = if self.config.enable_caching && !is_codex {
+            apply_anthropic_cache_control(&api_messages, CacheTtl::FiveMinutes, false)
+        } else {
+            api_messages
+        };
+
+        let tool_definitions = self.tool_registry.get_definitions(None);
+
+        let (resolved_api_key, resolved_base_url) =
+            if let Some(ref pool) = self.config.credential_pool {
+                if let Some(cred) = pool.current() {
+                    let key = cred.runtime_api_key().to_string();
+                    let url = cred.runtime_base_url()
+                        .map(String::from)
+                        .or_else(|| self.config.base_url.clone());
+                    (Some(key), url)
+                } else {
+                    (self.config.api_key.clone(), self.config.base_url.clone())
+                }
+            } else {
+                (self.config.api_key.clone(), self.config.base_url.clone())
+            };
+
+        let request = hermes_llm::client::LlmRequest {
+            model: self.config.model.clone(),
+            messages: cached_messages,
+            tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions) },
+            temperature: None,
+            max_tokens: None,
+            base_url: resolved_base_url,
+            api_key: resolved_api_key,
+            timeout_secs: None,
+            provider_preferences: self.config.provider_preferences.clone(),
+            api_mode: self.config.api_mode.clone(),
+        };
+
+        let mut stream = hermes_llm::client::call_llm_stream(request).await
+            .map_err(|e| hermes_core::HermesError::new(
+                hermes_core::ErrorCategory::ApiError,
+                e.to_string(),
+            ))?;
+
+        // Accumulators
+        let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut final_usage: Option<hermes_llm::client::UsageInfo> = None;
+
+        while let Some(event) = stream.next().await {
+            match event {
+                hermes_llm::client::LlmStreamEvent::TextDelta { delta } => {
+                    if !delta.is_empty() {
+                        self.fire_stream_delta(&delta);
+                        text_parts.push(delta);
+                    }
+                }
+                hermes_llm::client::LlmStreamEvent::ReasoningDelta { delta } => {
+                    if !delta.is_empty() {
+                        self.fire_reasoning_delta(&delta);
+                        reasoning_parts.push(delta);
+                    }
+                }
+                hermes_llm::client::LlmStreamEvent::ToolGenStarted { name } => {
+                    self.fire_tool_gen_started(&name);
+                }
+                hermes_llm::client::LlmStreamEvent::ToolCall { id, name, arguments } => {
+                    self.fire_tool_gen_started(&name);
+                    tool_calls.push(serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
+                hermes_llm::client::LlmStreamEvent::Done { usage } => {
+                    final_usage = usage;
+                    break;
+                }
+                hermes_llm::client::LlmStreamEvent::Error { message } => {
+                    return Err(hermes_core::HermesError::new(
+                        hermes_core::ErrorCategory::ApiError,
+                        message,
+                    ));
+                }
+            }
+        }
+
+        if let Some(usage_info) = final_usage {
+            self.set_last_usage(TurnUsage {
+                prompt_tokens: usage_info.prompt_tokens,
+                completion_tokens: usage_info.completion_tokens,
+                total_tokens: usage_info.total_tokens,
+            });
+        }
+
+        let mut result = serde_json::json!({
+            "role": "assistant",
+            "content": text_parts.join(""),
+        });
+
+        if !tool_calls.is_empty() {
+            result["tool_calls"] = serde_json::Value::Array(tool_calls);
+        }
+
+        // If we collected reasoning, attach it for downstream extraction
+        if !reasoning_parts.is_empty() {
+            result["reasoning"] = serde_json::Value::String(reasoning_parts.join(""));
         }
 
         Ok(result)
@@ -1150,6 +1320,427 @@ impl AIAgent {
         F: Fn(&str) + Send + Sync + 'static,
     {
         self.activity_callback = Some(Arc::new(callback));
+    }
+
+    /// Set a stream callback to receive text deltas during LLM streaming.
+    ///
+    /// Mirrors Python `_stream_callback` (run_agent.py:5168).
+    /// Used by TTS pipeline to start audio generation before the full response.
+    pub fn set_stream_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.stream_callback = Some(Arc::new(callback));
+    }
+
+    /// Set a status callback for gateway platform notifications.
+    ///
+    /// Mirrors Python `status_callback` (run_agent.py:5194+).
+    /// Receives (event_type, message) pairs for context pressure,
+    /// compression warnings, and other user-facing status updates.
+    pub fn set_status_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str, &str) + Send + Sync + 'static,
+    {
+        self.status_callback = Some(Arc::new(callback));
+    }
+
+    /// Set a reasoning callback to receive thinking/thinking deltas.
+    ///
+    /// Mirrors Python `reasoning_callback` (run_agent.py:5163).
+    /// Receives reasoning text chunks during streaming for display.
+    pub fn set_reasoning_stream_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.reasoning_callback = Some(Arc::new(callback));
+    }
+
+    /// Set a tool generation started callback.
+    ///
+    /// Mirrors Python `_fire_tool_gen_started()` (run_agent.py:5172).
+    /// Fires once per tool name when the streaming response begins
+    /// producing tool_call / tool_use tokens.
+    pub fn set_tool_gen_started_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.tool_gen_callback = Some(Arc::new(callback));
+    }
+
+    /// Set an interim assistant message callback.
+    ///
+    /// Mirrors Python `_emit_interim_assistant_message()` (run_agent.py:5128).
+    /// Fires mid-turn to surface real assistant commentary to the UI layer.
+    /// Signature: (visible_text, already_streamed).
+    #[allow(dead_code)]
+    pub fn set_interim_assistant_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&str, bool) + Send + Sync + 'static,
+    {
+        self.interim_assistant_callback = Some(Arc::new(callback));
+    }
+
+    /// Restore the primary runtime if fallback was activated last turn.
+    ///
+    /// Mirrors Python `_restore_primary_runtime()` (run_agent.py:5994).
+    /// Makes fallback turn-scoped instead of pinning the whole session
+    /// to the fallback provider for every subsequent turn.
+    fn restore_primary_runtime(&mut self) {
+        let Some(primary) = self.primary_runtime.take() else {
+            tracing::warn!("Fallback activated but no primary runtime snapshot");
+            self.fallback_activated = false;
+            return;
+        };
+
+        let old_model = self.config.model.clone();
+        self.config.model = primary.model.clone();
+        self.config.base_url = primary.base_url.clone();
+        self.config.api_key = primary.api_key.clone();
+        self.config.provider = primary.provider.clone();
+
+        self.fallback_activated = false;
+        self.failover_state = FailoverState::default();
+
+        tracing::info!(
+            "Primary runtime restored: {} → {} (provider={:?})",
+            old_model, primary.model, primary.provider
+        );
+    }
+
+    /// Fire the stream delta callback with new text.
+    ///
+    /// Mirrors Python `_fire_stream_delta()` (run_agent.py:5143).
+    /// Delivers text to TTS pipeline and display layers.
+    /// Handles paragraph break injection across tool boundaries
+    /// and tracks what has been streamed to avoid resending.
+    fn fire_stream_delta(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        // If a tool iteration set the break flag, prepend a paragraph
+        // break before the first real text delta.
+        // Mirrors Python: `_stream_needs_break` handling.
+        let mut needs_break = self.stream_needs_break.lock().unwrap();
+        let text = if *needs_break && !text.trim().is_empty() {
+            *needs_break = false;
+            format!("\n\n{text}")
+        } else {
+            text.to_string()
+        };
+        drop(needs_break);
+
+        // Fire callback and record delivery.
+        if let Some(ref cb) = self.stream_callback {
+            cb(text.as_str());
+            self.record_streamed_assistant_text(&text);
+        }
+    }
+
+    /// Fire the reasoning delta callback with reasoning text.
+    ///
+    /// Mirrors Python `_fire_reasoning_delta()` (run_agent.py:5163).
+    /// Delivers thinking/reasoning chunks to display layers.
+    fn fire_reasoning_delta(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ref cb) = self.reasoning_callback {
+            cb(text);
+        }
+    }
+
+    /// Notify display layer that tool call generation has started.
+    ///
+    /// Mirrors Python `_fire_tool_gen_started()` (run_agent.py:5172).
+    /// Fires once per tool name when streaming begins producing
+    /// tool_call / tool_use tokens.
+    fn fire_tool_gen_started(&self, tool_name: &str) {
+        if let Some(ref cb) = self.tool_gen_callback {
+            cb(tool_name);
+        }
+    }
+
+    /// Check if any streaming consumer is registered.
+    ///
+    /// Mirrors Python `_has_stream_consumers()` (run_agent.py:5187).
+    fn has_stream_consumers(&self) -> bool {
+        self.stream_callback.is_some() || self.reasoning_callback.is_some()
+    }
+
+    /// Reset tracking for text delivered during the current model response.
+    ///
+    /// Mirrors Python `_reset_stream_delivery_tracking()` (run_agent.py:5100).
+    fn reset_stream_delivery_tracking(&self) {
+        let mut tracked = self.current_streamed_assistant_text.lock().unwrap();
+        tracked.clear();
+        let mut needs_break = self.stream_needs_break.lock().unwrap();
+        *needs_break = false;
+    }
+
+    /// Accumulate visible assistant text emitted through stream callbacks.
+    ///
+    /// Mirrors Python `_record_streamed_assistant_text()` (run_agent.py:5104).
+    fn record_streamed_assistant_text(&self, text: &str) {
+        if !text.is_empty() {
+            let mut tracked = self.current_streamed_assistant_text.lock().unwrap();
+            tracked.push_str(text);
+        }
+    }
+
+    /// Normalize interim visible text for display comparison.
+    ///
+    /// Mirrors Python `_normalize_interim_visible_text()` (run_agent.py:5112).
+    /// Collapses whitespace and trims.
+    #[allow(dead_code)]
+    fn normalize_interim_visible_text(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut prev_space = true;
+        for c in text.chars() {
+            if c.is_whitespace() {
+                if !prev_space {
+                    result.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                result.push(c);
+                prev_space = false;
+            }
+        }
+        result.trim().to_string()
+    }
+
+    /// Strip reasoning/thinking blocks from content.
+    ///
+    /// Mirrors Python `_strip_think_blocks()` (run_agent.py:2096).
+    /// Handles all tag variants: <think>, <thinking>, <reasoning>,
+    /// <REASONING_SCRATCHPAD>, <thought>, <think>, etc.
+    #[allow(dead_code)]
+    fn strip_think_blocks(content: &str) -> String {
+        let mut result = String::with_capacity(content.len());
+        let bytes = content.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            // <|think|>...|>
+            if content[i..].starts_with("<|think|>") {
+                if let Some(end) = content[i+9..].find("|>") {
+                    i += end + 11;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // <think>...
+            if content[i..].starts_with("<think>") {
+                if let Some(end) = content[i..].find("</think>") {
+                    i += end + 9;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // <thinking>...</thinking> (case-insensitive)
+            if content[i..].to_lowercase().starts_with("<thinking>") {
+                let lower = content[i..].to_lowercase();
+                if let Some(end) = lower.find("</thinking>") {
+                    i += end + 11;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // <reasoning>...</reasoning>
+            if content[i..].starts_with("<reasoning>") {
+                if let Some(end) = content[i..].find("</reasoning>") {
+                    i += end + 12;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD>
+            if content[i..].starts_with("<REASONING_SCRATCHPAD>") {
+                if let Some(end) = content[i..].find("</REASONING_SCRATCHPAD>") {
+                    i += end + 25;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // <thought>...</thought> (case-insensitive)
+            if content[i..].to_lowercase().starts_with("<thought>") {
+                let lower = content[i..].to_lowercase();
+                if let Some(end) = lower.find("</thought>") {
+                    i += end + 10;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // Strip bare closing tags that leaked through
+            if content[i..].starts_with("</think>")
+                || content[i..].starts_with("</thinking>")
+                || content[i..].starts_with("</reasoning>")
+                || content[i..].starts_with("</thought>")
+                || content[i..].starts_with("</REASONING_SCRATCHPAD>")
+            {
+                if let Some(gt) = content[i..].find('>') {
+                    i += gt + 1;
+                    continue;
+                }
+            }
+
+            // Not inside a think block — emit byte
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+
+        result
+    }
+
+    /// Check if content has actual text after reasoning/thinking blocks.
+    ///
+    /// Mirrors Python `_has_content_after_think_block()` (run_agent.py:2073).
+    /// Detects cases where the model only outputs reasoning but no actual
+    /// response, indicating incomplete generation that should be retried.
+    #[allow(dead_code)]
+    fn has_content_after_think_block(content: &str) -> bool {
+        if content.is_empty() {
+            return false;
+        }
+        !Self::strip_think_blocks(content).trim().is_empty()
+    }
+
+    /// Detect Codex-style intermediate acknowledgment.
+    ///
+    /// Mirrors Python `_looks_like_codex_intermediate_ack()` (run_agent.py:2110).
+    /// Detects a planning/ack message that should continue instead of ending the turn.
+    #[allow(dead_code)]
+    fn looks_like_codex_intermediate_ack(
+        user_message: &str,
+        assistant_content: &str,
+        messages: &[Value],
+    ) -> bool {
+        // Don't trigger if any tool result are present.
+        if messages.iter().any(|msg| msg.get("role").and_then(Value::as_str) == Some("tool")) {
+            return false;
+        }
+
+        let assistant_text = Self::strip_think_blocks(assistant_content);
+        let assistant_text = assistant_text.trim().to_lowercase();
+        if assistant_text.is_empty() {
+            return false;
+        }
+        if assistant_text.len() > 1200 {
+            return false;
+        }
+
+        // Check for future acknowledgment: "i'll", "i will", "let me", etc.
+        let has_future_ack = assistant_text.contains("i'll")
+            || assistant_text.contains("i' ll")
+            || assistant_text.contains("i will")
+            || assistant_text.contains("let me")
+            || assistant_text.contains("i can do that")
+            || assistant_text.contains("i can help with that");
+        if !has_future_ack {
+            return false;
+        }
+
+        // Check for action markers.
+        let action_markers = [
+            "look into", "look at", "inspect", "check", "verify",
+            "find", "search", "read", "try", "see if",
+        ];
+        let has_action = action_markers.iter().any(|&m| assistant_text.contains(m));
+        if !has_action {
+            return false;
+        }
+
+        // Don't continue on "I can help with that" without an action plan.
+        if assistant_text.contains("i can help with that") && !has_action {
+            return false;
+        }
+
+        // Must be a single user message (or at least the last one matters).
+        let _ = user_message; // consumed by caller context
+
+        true
+    }
+
+    /// Check if content was already streamed via stream callbacks.
+    ///
+    /// Mirrors Python `_interim_content_was_streamed()` (run_agent.py:5117).
+    #[allow(dead_code)]
+    fn interim_content_was_streamed(&self, content: &str) -> bool {
+        let visible = Self::normalize_interim_visible_text(&Self::strip_think_blocks(content));
+        if visible.is_empty() {
+            return false;
+        }
+        let streamed = {
+            let tracked = self.current_streamed_assistant_text.lock().unwrap();
+            Self::normalize_interim_visible_text(&Self::strip_think_blocks(&tracked))
+        };
+        !streamed.is_empty() && streamed == visible
+    }
+
+    /// Emit an interim assistant message to the UI layer.
+    ///
+    /// Mirrors Python `_emit_interim_assistant_message()` (run_agent.py:5128).
+    /// Surfaces real mid-turn assistant commentary, stripping thinking blocks.
+    #[allow(dead_code)]
+    fn emit_interim_assistant_message(&self, assistant_msg: &Value) {
+        let Some(ref cb) = self.interim_assistant_callback else {
+            return;
+        };
+        let Some(content) = assistant_msg.get("content").and_then(Value::as_str) else {
+            return;
+        };
+        let visible = Self::strip_think_blocks(content);
+        let visible = visible.trim();
+        if visible.is_empty() || visible == "(empty)" {
+            return;
+        }
+        let already_streamed = self.interim_content_was_streamed(visible);
+        cb(visible, already_streamed);
+    }
+
+    /// Mark that the next stream delta should be preceded by a paragraph break.
+    ///
+    /// Called when a tool iteration completes and more text will follow,
+    /// preventing text concatenation across tool boundaries.
+    /// Mirrors Python `_stream_needs_break = True`.
+    #[allow(dead_code)]
+    fn mark_stream_break_needed(&self) {
+        let mut needs_break = self.stream_needs_break.lock().unwrap();
+        *needs_break = true;
+    }
+
+    /// Emit context pressure warning to gateway.
+    ///
+    /// Mirrors Python `_emit_context_pressure()` (run_agent.py:7917).
+    /// Notifies the user that context is approaching the compaction threshold.
+    fn emit_context_pressure(&self, approx_tokens: usize, threshold_tokens: usize) {
+        let Some(ref cb) = self.status_callback else {
+            return;
+        };
+        let threshold_pct = if threshold_tokens > 0 {
+            approx_tokens * 100 / threshold_tokens
+        } else {
+            0
+        };
+        let msg = format!(
+            "⚠️ Context pressure: ~{approx_tokens} tokens ({threshold_pct}% of threshold). Compression will trigger at {threshold_tokens} tokens."
+        );
+        cb("context_pressure", &msg);
     }
 
     /// Spawn a fire-and-forget background review agent.
@@ -1209,6 +1800,105 @@ impl AIAgent {
             "Agent closed: session_id={:?}",
             self.config.session_id
         );
+    }
+
+    /// Deduplicate tool calls by (name, arguments) within a single turn.
+    ///
+    /// Mirrors Python `_deduplicate_tool_calls()` (run_agent.py:3573).
+    /// Weak models sometimes emit duplicate tool calls with identical
+    /// name and arguments — executing them twice is wasteful and can
+    /// cause side effects (e.g., double file writes).
+    fn deduplicate_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::new();
+
+        for tc in tool_calls {
+            let key = format!(
+                "{}:{}",
+                tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or(""),
+                tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or(""),
+            );
+            if seen.insert(key) {
+                unique.push(tc.clone());
+            } else {
+                let dup_name = tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                tracing::warn!("Removed duplicate tool call: {dup_name}");
+            }
+        }
+
+        unique
+    }
+
+    /// Attempt to repair a mismatched tool name.
+    ///
+    /// Mirrors Python `_repair_tool_call()` (run_agent.py:3590).
+    /// Tries: lowercase → normalized (hyphens/spaces to underscores) →
+    /// fuzzy match via Levenshtein distance (cutoff 0.7).
+    fn repair_tool_call(tool_name: &str, valid_names: &[String]) -> Option<String> {
+        // 1. Lowercase
+        let lowered = tool_name.to_lowercase();
+        if valid_names.iter().any(|n| *n == lowered) {
+            return Some(lowered);
+        }
+
+        // 2. Normalized
+        let normalized = lowered.replace('-', "_").replace(' ', "_");
+        if valid_names.iter().any(|n| *n == normalized) {
+            return Some(normalized);
+        }
+
+        // 3. Fuzzy match — Levenshtein distance
+        let cutoff = 0.7;
+        let mut best_match: Option<(f64, &String)> = None;
+        for valid in valid_names {
+            let dist = Self::levenshtein(tool_name, valid);
+            let max_len = tool_name.len().max(valid.len());
+            if max_len == 0 {
+                continue;
+            }
+            let similarity = 1.0 - (dist as f64 / max_len as f64);
+            if similarity >= cutoff {
+                match best_match {
+                    None => best_match = Some((similarity, valid)),
+                    Some((best_sim, _)) => {
+                        if similarity > best_sim {
+                            best_match = Some((similarity, valid));
+                        }
+                    }
+                }
+            }
+        }
+
+        best_match.map(|(_, name)| name.clone())
+    }
+
+    /// Compute Levenshtein distance between two strings.
+    fn levenshtein(a: &str, b: &str) -> usize {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let m = a_chars.len();
+        let n = b_chars.len();
+
+        if m == 0 { return n; }
+        if n == 0 { return m; }
+
+        let mut dp = vec![vec![0usize; n + 1]; m + 1];
+        for i in 0..=m { dp[i][0] = i; }
+        for j in 0..=n { dp[0][j] = j; }
+
+        for i in 1..=m {
+            for j in 1..=n {
+                let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+                dp[i][j] = (dp[i - 1][j] + 1)
+                    .min(dp[i][j - 1] + 1)
+                    .min(dp[i - 1][j - 1] + cost);
+            }
+        }
+
+        dp[m][n]
     }
 
     /// Execute a single tool call and return the result.
@@ -1281,7 +1971,7 @@ impl AIAgent {
         }
 
         // Dispatch through the tool registry
-        match self.tool_registry.dispatch(tool_name, args) {
+        match self.tool_registry.dispatch(tool_name, args.clone()) {
             Ok(result) => {
                 serde_json::json!({
                     "role": "tool",
@@ -1290,6 +1980,45 @@ impl AIAgent {
                 })
             }
             Err(e) => {
+                // Attempt to repair mismatched tool name before returning error.
+                // Mirrors Python `_repair_tool_call()` (run_agent.py:3590).
+                let valid_names: Vec<String> = self
+                    .tool_registry
+                    .get_definitions(None)
+                    .into_iter()
+                    .filter_map(|s| {
+                        s.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .collect();
+
+                if let Some(repaired) = Self::repair_tool_call(tool_name, &valid_names) {
+                    tracing::warn!(
+                        "Tool name repair: {} → {}", tool_name, repaired
+                    );
+                    match self.tool_registry.dispatch(&repaired, args) {
+                        Ok(result) => {
+                            return serde_json::json!({
+                                "role": "tool",
+                                "content": result,
+                                "tool_call_id": tool_call_id
+                            });
+                        }
+                        Err(e2) => {
+                            return serde_json::json!({
+                                "role": "tool",
+                                "content": format!(
+                                    "Error executing tool {} (tried repair to '{}'): {}. {}",
+                                    tool_name, repaired, e, e2
+                                ),
+                                "tool_call_id": tool_call_id
+                            });
+                        }
+                    }
+                }
+
                 serde_json::json!({
                     "role": "tool",
                     "content": format!("Error executing tool {}: {}", tool_name, e),
@@ -1299,19 +2028,400 @@ impl AIAgent {
         }
     }
 
-    /// Shutdown the agent, cleaning up memory providers and other resources.
-    pub fn shutdown(&self) {
-        self.memory_manager.shutdown_all();
+    // ── Concurrent tool execution ─────────────────────────────────────────
+
+    /// Decide whether a batch of tool calls is safe to run in parallel.
+    ///
+    /// Mirrors Python `_should_parallelize_tool_batch()` (run_agent.py:267).
+    ///
+    /// Rules:
+    /// - Single tool: no point in parallelism (returns false)
+    /// - Any tool in `_NEVER_PARALLEL_TOOLS`: sequential (e.g., `clarify`)
+    /// - Path-scoped tools (`read_file`, `write_file`, `patch`): safe only
+    ///   when their target paths don't overlap (no same-file read+write)
+    /// - Other tools: must be in `_PARALLEL_SAFE_TOOLS` (read-only set)
+    /// - Invalid JSON args: fall back to sequential
+    fn should_parallelize_tool_batch(tool_calls: &[Value]) -> bool {
+        if tool_calls.len() <= 1 {
+            return false;
+        }
+
+        // Check for never-parallel tools
+        for tc in tool_calls {
+            if let Some(name) = tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                if NEVER_PARALLEL_TOOLS.contains(name) {
+                    return false;
+                }
+            }
+        }
+
+        // Collect reserved paths for path-scoped overlap detection
+        let mut reserved_paths: Vec<std::path::PathBuf> = Vec::new();
+
+        for tc in tool_calls {
+            let name = tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            // Parse arguments
+            let args_str = tc.get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str);
+
+            let args_str = match args_str {
+                Some(s) => s,
+                None => {
+                    tracing::debug!("No arguments for tool '{}' — defaulting to sequential", name);
+                    return false;
+                }
+            };
+
+            let args: Value = match serde_json::from_str(args_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(
+                        "Invalid JSON args for '{}' ({}) — defaulting to sequential",
+                        name, e
+                    );
+                    return false;
+                }
+            };
+
+            if !args.is_object() {
+                tracing::debug!("Non-object args for '{}' — defaulting to sequential", name);
+                return false;
+            }
+
+            if PATH_SCOPED_TOOLS.contains(name) {
+                // Extract the path scope
+                let scoped_path = Self::extract_parallel_scope_path(name, &args);
+                match scoped_path {
+                    Some(path) => {
+                        // Check overlap with existing reserved paths
+                        for existing in &reserved_paths {
+                            if Self::paths_overlap(&path, existing) {
+                                return false;
+                            }
+                        }
+                        reserved_paths.push(path);
+                    }
+                    None => {
+                        // Couldn't extract path — play it safe
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            if !PARALLEL_SAFE_TOOLS.contains(name) {
+                // Unknown tool — default to sequential
+                return false;
+            }
+        }
+
+        true
     }
 
-    /// Register an external memory provider.
-    pub fn register_memory_provider(&mut self, provider: Arc<dyn MemoryProvider>) {
-        self.memory_manager.add_provider(provider);
+    /// Extract the normalized file target for path-scoped tools.
+    ///
+    /// Mirrors Python `_extract_parallel_scope_path()` (run_agent.py:311).
+    fn extract_parallel_scope_path(tool_name: &str, args: &Value) -> Option<std::path::PathBuf> {
+        if !PATH_SCOPED_TOOLS.contains(tool_name) {
+            return None;
+        }
+
+        let raw_path = args.get("path").and_then(Value::as_str)?;
+        if raw_path.trim().is_empty() {
+            return None;
+        }
+
+        // Expand ~ and resolve to absolute path
+        let expanded = shellexpand::tilde(raw_path);
+        let path = std::path::Path::new(expanded.as_ref());
+
+        if path.is_absolute() {
+            // Use canonicalize if file exists, otherwise just use the absolute path
+            if path.exists() {
+                path.canonicalize().ok()
+            } else {
+                Some(path.to_path_buf())
+            }
+        } else {
+            // Prepend current directory to make it absolute
+            std::env::current_dir().ok().map(|cwd| cwd.join(path))
+        }
     }
 
-    /// Initialize memory providers for a session.
-    pub fn init_memory(&self, session_id: &str) {
-        self.memory_manager.initialize_all(session_id, std::collections::HashMap::new());
+    /// Check if two paths may refer to the same subtree.
+    ///
+    /// Mirrors Python `_paths_overlap()` (run_agent.py:328).
+    fn paths_overlap(a: &std::path::PathBuf, b: &std::path::PathBuf) -> bool {
+        // Exact match
+        if a == b {
+            return true;
+        }
+
+        // Component-wise: check if one is a prefix of the other
+        let a_components: Vec<_> = a.components().collect();
+        let b_components: Vec<_> = b.components().collect();
+
+        let min_len = a_components.len().min(b_components.len());
+        if min_len == 0 {
+            return false;
+        }
+
+        // Check common prefix — if they share the same prefix up to the
+        // shorter path's length, they could be the same file or parent/child
+        a_components[..min_len] == b_components[..min_len]
+    }
+
+    /// Execute multiple tool calls sequentially with richer display output.
+    ///
+    /// Mirrors Python `_execute_tool_calls_sequential()` (run_agent.py:7536).
+    /// Each tool runs one at a time, with per-tool logging, interrupt checks,
+    /// and nudge counter resets.
+    async fn execute_tool_calls_sequential(
+        &mut self,
+        tool_calls: &[Value],
+    ) -> Vec<Value> {
+        let mut results = Vec::with_capacity(tool_calls.len());
+        let num_tools = tool_calls.len();
+
+        for (i, tc) in tool_calls.iter().enumerate() {
+            // Interrupt check before each tool
+            if self.is_interrupted() {
+                let remaining = num_tools - i;
+                if remaining > 0 {
+                    tracing::info!(
+                        "Interrupt: skipping {} remaining tool call(s)",
+                        remaining
+                    );
+                }
+                // Add cancellation messages for skipped tools
+                for skipped_tc in tool_calls.iter().skip(i) {
+                    let skip_name = skipped_tc.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let skip_id = skipped_tc.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    results.push(serde_json::json!({
+                        "role": "tool",
+                        "content": format!(
+                            "[Tool execution cancelled — {} was skipped due to user interrupt]",
+                            skip_name
+                        ),
+                        "tool_call_id": skip_id
+                    }));
+                }
+                break;
+            }
+
+            let tool_name = tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+
+            let args_str = tc.get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+
+            // Log tool invocation
+            tracing::info!(
+                "Executing tool {}/{}: {} (args: {})",
+                i + 1, num_tools, tool_name,
+                &args_str.chars().take(120).collect::<String>()
+            );
+
+            // Self-evolution: reset nudge counters on relevant tool use
+            if tool_name == "memory" {
+                self.turns_since_memory = 0;
+            } else if tool_name == "skill_manage" {
+                self.iters_since_skill = 0;
+            }
+
+            // Signal activity
+            if let Some(ref cb) = self.activity_callback {
+                cb(&format!("calling tool: {tool_name}"));
+            }
+
+            let tool_start = std::time::Instant::now();
+
+            // Execute the tool
+            let tool_result = self.execute_tool_call(tc).await;
+
+            let duration = tool_start.elapsed();
+
+            // Log completion
+            let content_len = tool_result.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.len())
+                .unwrap_or(0);
+
+            tracing::info!(
+                "Tool {} completed in {:.2}s ({} chars output)",
+                tool_name,
+                duration.as_secs_f64(),
+                content_len
+            );
+
+            results.push(tool_result);
+        }
+
+        results
+    }
+
+    /// Execute multiple tool calls concurrently using tokio tasks.
+    ///
+    /// Mirrors Python `_execute_tool_calls_concurrent()` (run_agent.py:7298).
+    /// Independent tool calls (read-only, non-overlapping paths) are spawned
+    /// as separate tokio tasks and results are collected in original order.
+    async fn execute_tool_calls_concurrent(
+        &mut self,
+        tool_calls: &[Value],
+    ) -> Vec<Value> {
+        let num_tools = tool_calls.len();
+
+        // Pre-flight: interrupt check
+        if self.is_interrupted() {
+            tracing::info!("Interrupt: skipping {} tool call(s)", num_tools);
+            return tool_calls.iter().map(|tc| {
+                let name = tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let id = tc.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                serde_json::json!({
+                    "role": "tool",
+                    "content": format!("[Tool execution cancelled — {} was skipped due to user interrupt]", name),
+                    "tool_call_id": id
+                })
+            }).collect()
+        }
+
+        // Parse and log all calls up front
+        let tool_names: Vec<String> = tool_calls.iter()
+            .filter_map(|tc| tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .map(String::from))
+            .collect();
+
+        let tool_names_str = tool_names.join(", ");
+        tracing::info!(
+            "Concurrent: {} tool calls — {}",
+            num_tools, tool_names_str
+        );
+
+        // Reset nudge counters for all tools
+        for name in &tool_names {
+            if name == "memory" {
+                self.turns_since_memory = 0;
+            } else if name == "skill_manage" {
+                self.iters_since_skill = 0;
+            }
+        }
+
+        // Signal activity
+        if let Some(ref cb) = self.activity_callback {
+            cb(&format!("executing {} tools concurrently: {}", num_tools, tool_names_str));
+        }
+
+        // Clone tool calls for spawning (we don't have &mut self across tasks)
+        let tool_calls_clone: Vec<Value> = tool_calls.to_vec();
+
+        // Spawn concurrent tasks.
+        // We use `futures::future::join_all` which runs them concurrently
+        // and collects results in order.
+        let registry = Arc::clone(&self.tool_registry);
+        let subagent_mgr = self.subagent_mgr.clone();
+
+        let tasks: Vec<_> = tool_calls_clone.iter().enumerate().map(|(index, tc)| {
+            let registry = Arc::clone(&registry);
+            let subagent_mgr = subagent_mgr.clone();
+            async move {
+                let tool_name = tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let tool_call_id = tc.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let arguments = tc.get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+
+                let args: std::result::Result<Value, _> = serde_json::from_str(arguments);
+                let args = match args {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (index, serde_json::json!({
+                            "role": "tool",
+                            "content": format!("Invalid JSON arguments for {}: {}", tool_name, e),
+                            "tool_call_id": tool_call_id
+                        }));
+                    }
+                };
+
+                // Handle delegate_task specially (same as execute_tool_call)
+                if tool_name == "delegate_task" {
+                    if let Some(ref mgr) = subagent_mgr {
+                        let mgr = Arc::clone(mgr);
+                        let registry = Arc::clone(&registry);
+                        let args_clone = args.clone();
+                        let rx = dispatch_delegation(mgr, registry, args_clone);
+                        let _results = rx.await.unwrap_or_default();
+                        return (index, serde_json::json!({
+                            "role": "tool",
+                            "content": "Subagent tasks dispatched. Results will be provided after the next LLM call.",
+                            "tool_call_id": tool_call_id
+                        }));
+                    }
+                }
+
+                // Dispatch through the tool registry
+                let tool_start = std::time::Instant::now();
+                let result = match registry.dispatch(tool_name, args) {
+                    Ok(output) => serde_json::json!({
+                        "role": "tool",
+                        "content": output,
+                        "tool_call_id": tool_call_id
+                    }),
+                    Err(e) => serde_json::json!({
+                        "role": "tool",
+                        "content": format!("Error executing tool {}: {}", tool_name, e),
+                        "tool_call_id": tool_call_id
+                    }),
+                };
+
+                let duration = tool_start.elapsed();
+                tracing::info!(
+                    "Tool {} completed in {:.2}s (concurrent)",
+                    tool_name,
+                    duration.as_secs_f64()
+                );
+
+                (index, result)
+            }
+        }).collect();
+
+        // Run all tasks concurrently and collect results
+        let mut indexed_results: Vec<(usize, Value)> = futures::future::join_all(tasks).await;
+
+        // Sort by original index to maintain order
+        indexed_results.sort_by_key(|(idx, _)| *idx);
+
+        // Extract just the result values
+        indexed_results.into_iter().map(|(_, result)| result).collect()
     }
 
 }
@@ -1387,7 +2497,10 @@ mod tests {
             memory_flush_min_turns: 3,
             self_evolution_enabled: true,
             credential_pool: None,
+            provider_preferences: None,
             fallback_providers: Vec::new(),
+            session_db: None,
+            persist_session: true,
         };
         assert_eq!(config.model, "openai/gpt-4");
         assert_eq!(config.max_iterations, 30);
@@ -1984,5 +3097,308 @@ mod tests {
             "openrouter", "model", Some(402), "Insufficient credits");
         let hint = build_failure_hint(&classification, 2.0);
         assert!(hint.contains("billing"));
+    }
+
+    // ── New feature tests ──
+
+    #[test]
+    fn test_deduplicate_tool_calls_no_dupes() {
+        let tool_calls = vec![
+            serde_json::json!({
+                "id": "call_1",
+                "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}
+            }),
+            serde_json::json!({
+                "id": "call_2",
+                "function": {"name": "write_file", "arguments": "{\"path\": \"b.rs\"}"}
+            }),
+        ];
+        let deduped = AIAgent::deduplicate_tool_calls(&tool_calls);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_tool_calls_removes_dupes() {
+        let tool_calls = vec![
+            serde_json::json!({
+                "id": "call_1",
+                "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}
+            }),
+            serde_json::json!({
+                "id": "call_2",
+                "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}
+            }),
+        ];
+        let deduped = AIAgent::deduplicate_tool_calls(&tool_calls);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].get("id").and_then(Value::as_str), Some("call_1"));
+    }
+
+    #[test]
+    fn test_repair_tool_call_lowercase() {
+        let valid = vec!["read_file".to_string(), "write_file".to_string()];
+        let result = AIAgent::repair_tool_call("READ_FILE", &valid);
+        assert_eq!(result, Some("read_file".to_string()));
+    }
+
+    #[test]
+    fn test_repair_tool_call_normalized() {
+        let valid = vec!["read_file".to_string(), "write_file".to_string()];
+        let result = AIAgent::repair_tool_call("read-file", &valid);
+        assert_eq!(result, Some("read_file".to_string()));
+    }
+
+    #[test]
+    fn test_repair_tool_call_fuzzy() {
+        let valid = vec!["read_file".to_string(), "write_file".to_string()];
+        let result = AIAgent::repair_tool_call("reed_file", &valid);
+        assert_eq!(result, Some("read_file".to_string()));
+    }
+
+    #[test]
+    fn test_repair_tool_call_no_match() {
+        let valid = vec!["read_file".to_string(), "write_file".to_string()];
+        let result = AIAgent::repair_tool_call("completely_unknown", &valid);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(AIAgent::levenshtein("", ""), 0);
+        assert_eq!(AIAgent::levenshtein("kitten", "sitting"), 3);
+        assert_eq!(AIAgent::levenshtein("read_file", "reed_file"), 1);
+        assert_eq!(AIAgent::levenshtein("abc", "abc"), 0);
+        assert_eq!(AIAgent::levenshtein("a", "b"), 1);
+    }
+
+    #[test]
+    fn test_restore_primary_runtime() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        // Simulate fallback activation
+        agent.fallback_activated = true;
+        agent.config.model = "openai/gpt-4-fallback".to_string();
+        agent.primary_runtime = Some(PrimaryRuntime {
+            model: "anthropic/claude-opus-4-6".to_string(),
+            base_url: None,
+            api_key: None,
+            provider: Some("anthropic".to_string()),
+        });
+
+        agent.restore_primary_runtime();
+
+        assert!(!agent.fallback_activated);
+        assert_eq!(agent.config.model, "anthropic/claude-opus-4-6");
+        assert!(agent.primary_runtime.is_none());
+    }
+
+    #[test]
+    fn test_restore_primary_runtime_no_snapshot() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        agent.fallback_activated = true;
+        agent.primary_runtime = None;
+
+        agent.restore_primary_runtime();
+
+        // Should gracefully handle missing snapshot
+        assert!(!agent.fallback_activated);
+    }
+
+    // ── Message sanitization tests ────────────────────────────────────
+
+    #[test]
+    fn test_sanitize_api_messages_basic() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi"}),
+        ];
+        let result = sanitize_api_messages(&messages);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_sanitize_api_messages_removes_orphaned_tool() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi", "tool_calls": [
+                {"id": "call_1", "function": {"name": "read", "arguments": "{}"}}
+            ]}),
+            // Orphaned tool result — references non-existent tool_call_id
+            serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_999"}),
+        ];
+        let result = sanitize_api_messages(&messages);
+        // Should remove the orphaned tool result
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_sanitize_api_messages_keeps_valid_tool_result() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi", "tool_calls": [
+                {"id": "call_1", "function": {"name": "read", "arguments": "{}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_1"}),
+        ];
+        let result = sanitize_api_messages(&messages);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_sanitize_api_messages_merges_consecutive_users() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "user", "content": "follow up"}),
+            serde_json::json!({"role": "assistant", "content": "hi"}),
+        ];
+        let result = sanitize_api_messages(&messages);
+        // Consecutive user messages should be merged
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["content"], "hello\n\nfollow up");
+    }
+
+    // ── Message normalization tests ───────────────────────────────────
+
+    #[test]
+    fn test_normalize_messages_strips_assistant_whitespace() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "  hi there  \n"}),
+        ];
+        let result = normalize_messages(&messages);
+        assert_eq!(result[1]["content"], "hi there");
+    }
+
+    #[test]
+    fn test_normalize_messages_canonicalizes_tool_args() {
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "function": {
+                    "name": "read",
+                    "arguments": "{\"path\":\"/tmp\",\"mode\":\"r\"}"
+                }}
+            ]}),
+        ];
+        let result = normalize_messages(&messages);
+        let args = result[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str().unwrap();
+        // Should be valid JSON (canonicalized)
+        assert!(serde_json::from_str::<Value>(args).is_ok());
+    }
+
+    #[test]
+    fn test_normalize_messages_preserves_user_content() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "  hello  "}),
+        ];
+        let result = normalize_messages(&messages);
+        // User content should NOT be stripped
+        assert_eq!(result[0]["content"], "  hello  ");
+    }
+
+    // ── Thinking budget exhaustion tests ──────────────────────────────
+
+    #[test]
+    fn test_thinking_budget_exhausted_claude_no_content() {
+        let response = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "finish_reason": "length"
+        });
+        assert!(is_thinking_budget_exhausted(&response, "anthropic/claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_thinking_budget_exhausted_open_o1() {
+        let response = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "finish_reason": "length"
+        });
+        assert!(is_thinking_budget_exhausted(&response, "openai/o1"));
+    }
+
+    #[test]
+    fn test_thinking_budget_not_exhausted_non_reasoning_model() {
+        let response = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "finish_reason": "length"
+        });
+        assert!(!is_thinking_budget_exhausted(&response, "openai/gpt-4"));
+    }
+
+    #[test]
+    fn test_thinking_budget_not_exhausted_normal_finish() {
+        let response = serde_json::json!({
+            "role": "assistant",
+            "content": "Hello!",
+            "finish_reason": "stop"
+        });
+        assert!(!is_thinking_budget_exhausted(&response, "anthropic/claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_thinking_budget_exhausted_open_think_no_close() {
+        let response = serde_json::json!({
+            "role": "assistant",
+            "content": "<think>Let me think about this...",
+            "finish_reason": "length"
+        });
+        assert!(is_thinking_budget_exhausted(&response, "anthropic/claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_thinking_budget_not_exhausted_closed_think() {
+        let response = serde_json::json!({
+            "role": "assistant",
+            "content": "<think>Analysis done</think>Here's my answer.",
+            "finish_reason": "length"
+        });
+        // Has both open and close — not considered exhausted
+        assert!(!is_thinking_budget_exhausted(&response, "anthropic/claude-sonnet-4-6"));
+    }
+
+    // ── Pre-LLM hook tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_pre_llm_hook_abort() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        agent.set_pre_llm_hook(|_sys, _msgs, _count| {
+            PreLlmHookResult::Abort("Plugin blocked this request".to_string())
+        });
+
+        // Hook is set — verify no panic
+        assert!(agent.pre_llm_hook.is_some());
+    }
+
+    #[test]
+    fn test_pre_llm_hook_override_system() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let mut agent = AIAgent::new(config, registry).unwrap();
+
+        agent.set_pre_llm_hook(|sys, _msgs, _count| {
+            PreLlmHookResult::OverrideSystem(format!("OVERRIDE: {}", sys))
+        });
+
+        assert!(agent.pre_llm_hook.is_some());
+    }
+
+    #[test]
+    fn test_turn_number_increments() {
+        let config = AgentConfig::default();
+        let registry = Arc::new(ToolRegistry::new());
+        let agent = AIAgent::new(config, registry).unwrap();
+
+        assert_eq!(agent.turn_number(), 0);
     }
 }

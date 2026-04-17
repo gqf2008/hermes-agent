@@ -8,10 +8,19 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// Provider alias mappings (e.g., "google" -> "gemini").
+/// Mirrors Python `_PROVIDER_ALIASES` (auxiliary_client.py).
 pub const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("google", "gemini"),
+    ("z-ai", "zai"),
+    ("z.ai", "zai"),
+    ("zhipu", "zai"),
     ("glm", "zai"),
+    ("kimi", "kimi-coding"),
+    ("moonshot", "kimi-coding"),
+    ("minimax_china", "minimax-cn"),
+    ("minimax_cn", "minimax-cn"),
     ("claude", "anthropic"),
+    ("claude-code", "anthropic"),
     ("deepseek", "deepseek"),
 ];
 

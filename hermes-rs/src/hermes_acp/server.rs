@@ -585,6 +585,9 @@ async fn run_agent(
         self_evolution_enabled: false,  // disabled in ACP
         credential_pool: None,
         fallback_providers: Vec::new(),
+        provider_preferences: None,
+        session_db: None,
+        persist_session: true,
     };
 
     let mut registry = ToolRegistry::new();

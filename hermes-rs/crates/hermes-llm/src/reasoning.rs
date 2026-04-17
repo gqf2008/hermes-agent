@@ -21,10 +21,14 @@ pub fn extract_reasoning(message: &Value) -> String {
         }
     }
 
-    // 2. message.reasoning_content — alternative field
+    // 2. message.reasoning_content — alternative field (dedup against reasoning)
     if let Some(reasoning_content) = message.get("reasoning_content").and_then(Value::as_str) {
         if !reasoning_content.is_empty() {
-            parts.push(reasoning_content.to_string());
+            let rc = reasoning_content.to_string();
+            // Avoid duplicating if same as already-collected reasoning
+            if !parts.iter().any(|p| p == &rc) {
+                parts.push(rc);
+            }
         }
     }
 
@@ -36,7 +40,11 @@ pub fn extract_reasoning(message: &Value) -> String {
                 for key in &["summary", "thinking", "content", "text"] {
                     if let Some(val) = obj.get(*key).and_then(Value::as_str) {
                         if !val.is_empty() {
-                            parts.push(val.to_string());
+                            let v = val.to_string();
+                            // Dedup against already-collected parts
+                            if !parts.iter().any(|p| p == &v) {
+                                parts.push(v);
+                            }
                             break;
                         }
                     }
@@ -69,13 +77,17 @@ fn extract_inline_reasoning(content: &str) -> Vec<String> {
     let mut results = Vec::new();
 
     for &(open, close) in REASONING_PATTERNS {
-        let pattern = format!("(?s){}(.*?){}", regex::escape(open), regex::escape(close));
+        // (?si) = DOTALL (dot matches newline) + case-insensitive
+        let pattern = format!("(?si){}(.*?){}", regex::escape(open), regex::escape(close));
         if let Ok(re) = Regex::new(&pattern) {
             for cap in re.captures_iter(content) {
                 if let Some(m) = cap.get(1) {
                     let text = m.as_str().trim();
                     if !text.is_empty() {
-                        results.push(text.to_string());
+                        // Dedup against already-collected results
+                        if !results.iter().any(|r| r == text) {
+                            results.push(text.to_string());
+                        }
                     }
                 }
             }

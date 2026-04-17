@@ -5,17 +5,20 @@
 
 pub mod anthropic;
 pub mod auxiliary_client;
+pub mod bedrock;
 pub mod client;
 pub mod codex;
 pub mod credential_pool;
 pub mod error_classifier;
 pub mod model_metadata;
+pub mod model_normalize;
 pub mod models_dev;
 pub mod pricing;
 pub mod provider;
 pub mod rate_limit;
 pub mod reasoning;
 pub mod retry;
+pub mod runtime_provider;
 pub mod token_estimate;
 pub mod tool_call;
 

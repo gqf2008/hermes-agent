@@ -18,6 +18,7 @@ pub mod debug_helpers;
 pub mod fuzzy_match;
 pub mod patch_parser;
 pub mod osv_check;
+pub mod clipboard;
 pub mod credential_files;
 pub mod tool_result_storage;
 pub mod openrouter_client;

@@ -24,3 +24,7 @@ once_cell.workspace = true
 chrono.workspace = true
 walkdir.workspace = true
 serde_yaml.workspace = true
+shellexpand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

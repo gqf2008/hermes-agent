@@ -22,6 +22,17 @@ tiktoken-rs.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 fastrand = "2"
+rand = "0.8"
+time = { version = "0.3", features = ["parsing", "serde", "formatting"] }
+hmac.workspace = true
+sha2.workspace = true
+base64 = "0.22"
+hex = "0.4"
+bytes = "1"
+url.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
 mockito = "1"
+anyhow = "1"
+tempfile.workspace = true

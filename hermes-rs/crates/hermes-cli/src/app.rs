@@ -2,6 +2,9 @@
 //!
 //! Interactive CLI with reedline for input, console for output.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -9,6 +12,50 @@ use hermes_agent_engine::agent::{AIAgent, AgentConfig};
 use hermes_core::{HermesConfig, Result};
 use hermes_tools::registry::ToolRegistry;
 use hermes_tools::register_all_tools;
+
+/// Custom reedline prompt that uses the active skin's branding.
+struct SkinPrompt {
+    model: String,
+}
+
+impl SkinPrompt {
+    fn new(model: String) -> Self {
+        Self { model }
+    }
+}
+
+impl reedline::Prompt for SkinPrompt {
+    fn render_prompt_left(&self) -> Cow<str> {
+        let skin = crate::skin_engine::get_active_skin();
+        let symbol = skin.get_branding("prompt_symbol", "❯ ");
+        Cow::Owned(symbol)
+    }
+
+    fn render_prompt_right(&self) -> Cow<str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _edit_mode: reedline::PromptEditMode) -> Cow<str> {
+        let skin = crate::skin_engine::get_active_skin();
+        let symbol = skin.get_branding("prompt_symbol", "❯ ");
+        Cow::Owned(symbol)
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<str> {
+        Cow::Borrowed("... ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: reedline::PromptHistorySearch,
+    ) -> Cow<str> {
+        let prefix = match history_search.status {
+            reedline::PromptHistorySearchStatus::Passing => "",
+            reedline::PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!("({}reverse-search: {}) ", prefix, history_search.term))
+    }
+}
 
 /// Main application struct holding configuration and state.
 pub struct HermesApp {
@@ -76,17 +123,89 @@ impl HermesApp {
             model_name
         };
 
+        // Build model config hashmap for runtime provider resolution
+        let mut model_cfg = HashMap::new();
+        if let Some(ref name) = self.config.model.name {
+            model_cfg.insert("default".to_string(), serde_json::json!(name));
+        }
+        if let Some(ref provider) = self.config.model.provider {
+            model_cfg.insert("provider".to_string(), serde_json::json!(provider));
+        }
+        if let Some(ref base_url) = self.config.model.base_url {
+            model_cfg.insert("base_url".to_string(), serde_json::json!(base_url));
+        }
+        if let Some(ref api_key) = self.config.model.api_key {
+            model_cfg.insert("api_key".to_string(), serde_json::json!(api_key));
+        }
+        if let Some(ref api_mode) = self.config.model.api_mode {
+            model_cfg.insert("api_mode".to_string(), serde_json::json!(api_mode));
+        }
+
+        // Resolve runtime provider (credential pool → auth.json → env → config)
+        let runtime = hermes_llm::runtime_provider::resolve_runtime_provider(
+            self.config.model.provider.as_deref(),
+            self.config.model.api_key.as_deref(),
+            self.config.model.base_url.as_deref(),
+            Some(&model_cfg),
+        );
+
+        let (resolved_model, resolved_base_url, resolved_api_key, resolved_provider, resolved_api_mode) =
+            if let Some(ref rt) = runtime {
+                let m = rt.model.clone().unwrap_or_else(|| final_model.clone());
+                (
+                    m,
+                    Some(rt.base_url.clone()).filter(|s| !s.is_empty()),
+                    Some(rt.api_key.clone()).filter(|s| !s.is_empty()),
+                    Some(rt.provider.clone()).filter(|s| !s.is_empty()),
+                    Some(rt.api_mode.clone()).filter(|s| !s.is_empty()),
+                )
+            } else {
+                (final_model, self.config.model.base_url.clone(), self.config.model.api_key.clone(), self.config.model.provider.clone(), self.config.model.api_mode.clone())
+            };
+
         // Build agent config
         let max_iterations = max_turns.unwrap_or(90) as usize;
+        // Bridge config provider preferences to AgentConfig
+        let provider_preferences = self.config.provider.as_ref().map(|p| {
+            hermes_llm::client::ProviderPreferences {
+                only: p.allowed.clone(),
+                ignore: p.ignored.clone(),
+                order: p.order.clone(),
+                sort: p.sort.clone(),
+                require_parameters: p.require_parameters,
+                data_collection: p.data_collection.clone(),
+            }
+        });
+
+        // Build credential pool from config if a strategy exists for the resolved provider
+        let credential_pool = resolved_provider.as_deref().and_then(|provider| {
+            self.config.credential_pool_strategies.get(provider).and_then(|strategy| {
+                let mut pool = hermes_llm::credential_pool::from_entries(provider, strategy.credentials.clone())?;
+                if let Some(mode) = strategy.mode.as_deref() {
+                    let strategy_enum = match mode {
+                        "round_robin" => hermes_llm::credential_pool::PoolStrategy::RoundRobin,
+                        "failover" | "fill_first" => hermes_llm::credential_pool::PoolStrategy::FillFirst,
+                        "random" => hermes_llm::credential_pool::PoolStrategy::Random,
+                        "least_used" => hermes_llm::credential_pool::PoolStrategy::LeastUsed,
+                        _ => hermes_llm::credential_pool::PoolStrategy::RoundRobin,
+                    };
+                    pool.set_strategy(strategy_enum);
+                }
+                Some(Arc::new(pool))
+            })
+        });
+
         let config = AgentConfig {
-            model: final_model,
+            model: resolved_model.clone(),
             max_iterations,
             skip_context_files: skip_context,
             terminal_cwd: std::env::current_dir().ok(),
-            base_url: self.config.model.base_url.clone(),
-            api_key: self.config.model.api_key.clone(),
-            provider: self.config.model.provider.clone(),
-            api_mode: self.config.model.api_mode.clone(),
+            base_url: resolved_base_url,
+            api_key: resolved_api_key,
+            provider: resolved_provider,
+            api_mode: resolved_api_mode,
+            provider_preferences,
+            credential_pool,
             ..AgentConfig::default()
         };
 
@@ -100,6 +219,20 @@ impl HermesApp {
             ))?;
 
         let mut agent = AIAgent::new(config.clone(), Arc::new(registry))?;
+
+        // Wire up callbacks for real-time output when not in quiet mode
+        if !quiet {
+            agent.set_stream_callback(|delta| {
+                print!("{}", delta);
+                let _ = std::io::stdout().flush();
+            });
+            agent.set_tool_gen_started_callback(|name| {
+                println!("\n  → Tool: {}", name);
+            });
+            agent.set_status_callback(|_event, msg| {
+                tracing::debug!("Agent status: {msg}");
+            });
+        }
 
         // Single-shot query mode (non-interactive)
         if let Some(ref q) = query {
@@ -133,9 +266,10 @@ impl HermesApp {
             return Ok(());
         }
 
-        // Set up reedline for input
-        let mut line_editor = reedline::Reedline::create();
-        let prompt = reedline::DefaultPrompt::default();
+        // Set up reedline for input with tab completion and skin-aware prompt
+        let mut line_editor = reedline::Reedline::create()
+            .with_completer(Box::new(crate::tui::completers::HermesCompleter::new()));
+        let prompt = SkinPrompt::new(resolved_model.clone());
 
         // Main chat loop
         loop {
@@ -786,268 +920,22 @@ impl HermesApp {
     }
 
     pub fn run_doctor(&self) -> Result<()> {
-        use console::Style;
-
-        let green = Style::new().green();
-        let yellow = Style::new().yellow();
-        let red = Style::new().red();
-        let cyan = Style::new().cyan();
-        let dim = Style::new().dim();
-
-        let mut issues = Vec::new();
-
-        println!();
-        println!("{}", cyan.apply_to("┌─────────────────────────────────────────────────────────┐"));
-        println!("{}", cyan.apply_to("│                 Hermes Doctor                          │"));
-        println!("{}", cyan.apply_to("└─────────────────────────────────────────────────────────┘"));
-
-        // ── Configuration ──────────────────────────────────────────────
-        println!();
-        println!("{}", cyan.apply_to("◆ Configuration"));
-
-        let hermes_home = hermes_core::hermes_home::get_hermes_home();
-        if hermes_home.exists() {
-            println!("  {} HERMES_HOME exists", green.apply_to("✓"));
-        } else {
-            println!("  {} HERMES_HOME not found", yellow.apply_to("⚠"));
-            println!("    {}", dim.apply_to("(will be created on first use)"));
-        }
-
-        // Config file
-        let config_path = hermes_home.join("config.yaml");
-        if config_path.exists() {
-            println!("  {} config.yaml exists", green.apply_to("✓"));
-        } else {
-            println!("  {} config.yaml not found", yellow.apply_to("⚠"));
-            println!("    {}", dim.apply_to("(using defaults)"));
-        }
-
-        // .env file
-        let env_path = hermes_home.join(".env");
-        if env_path.exists() {
-            println!("  {} .env file exists", green.apply_to("✓"));
-            // Check for API keys
-            let content = std::fs::read_to_string(&env_path).unwrap_or_default();
-            let has_key = content.contains("OPENROUTER_API_KEY")
-                || content.contains("OPENAI_API_KEY")
-                || content.contains("ANTHROPIC_API_KEY")
-                || content.contains("NOUS_API_KEY")
-                || content.contains("OPENAI_BASE_URL");
-            if has_key {
-                println!("  {} API key configured", green.apply_to("✓"));
-            } else {
-                println!("  {} No API key found in .env", yellow.apply_to("⚠"));
-                issues.push("Run 'hermes setup' to configure API keys".to_string());
-            }
-        } else {
-            println!("  {} .env file missing", red.apply_to("✗"));
-            issues.push("Run 'hermes setup' to create .env".to_string());
-        }
-
-        // ── Model ──────────────────────────────────────────────────────
-        println!();
-        println!("{}", cyan.apply_to("◆ Model"));
-        let model = &self.config.model.name.as_deref().unwrap_or("anthropic/claude-opus-4.6");
-        println!("  {} Primary model: {}", green.apply_to("✓"), model);
-
-        // Check provider env hints
-        let provider = model.split('/').next().unwrap_or("");
-        match provider {
-            "anthropic" if std::env::var("ANTHROPIC_API_KEY").is_err() && std::env::var("OPENROUTER_API_KEY").is_err() => {
-                println!("  {} ANTHROPIC_API_KEY not set", yellow.apply_to("⚠"));
-            }
-            "openai" if std::env::var("OPENAI_API_KEY").is_err() => {
-                println!("  {} OPENAI_API_KEY not set", yellow.apply_to("⚠"));
-            }
-            "openrouter" if std::env::var("OPENROUTER_API_KEY").is_err() => {
-                println!("  {} OPENROUTER_API_KEY not set", yellow.apply_to("⚠"));
-            }
-            _ => println!("  {} Provider: {}", green.apply_to("✓"), provider),
-        }
-
-        // ── Directory Structure ────────────────────────────────────────
-        println!();
-        println!("{}", cyan.apply_to("◆ Directory Structure"));
-
-        let expected_subdirs = ["cron", "sessions", "logs", "skills", "memories"];
-        for subdir_name in &expected_subdirs {
-            let subdir_path = hermes_home.join(subdir_name);
-            if subdir_path.exists() {
-                println!("  {} {}/ exists", green.apply_to("✓"), subdir_name);
-            } else {
-                println!("  {} {}/ not found", yellow.apply_to("⚠"), subdir_name);
-                println!("    {}", dim.apply_to("(will be created on first use)"));
-            }
-        }
-
-        // SOUL.md
-        let soul_path = hermes_home.join("SOUL.md");
-        if soul_path.exists() {
-            let content = std::fs::read_to_string(&soul_path).unwrap_or_default();
-            let has_content = content.lines().any(|l| {
-                let trimmed = l.trim();
-                !trimmed.is_empty()
-                    && !trimmed.starts_with("<!--")
-                    && !trimmed.starts_with("-->")
-                    && !trimmed.starts_with("#")
-            });
-            if has_content {
-                println!("  {} SOUL.md exists (persona configured)", green.apply_to("✓"));
-            } else {
-                println!("  {} SOUL.md exists but empty", yellow.apply_to("⚠"));
-                println!("    {}", dim.apply_to("(edit it to customize personality)"));
-            }
-        } else {
-            println!("  {} SOUL.md not found", yellow.apply_to("⚠"));
-            println!("    {}", dim.apply_to("(create it to give Hermes a custom personality)"));
-        }
-
-        // ── Session Database ───────────────────────────────────────────
-        println!();
-        println!("{}", cyan.apply_to("◆ Session Database"));
-        let db_path = hermes_home.join("sessions.db");
-        if db_path.exists() {
-            println!("  {} sessions.db exists", green.apply_to("✓"));
-            // Try to open and check
-            match hermes_state::SessionDB::open(&db_path) {
-                Ok(db) => {
-                    if let Ok(count) = db.session_count(None) {
-                        println!("  {} {} session(s) recorded", green.apply_to("✓"), count);
-                    }
-                    if let Ok(_fts_count) = db.search_messages("test", None, None, None, 1, 0) {
-                        println!("  {} FTS5 search available", green.apply_to("✓"));
-                    }
-                }
-                Err(e) => {
-                    println!("  {} Failed to open: {e}", red.apply_to("✗"));
-                    issues.push(format!("Session database error: {e}"));
-                }
-            }
-        } else {
-            println!("  {} sessions.db not found", yellow.apply_to("⚠"));
-            println!("    {}", dim.apply_to("(will be created on first conversation)"));
-        }
-
-        // ── Tools ──────────────────────────────────────────────────────
-        println!();
-        println!("{}", cyan.apply_to("◆ Tools"));
-        let mut registry = hermes_tools::registry::ToolRegistry::new();
-        hermes_tools::register_all_tools(&mut registry);
-        let total = registry.len();
-        let available = registry.get_available_tools();
-        println!("  {} {} tools registered", green.apply_to("✓"), total);
-        println!("  {} {} available (prerequisites met)", green.apply_to("✓"), available.len());
-
-        // Check for common external tools
-        let external_checks = [
-            ("docker", "Docker (terminal backend)"),
-            ("bash", "Bash shell"),
-        ];
-        for (cmd, desc) in &external_checks {
-            if which::which(cmd).is_ok() {
-                println!("  {} {cmd} ({desc})", green.apply_to("✓"));
-            } else {
-                println!("  {} {cmd} not found", yellow.apply_to("⚠"));
-                println!("    {}", dim.apply_to(desc));
-            }
-        }
-
-        // ── Summary ────────────────────────────────────────────────────
-        println!();
-        if issues.is_empty() {
-            println!("  {} No issues found!", green.apply_to("✓"));
-        } else {
-            println!("{}", cyan.apply_to("◆ Issues Found"));
-            for (i, issue) in issues.iter().enumerate() {
-                println!("  {}. {issue}", i + 1);
-            }
-        }
-        println!();
-
-        Ok(())
+        let _ = &self.config; // suppress unused warning
+        crate::doctor_cmd::cmd_doctor()
+            .map_err(|e| hermes_core::HermesError::new(
+                hermes_core::ErrorCategory::InternalError,
+                format!("Doctor failed: {e}"),
+            ))
     }
 
     /// Run doctor in auto-fix mode — attempt to resolve detected issues.
     pub fn run_doctor_fix(&self) -> Result<()> {
-        use console::Style;
-
-        let green = Style::new().green();
-        let yellow = Style::new().yellow();
-        let red = Style::new().red();
-        let cyan = Style::new().cyan();
-
-        let hermes_home = hermes_core::hermes_home::get_hermes_home();
-        let mut fixed = 0;
-        let mut failed = Vec::new();
-
-        println!();
-        println!("{}", cyan.apply_to("┌─────────────────────────────────────────────────────────┐"));
-        println!("{}", cyan.apply_to("│              Hermes Doctor — Auto-Fix                  │"));
-        println!("{}", cyan.apply_to("└─────────────────────────────────────────────────────────┘"));
-
-        // Ensure HERMES_HOME exists
-        if !hermes_home.exists() {
-            print!("  {} Creating HERMES_HOME... ", yellow.apply_to("→"));
-            match std::fs::create_dir_all(&hermes_home) {
-                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
-                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create HERMES_HOME".to_string()); }
-            }
-        }
-
-        // Create missing subdirectories
-        let expected_subdirs = ["cron", "sessions", "logs", "skills", "memories"];
-        for subdir_name in &expected_subdirs {
-            let subdir_path = hermes_home.join(subdir_name);
-            if !subdir_path.exists() {
-                print!("  {} Creating {subdir_name}/... ", yellow.apply_to("→"));
-                match std::fs::create_dir_all(&subdir_path) {
-                    Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
-                    Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push(format!("create {subdir_name}/")); }
-                }
-            }
-        }
-
-        // Create default .env if missing
-        let env_path = hermes_home.join(".env");
-        if !env_path.exists() {
-            print!("  {} Creating .env template... ", yellow.apply_to("→"));
-            match std::fs::write(&env_path, "# API keys for Hermes Agent\n# Get yours at openrouter.ai or nousresearch.com\n") {
-                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
-                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create .env".to_string()); }
-            }
-        }
-
-        // Create default config.yaml if missing
-        let config_path = hermes_home.join("config.yaml");
-        if !config_path.exists() {
-            print!("  {} Creating config.yaml... ", yellow.apply_to("→"));
-            match std::fs::write(&config_path, "# Hermes Agent configuration\nmodel:\n  name: anthropic/claude-opus-4.6\n") {
-                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
-                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create config.yaml".to_string()); }
-            }
-        }
-
-        // Create default SOUL.md if missing
-        let soul_path = hermes_home.join("SOUL.md");
-        if !soul_path.exists() {
-            print!("  {} Creating SOUL.md template... ", yellow.apply_to("→"));
-            match std::fs::write(&soul_path, "# SOUL.md — Custom personality for Hermes Agent\n# Edit this file to customize your agent's behavior\n") {
-                Ok(()) => { println!("{}", green.apply_to("✓")); fixed += 1; }
-                Err(e) => { println!("{} {e}", red.apply_to("✗")); failed.push("create SOUL.md".to_string()); }
-            }
-        }
-
-        println!();
-        println!("  {} {} issue(s) auto-fixed", green.apply_to("✓"), fixed);
-        if !failed.is_empty() {
-            println!("  {} {} issue(s) require manual action:", red.apply_to("✗"), failed.len());
-            for f in &failed {
-                println!("    - {f}");
-            }
-        }
-        println!();
-
-        Ok(())
+        let _ = &self.config; // suppress unused warning
+        crate::doctor_cmd::cmd_doctor_fix()
+            .map_err(|e| hermes_core::HermesError::new(
+                hermes_core::ErrorCategory::InternalError,
+                format!("Doctor fix failed: {e}"),
+            ))
     }
 
     pub fn list_models(&self) -> Result<()> {
@@ -1110,351 +998,21 @@ impl HermesApp {
         Ok(())
     }
 
+    /// List all profiles (delegates to profiles_cmd).
     pub fn list_profiles(&self) -> Result<()> {
-        use console::Style;
-        let cyan = Style::new().cyan();
-        let dim = Style::new().dim();
-
-        println!();
-        println!("{}", cyan.apply_to("◆ Profiles"));
-        println!();
-
-        let hermes_home = hermes_core::hermes_home::get_hermes_home();
-        println!("  HERMES_HOME: {}", hermes_home.display());
-        println!();
-
-        // Check for profiles directory
-        let profiles_dir = hermes_home.parent().map(|p| p.join("profiles")).filter(|p| p.exists());
-        if let Some(dir) = profiles_dir {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                let profiles: Vec<_> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .collect();
-                if profiles.is_empty() {
-                    println!("  No profiles found.");
-                } else {
-                    println!("  {} profile(s):", profiles.len());
-                    for entry in &profiles {
-                        println!("    - {}", entry.file_name().to_string_lossy());
-                    }
-                }
-            }
-        } else {
-            println!("  {}", dim.apply_to("No profiles directory found. Profiles are stored under ~/.hermes/profiles/"));
-        }
-        println!();
-
-        Ok(())
+        crate::profiles_cmd::cmd_profile_list()
+            .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))
     }
 
+    /// Create a profile (delegates to profiles_cmd).
     pub fn create_profile(&self, name: &str) -> Result<()> {
-        use console::Style;
-        let green = Style::new().green();
-        let cyan = Style::new().cyan();
-
-        let hermes_home = hermes_core::hermes_home::get_hermes_home();
-        let profiles_dir = hermes_home.parent().map(|p| p.join("profiles")).unwrap_or_else(|| hermes_home.join("profiles"));
-
-        let profile_dir = profiles_dir.join(name);
-        if profile_dir.exists() {
-            println!("  {} Profile '{name}' already exists at: {}", yellow_style().apply_to("⚠"), profile_dir.display());
-            return Ok(());
-        }
-
-        std::fs::create_dir_all(&profile_dir)
-            .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))?;
-
-        let env_path = profile_dir.join(".env");
-        std::fs::write(&env_path, "# API keys for this profile\n")
-            .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))?;
-
-        let config_path = profile_dir.join("config.yaml");
-        std::fs::write(&config_path, format!("# Hermes profile: {}\nmodel:\n  name: anthropic/claude-opus-4.6\n", name))
-            .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))?;
-
-        println!("  {} Profile '{name}' created at: {}", green.apply_to("✓"), profile_dir.display());
-        println!("  {}", cyan.apply_to("Set HERMES_HOME to switch profiles:"));
-        println!("    {}", cyan.apply_to(format!("  HERMES_HOME={} hermes", profile_dir.display())));
-        println!();
-
-        Ok(())
+        crate::profiles_cmd::cmd_profile_create(name, false, false, None, false)
+            .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))
     }
 
+    /// Switch to a profile (delegates to profiles_cmd).
     pub fn use_profile(&self, name: &str) -> Result<()> {
-        use console::Style;
-        let green = Style::new().green();
-        let yellow = Style::new().yellow();
-
-        let hermes_home = hermes_core::hermes_home::get_hermes_home();
-        let profiles_dir = hermes_home.parent().map(|p| p.join("profiles")).unwrap_or_else(|| hermes_home.join("profiles"));
-        let profile_dir = profiles_dir.join(name);
-
-        if !profile_dir.exists() {
-            println!("  {} Profile '{name}' not found. Create it first with 'hermes profile create {name}'", yellow.apply_to("✗"));
-            return Ok(());
-        }
-
-        println!("  {} To use profile '{name}', set:", yellow.apply_to("→"));
-        println!("    {}", green.apply_to(format!("HERMES_HOME={}", profile_dir.display())));
-        println!();
-        println!("  On Unix: export HERMES_HOME={}", profile_dir.display());
-        println!("  On Windows: set HERMES_HOME={}", profile_dir.display());
-
-        Ok(())
+        crate::profiles_cmd::cmd_profile_use(name)
+            .map_err(|e| hermes_core::HermesError::new(hermes_core::ErrorCategory::InternalError, e.to_string()))
     }
-}
-
-/// Create a new profile with options.
-pub fn cmd_profile_create(name: &str, clone: bool, clone_all: bool, clone_from: Option<&str>, _no_alias: bool) -> anyhow::Result<()> {
-    // For now, delegate to basic create; clone logic is a stub
-    let hermes_home = hermes_core::hermes_home::get_hermes_home();
-    let profiles_root = hermes_home.parent().map(|p| p.join("profiles")).unwrap_or_else(|| hermes_home.join("profiles"));
-    let profile_dir = profiles_root.join(name);
-    if profile_dir.exists() {
-        println!("  {} Profile '{name}' already exists.", console::Style::new().yellow().apply_to("⚠"));
-        return Ok(());
-    }
-    std::fs::create_dir_all(&profile_dir)?;
-    std::fs::write(profile_dir.join(".env"), "# API keys for this profile\n")?;
-    std::fs::write(profile_dir.join("config.yaml"), format!("# Hermes profile: {}\n", name))?;
-    if clone || clone_all {
-        let src = clone_from.map(|s| profiles_root.join(s)).unwrap_or_else(hermes_core::hermes_home::get_hermes_home);
-        for file in ["config.yaml", ".env", "SOUL.md"] {
-            let src_file = src.join(file);
-            if src_file.exists() && !clone_all {
-                let _ = std::fs::copy(&src_file, profile_dir.join(file));
-            }
-        }
-        if clone_all {
-            for entry in std::fs::read_dir(&src)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    let _ = copy_dir_all(&entry.path(), &profile_dir.join(entry.file_name()));
-                }
-            }
-        }
-    }
-    println!("  {} Profile '{name}' created.", console::Style::new().green().apply_to("✓"));
-    println!();
-    Ok(())
-}
-
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Delete a profile.
-pub fn cmd_profile_delete(name: &str, force: bool) -> anyhow::Result<()> {
-    use console::Style;
-    let yellow = Style::new().yellow();
-    let green = Style::new().green();
-
-    let profiles_dir = get_profiles_dir();
-    let profile_dir = profiles_dir.join(name);
-
-    if !profile_dir.exists() {
-        println!("  {} Profile '{name}' not found.", yellow.apply_to("✗"));
-        return Ok(());
-    }
-
-    if !force {
-        println!("  This will delete profile '{}' and all its data.", name);
-        print!("  Continue? [y/N]: ");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
-        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
-            println!("  {}", Style::new().dim().apply_to("Delete cancelled."));
-            return Ok(());
-        }
-    }
-
-    let _ = std::fs::remove_dir_all(&profile_dir);
-    println!("  {} Profile '{name}' deleted.", green.apply_to("✓"));
-    Ok(())
-}
-
-/// Show profile details.
-pub fn cmd_profile_show(name: &str) -> anyhow::Result<()> {
-    use console::Style;
-    let cyan = Style::new().cyan();
-    let yellow = Style::new().yellow();
-
-    let profiles_dir = get_profiles_dir();
-    let profile_dir = profiles_dir.join(name);
-
-    if !profile_dir.exists() {
-        println!("  {} Profile '{name}' not found.", yellow.apply_to("✗"));
-        return Ok(());
-    }
-
-    println!();
-    println!("{}", cyan.apply_to("◆ Profile: {name}"));
-    println!("  Path: {}", profile_dir.display());
-    println!();
-
-    if profile_dir.join("config.yaml").exists() {
-        println!("  Config: present");
-    }
-    if profile_dir.join(".env").exists() {
-        println!("  Env: present");
-    }
-    println!();
-
-    Ok(())
-}
-
-/// Manage profile wrapper scripts.
-pub fn cmd_profile_alias(name: &str, remove: bool, _alias_name: Option<&str>) -> anyhow::Result<()> {
-    use console::Style;
-    let cyan = Style::new().cyan();
-    let dim = Style::new().dim();
-    let green = Style::new().green();
-
-    let profiles_dir = get_profiles_dir();
-    let profile_dir = profiles_dir.join(name);
-
-    if !profile_dir.exists() {
-        println!("  {} Profile '{name}' not found.", Style::new().yellow().apply_to("✗"));
-        return Ok(());
-    }
-
-    if remove {
-        println!("  {} Alias for '{name}' removed.", green.apply_to("✓"));
-        println!();
-        return Ok(());
-    }
-
-    println!();
-    println!("{}", cyan.apply_to("◆ Profile Alias: {name}"));
-    println!();
-    println!("  {}", dim.apply_to("Create a shell alias to quickly switch to this profile:"));
-    println!();
-    println!("  bash/zsh: alias hermes-{name}='HERMES_HOME={} hermes'", profile_dir.display());
-    println!("  fish:     alias hermes-{name}='env HERMES_HOME={} hermes'", profile_dir.display());
-    println!();
-
-    Ok(())
-}
-
-/// Rename a profile.
-pub fn cmd_profile_rename(old_name: &str, new_name: &str) -> anyhow::Result<()> {
-    use console::Style;
-    let green = Style::new().green();
-    let yellow = Style::new().yellow();
-
-    let profiles_dir = get_profiles_dir();
-    let old_dir = profiles_dir.join(old_name);
-    let new_dir = profiles_dir.join(new_name);
-
-    if !old_dir.exists() {
-        println!("  {} Profile '{old_name}' not found.", yellow.apply_to("✗"));
-        return Ok(());
-    }
-    if new_dir.exists() {
-        println!("  {} Profile '{new_name}' already exists.", yellow.apply_to("✗"));
-        return Ok(());
-    }
-
-    std::fs::rename(&old_dir, &new_dir)?;
-    println!("  {} Profile renamed: {old_name} → {new_name}", green.apply_to("✓"));
-    Ok(())
-}
-
-/// Export a profile to archive.
-pub fn cmd_profile_export(name: &str, output: Option<&str>) -> anyhow::Result<()> {
-    use console::Style;
-    let green = Style::new().green();
-    let yellow = Style::new().yellow();
-
-    let profiles_dir = get_profiles_dir();
-    let profile_dir = profiles_dir.join(name);
-
-    if !profile_dir.exists() {
-        println!("  {} Profile '{name}' not found.", yellow.apply_to("✗"));
-        return Ok(());
-    }
-
-    let default_out = format!("{name}.tar.gz");
-    let out_path = output.unwrap_or(&default_out);
-    println!("  Exporting profile '{name}' to {out_path}...");
-
-    // Use tar on Unix, zip fallback on Windows
-    let result = if cfg!(unix) {
-        std::process::Command::new("tar")
-            .args(["-czf", out_path, "-C", &profiles_dir.to_string_lossy(), name])
-            .output()
-    } else {
-        std::process::Command::new("tar")
-            .args(["-cf", out_path, "-C", &profiles_dir.to_string_lossy(), name])
-            .output()
-    };
-
-    match result {
-        Ok(out) if out.status.success() => {
-            println!("  {} Exported to: {out_path}", green.apply_to("✓"));
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            println!("  {} Export failed: {}", yellow.apply_to("⚠"), err.trim());
-        }
-        Err(e) => {
-            println!("  {} Failed: {e}", yellow.apply_to("⚠"));
-        }
-    }
-    Ok(())
-}
-
-/// Import a profile from archive.
-pub fn cmd_profile_import(path: &str, _name: Option<&str>) -> anyhow::Result<()> {
-    use console::Style;
-    let green = Style::new().green();
-    let yellow = Style::new().yellow();
-
-    let archive = std::path::Path::new(path);
-    if !archive.exists() {
-        println!("  {} Archive not found: {path}", yellow.apply_to("✗"));
-        return Ok(());
-    }
-
-    let profiles_dir = get_profiles_dir();
-    std::fs::create_dir_all(&profiles_dir)?;
-
-    let output = std::process::Command::new("tar")
-        .args(["-xf", path, "-C", &profiles_dir.to_string_lossy()])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            println!("  {} Profile imported to: {}", green.apply_to("✓"), profiles_dir.display());
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            println!("  {} Import failed: {}", yellow.apply_to("⚠"), err.trim());
-        }
-        Err(e) => {
-            println!("  {} Failed: {e}", yellow.apply_to("⚠"));
-        }
-    }
-    Ok(())
-}
-
-fn get_profiles_dir() -> std::path::PathBuf {
-    let hermes_home = hermes_core::get_hermes_home();
-    hermes_home.join("profiles")
-}
-
-fn yellow_style() -> console::Style {
-    console::Style::new().yellow()
 }

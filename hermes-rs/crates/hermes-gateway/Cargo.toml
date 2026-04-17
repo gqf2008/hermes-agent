@@ -34,6 +34,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # WeCom WebSocket adapter
 tokio-tungstenite = "0.26"
 
+# Weixin AES-128-ECB media decryption
+aes = "0.8"
+
 [dev-dependencies]
 tempfile.workspace = true
 serial_test = "3"

@@ -47,9 +47,42 @@ fn build_hermes_command() -> Command {
         .subcommand(Command::new("doctor").about("Diagnose configuration"))
         .subcommand(Command::new("models").about("List available models"))
         .subcommand(Command::new("profiles").about("Manage profiles").subcommands([
-            Command::new("list").about("List profiles"),
-            Command::new("create").about("Create a profile").args([clap::Arg::new("name").required(true)]),
-            Command::new("use").about("Switch to profile").args([clap::Arg::new("name").required(true)]),
+            Command::new("list").about("List all profiles"),
+            Command::new("create").about("Create a profile").args([
+                clap::Arg::new("name").required(true),
+                clap::Arg::new("clone").long("clone").action(clap::ArgAction::SetTrue),
+                clap::Arg::new("clone_all").long("clone-all").action(clap::ArgAction::SetTrue),
+                clap::Arg::new("clone_from").long("clone-from"),
+                clap::Arg::new("no_alias").long("no-alias").action(clap::ArgAction::SetTrue),
+            ]),
+            Command::new("use").about("Switch to profile").args([
+                clap::Arg::new("name").required(true),
+            ]),
+            Command::new("delete").about("Delete a profile").args([
+                clap::Arg::new("name").required(true),
+                clap::Arg::new("force").short('f').long("force").action(clap::ArgAction::SetTrue),
+                clap::Arg::new("yes").short('y').long("yes").action(clap::ArgAction::SetTrue),
+            ]),
+            Command::new("show").about("Show profile details").args([
+                clap::Arg::new("name").required(true),
+            ]),
+            Command::new("alias").about("Manage profile aliases").args([
+                clap::Arg::new("name").required(true),
+                clap::Arg::new("target").value_name("TARGET"),
+                clap::Arg::new("remove").long("remove").action(clap::ArgAction::SetTrue),
+            ]),
+            Command::new("rename").about("Rename a profile").args([
+                clap::Arg::new("old_name").required(true),
+                clap::Arg::new("new_name").long("new-name").required(true),
+            ]),
+            Command::new("export").about("Export profile to archive").args([
+                clap::Arg::new("name").required(true),
+                clap::Arg::new("output").short('o').long("output"),
+            ]),
+            Command::new("import").about("Import profile from archive").args([
+                clap::Arg::new("path").required(true),
+                clap::Arg::new("name").long("name"),
+            ]),
         ]))
         .subcommand(Command::new("sessions").about("Manage sessions").subcommands([
             Command::new("list").about("List sessions").args([

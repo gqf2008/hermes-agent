@@ -12,12 +12,19 @@ pub mod message_loop;
 pub mod review_agent;
 pub mod self_evolution;
 pub mod skill_commands;
+pub mod skill_utils;
 pub mod smart_model_routing;
 pub mod subagent;
 pub mod title_generator;
 pub mod trajectory;
+pub mod usage_pricing;
 
 pub use agent::AIAgent;
+pub use agent::types::{
+    ActivityCallback, AgentConfig, FallbackProvider, InterimAssistantCallback,
+    PreLlmHook, PreLlmHookResult, PrimaryRuntime, ReasoningCallback,
+    StatusCallback, StreamCallback, ToolGenCallback, TurnResult, TurnUsage,
+};
 pub use memory_manager::{build_memory_context_block, sanitize_context as sanitize_memory_context, MemoryManager};
 pub use memory_provider::MemoryProvider;
 pub use message_loop::{MessageLoop, MessageResult, PlatformMessage};

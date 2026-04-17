@@ -181,3 +181,15 @@ impl From<serde_json::Error> for HermesError {
         }
     }
 }
+
+impl From<String> for HermesError {
+    fn from(err: String) -> Self {
+        Self::new(ErrorCategory::InternalError, err)
+    }
+}
+
+impl From<&str> for HermesError {
+    fn from(err: &str) -> Self {
+        Self::new(ErrorCategory::InternalError, err)
+    }
+}

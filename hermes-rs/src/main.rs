@@ -199,6 +199,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<AuthAction>,
     },
+    /// Manage CLI skins/themes
+    Skin {
+        #[command(subcommand)]
+        action: Option<SkinAction>,
+    },
     /// Show status of all components
     Status {
         /// Show all redacted details
@@ -421,6 +426,34 @@ enum ModelAction {
     /// List available models
     #[command(alias = "ls")]
     List,
+    /// Switch to a different model
+    Switch {
+        /// Model identifier (e.g., anthropic/claude-sonnet-4-6)
+        model: String,
+    },
+    /// Show model details
+    Info {
+        /// Model identifier
+        model: String,
+    },
+}
+
+/// Subcommands for skin management.
+#[derive(Subcommand)]
+enum SkinAction {
+    /// List available skins
+    #[command(alias = "ls")]
+    List,
+    /// Apply a skin
+    Apply {
+        /// Skin name
+        name: String,
+    },
+    /// Preview a skin without applying
+    Preview {
+        /// Skin name
+        name: String,
+    },
 }
 
 /// Subcommands for device pairing.
@@ -596,16 +629,16 @@ enum McpAction {
 
 #[derive(Subcommand)]
 enum ToolAction {
-    /// List all available tools
+    /// List all available toolsets with enabled/disabled status
     #[command(alias = "ls")]
     List {
         /// Platform to show (default: cli)
         #[arg(long, default_value = "cli")]
         platform: String,
     },
-    /// Show tool details
+    /// Show tool/toolset details
     Info { name: String },
-    /// Disable toolsets or MCP tools
+    /// Disable one or more toolsets
     Disable {
         /// Tool names to disable
         names: Vec<String>,
@@ -613,8 +646,40 @@ enum ToolAction {
         #[arg(long, default_value = "cli")]
         platform: String,
     },
-    /// Enable toolsets or MCP tools
+    /// Enable one or more toolsets
     Enable {
+        /// Tool names to enable
+        names: Vec<String>,
+        /// Platform to apply to
+        #[arg(long, default_value = "cli")]
+        platform: String,
+    },
+    /// Disable all toolsets
+    #[command(alias = "disable-all")]
+    DisableAll {
+        /// Platform to apply to
+        #[arg(long, default_value = "cli")]
+        platform: String,
+    },
+    /// Enable all toolsets
+    #[command(alias = "enable-all")]
+    EnableAll {
+        /// Platform to apply to
+        #[arg(long, default_value = "cli")]
+        platform: String,
+    },
+    /// Batch disable multiple toolsets
+    #[command(alias = "disable-batch")]
+    DisableBatch {
+        /// Tool names to disable
+        names: Vec<String>,
+        /// Platform to apply to
+        #[arg(long, default_value = "cli")]
+        platform: String,
+    },
+    /// Batch enable multiple toolsets
+    #[command(alias = "enable-batch")]
+    EnableBatch {
         /// Tool names to enable
         names: Vec<String>,
         /// Platform to apply to
@@ -1302,24 +1367,42 @@ fn main() -> anyhow::Result<()> {
                     hermes_cli::debug_cmd::cmd_dump_session(&sid, show_keys)?;
                 }
                 None => {
-                    hermes_cli::debug_cmd::cmd_dump_all(show_keys)?;
+                    hermes_cli::dump_cmd::cmd_dump(show_keys)?;
                 }
             }
         }
         Some(Commands::Tools { action }) => {
             match action {
-                Some(ToolAction::List { platform }) => app.list_tools_for_platform(&platform)?,
-                Some(ToolAction::Info { name }) => app.show_tool_info(&name)?,
+                Some(ToolAction::List { platform }) => {
+                    hermes_cli::tools_cmd::cmd_tools_list(&platform)?;
+                }
+                Some(ToolAction::Info { name }) => {
+                    hermes_cli::tools_cmd::cmd_tools_info(&name)?;
+                }
                 Some(ToolAction::Disable { names, platform }) => {
-                    hermes_cli::config_cmd::cmd_tools_disable(&names, &platform)?;
+                    hermes_cli::tools_cmd::cmd_tools_disable(&names, &platform)?;
                 }
                 Some(ToolAction::Enable { names, platform }) => {
-                    hermes_cli::config_cmd::cmd_tools_enable(&names, &platform)?;
+                    hermes_cli::tools_cmd::cmd_tools_enable(&names, &platform)?;
+                }
+                Some(ToolAction::DisableAll { platform }) => {
+                    hermes_cli::tools_cmd::cmd_tools_disable_all(&platform)?;
+                }
+                Some(ToolAction::EnableAll { platform }) => {
+                    hermes_cli::tools_cmd::cmd_tools_enable_all(&platform)?;
+                }
+                Some(ToolAction::DisableBatch { names, platform }) => {
+                    hermes_cli::tools_cmd::cmd_tools_disable_batch(&names, &platform)?;
+                }
+                Some(ToolAction::EnableBatch { names, platform }) => {
+                    hermes_cli::tools_cmd::cmd_tools_enable_batch(&names, &platform)?;
                 }
                 Some(ToolAction::Summary) => {
                     hermes_cli::config_cmd::cmd_tools_summary()?;
                 }
-                None => app.list_tools_for_platform("cli")?,
+                None => {
+                    hermes_cli::tools_cmd::cmd_tools_list("cli")?;
+                }
             }
         }
         Some(Commands::Skills { action }) => {
@@ -1443,30 +1526,39 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Profiles { action }) => {
             match action {
-                Some(ProfileAction::List) => app.list_profiles()?,
-                Some(ProfileAction::Create { name, clone, clone_all, clone_from, no_alias }) => {
-                    hermes_cli::app::cmd_profile_create(&name, clone, clone_all, clone_from.as_deref(), no_alias)?;
+                Some(ProfileAction::List) => {
+                    hermes_cli::profiles_cmd::cmd_profile_list()?;
                 }
-                Some(ProfileAction::Use { name }) => app.use_profile(&name)?,
+                Some(ProfileAction::Create { name, clone, clone_all, clone_from, no_alias }) => {
+                    hermes_cli::profiles_cmd::cmd_profile_create(
+                        &name, clone, clone_all, clone_from.as_deref(), no_alias,
+                    )?;
+                }
+                Some(ProfileAction::Use { name }) => {
+                    hermes_cli::profiles_cmd::cmd_profile_use(&name)?;
+                }
                 Some(ProfileAction::Delete { name, force, yes }) => {
-                    hermes_cli::app::cmd_profile_delete(&name, force || yes)?;
+                    hermes_cli::profiles_cmd::cmd_profile_delete(&name, force || yes)?;
                 }
                 Some(ProfileAction::Show { name }) => {
-                    hermes_cli::app::cmd_profile_show(&name)?;
+                    hermes_cli::profiles_cmd::cmd_profile_show(&name)?;
                 }
                 Some(ProfileAction::Alias { name, remove, alias_name }) => {
-                    hermes_cli::app::cmd_profile_alias(&name, remove, alias_name.as_deref())?;
+                    let target = alias_name.as_deref();
+                    hermes_cli::profiles_cmd::cmd_profile_alias(&name, target, remove)?;
                 }
                 Some(ProfileAction::Rename { old_name, new_name }) => {
-                    hermes_cli::app::cmd_profile_rename(&old_name, &new_name)?;
+                    hermes_cli::profiles_cmd::cmd_profile_rename(&old_name, &new_name)?;
                 }
                 Some(ProfileAction::Export { name, output }) => {
-                    hermes_cli::app::cmd_profile_export(&name, output.as_deref())?;
+                    hermes_cli::profiles_cmd::cmd_profile_export(&name, output.as_deref())?;
                 }
                 Some(ProfileAction::Import { path, name: profile_name }) => {
-                    hermes_cli::app::cmd_profile_import(&path, profile_name.as_deref())?;
+                    hermes_cli::profiles_cmd::cmd_profile_import(&path, profile_name.as_deref())?;
                 }
-                None => app.list_profiles()?,
+                None => {
+                    hermes_cli::profiles_cmd::cmd_profile_list()?;
+                }
             }
         }
         Some(Commands::Sessions { action }) => {
@@ -1743,6 +1835,25 @@ fn main() -> anyhow::Result<()> {
             match action {
                 Some(ModelAction::Browse) | Some(ModelAction::List) | None => {
                     hermes_cli::model_cmd::cmd_model()?;
+                }
+                Some(ModelAction::Switch { model }) => {
+                    hermes_cli::model_cmd::cmd_model_switch(&model)?;
+                }
+                Some(ModelAction::Info { model }) => {
+                    hermes_cli::model_cmd::cmd_model_info(&model)?;
+                }
+            }
+        }
+        Some(Commands::Skin { action }) => {
+            match action {
+                Some(SkinAction::List) | None => {
+                    hermes_cli::skin_engine::cmd_skin_list()?;
+                }
+                Some(SkinAction::Apply { name }) => {
+                    hermes_cli::skin_engine::cmd_skin_apply(&name)?;
+                }
+                Some(SkinAction::Preview { name }) => {
+                    hermes_cli::skin_engine::cmd_skin_preview(&name)?;
                 }
             }
         }

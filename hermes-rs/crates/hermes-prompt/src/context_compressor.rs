@@ -136,6 +136,14 @@ impl ContextCompressor {
         self.last_completion_tokens = completion_tokens;
     }
 
+    /// Return the compression threshold in tokens.
+    ///
+    /// Used by `AIAgent` to emit context pressure warnings before
+    /// the threshold is actually exceeded.
+    pub fn threshold_tokens(&self) -> usize {
+        self.threshold_tokens
+    }
+
     /// Check if context exceeds the compression threshold.
     ///
     /// Includes anti-thrashing protection: if the last two compressions
@@ -159,6 +167,22 @@ impl ContextCompressor {
             return false;
         }
         true
+    }
+
+    /// Reset internal counters for a fresh session.
+    ///
+    /// Mirrors Python: `ContextCompressor.on_session_reset()`.
+    /// Clears compression history and counters so the new session
+    /// starts clean.
+    pub fn on_session_reset(&mut self) {
+        self.compression_count = 0;
+        self.tail_token_budget = (self.threshold_tokens as f64 * self.config.summary_target_ratio) as usize;
+        self.last_prompt_tokens = 0;
+        self.last_completion_tokens = 0;
+        self.previous_summary = None;
+        self.summary_failure_cooldown_until = None;
+        self.last_compression_savings_pct = 100.0;
+        self.ineffective_compression_count = 0;
     }
 
     /// Compress conversation messages by summarizing middle turns.
@@ -796,6 +820,7 @@ The focus topic sections should receive roughly 60-70% of the summary token budg
             api_key: self.config.summary_api_key.clone(),
             timeout_secs: Some(120),
             provider_preferences: None,
+            api_mode: None,
         };
 
         // compress() is sync but call_llm is async. Try block_on if in a runtime.

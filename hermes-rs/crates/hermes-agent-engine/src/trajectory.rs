@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use hermes_core::Result;
+
 /// A single turn in ShareGPT conversation format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
@@ -76,7 +78,7 @@ pub fn save_trajectory(
     model: &str,
     completed: bool,
     filename: Option<&Path>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let default_name = if completed {
         "trajectory_samples.jsonl"
     } else {
@@ -91,15 +93,13 @@ pub fn save_trajectory(
         completed,
     };
 
-    let line = serde_json::to_string(&entry).map_err(|e| format!("JSON serialization error: {e}"))?;
+    let line = serde_json::to_string(&entry)?;
 
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-        .map_err(|e| format!("Failed to open trajectory file: {e}"))?
-        .write_all(format!("{line}\n").as_bytes())
-        .map_err(|e| format!("Failed to write trajectory: {e}"))?;
+        .open(path)?
+        .write_all(format!("{line}\n").as_bytes())?;
 
     Ok(path.to_path_buf())
 }

@@ -156,7 +156,7 @@ fn browser_navigate(args: &Value) -> Result<String, hermes_core::HermesError> {
 /// Camofox navigate: create tab + navigate.
 async fn camofox_navigate_async(url: String, task_id: String) -> Result<String, String> {
     let client = camofox::CamofoxClient::from_env();
-    let user_id = camofox::derive_user_id(&task_id, None);
+    let user_id = camofox::derive_user_id(None);
     let tab_id = client.create_tab(&user_id).await?;
     let result = client.navigate(&tab_id, &url, &user_id).await?;
 

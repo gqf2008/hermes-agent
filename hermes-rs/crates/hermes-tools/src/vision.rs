@@ -232,6 +232,7 @@ async fn call_vision_llm(
         max_tokens: Some(2000),
         tools: None,
         timeout_secs: Some(120),
+        extra_body: None,
     };
 
     let response: AuxiliaryResponse = call_auxiliary(request.clone())

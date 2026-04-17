@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::agent::{AIAgent, AgentConfig};
+use hermes_core::Result;
 use hermes_tools::registry::ToolRegistry;
 
 /// Run a background review of the conversation.
@@ -23,7 +24,7 @@ pub async fn run_review(
     review_prompt: String,
     review_memory: bool,
     review_skills: bool,
-) -> Result<(), String> {
+) -> Result<()> {
     tracing::info!(
         "Self-evolution: starting review (memory={}, skills={})",
         review_memory, review_skills
@@ -33,8 +34,7 @@ pub async fn run_review(
     let mut review_config = config;
     review_config.max_iterations = 8;
 
-    let mut review_agent = AIAgent::new(review_config, registry)
-        .map_err(|e| format!("Failed to create review agent: {e}"))?;
+    let mut review_agent = AIAgent::new(review_config, registry)?;
 
     // Extract user message for context (truncated to avoid wasting tokens)
     const MAX_USER_MSG_LEN: usize = 2000;

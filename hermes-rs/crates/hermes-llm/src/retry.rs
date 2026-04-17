@@ -168,16 +168,12 @@ where
             Some(c) => c,
             None => {
                 // No credentials available — try with a default empty credential
-                return make_request(&crate::credential_pool::Credential {
-                    api_key: String::new(),
-                    base_url: None,
-                    label: None,
-                })
-                .await;
+                return make_request(&crate::credential_pool::Credential::new(String::new()))
+                    .await;
             }
         };
 
-        match make_request(cred).await {
+        match make_request(&cred).await {
             Ok(value) => return Ok(value),
             Err(classified) => {
                 use crate::error_classifier::FailoverReason;
@@ -186,7 +182,7 @@ where
                 match classified.reason {
                     FailoverReason::Billing => {
                         // Immediately rotate and retry
-                        if pool.mark_exhausted_and_rotate() {
+                        if pool.mark_exhausted_and_rotate(Some(402), None).is_some() {
                             consecutive_429 = false;
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
@@ -195,25 +191,27 @@ where
                     FailoverReason::RateLimit => {
                         if consecutive_429 {
                             // Second consecutive 429 — rotate
-                            if pool.mark_exhausted_and_rotate() {
+                            if pool.mark_exhausted_and_rotate(Some(429), None).is_some() {
                                 consecutive_429 = false;
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 continue;
                             }
                         } else {
-                            // First 429 — don't rotate, set flag
+                            // First 429 — don't rotate, set flag and retry
                             consecutive_429 = true;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
                         }
                     }
                     FailoverReason::Auth => {
                         // Try refresh first
-                        if pool.try_refresh_current() {
+                        if pool.try_refresh_current().await {
                             // Refresh succeeded, retry with same credential
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
                         }
                         // Refresh failed — rotate
-                        if pool.mark_exhausted_and_rotate() {
+                        if pool.mark_exhausted_and_rotate(Some(401), None).is_some() {
                             consecutive_429 = false;
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;

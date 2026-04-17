@@ -293,6 +293,258 @@ impl ClaudeCodeCredentials {
     }
 }
 
+/// Parsed result from an Anthropic OAuth token refresh.
+#[derive(Debug, Clone)]
+pub struct RefreshedToken {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at_ms: u64,
+}
+
+/// Refresh an Anthropic OAuth token without mutating local credential files.
+///
+/// Mirrors Python `refresh_anthropic_oauth_pure()`. Tries both
+/// `platform.claude.com` and `console.anthropic.com` endpoints.
+///
+/// `use_json` controls the request body format:
+/// - `true` → JSON (`application/json`)
+/// - `false` → form-encoded (`application/x-www-form-urlencoded`)
+pub async fn refresh_anthropic_oauth_pure(
+    refresh_token: &str,
+    use_json: bool,
+) -> anyhow::Result<RefreshedToken> {
+    if refresh_token.is_empty() {
+        return Err(anyhow::anyhow!("refresh_token is required"));
+    }
+
+    let client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    let version = detect_claude_code_version();
+    let user_agent = format!("claude-cli/{} (external, cli)", version);
+
+    let endpoints = [
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token",
+    ];
+
+    let mut last_error = None;
+    for endpoint in &endpoints {
+        let client = reqwest::Client::new();
+        let mut req = client.post(*endpoint).header("User-Agent", &user_agent);
+
+        if use_json {
+            let body = serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            });
+            req = req.header("Content-Type", "application/json").json(&body);
+        } else {
+            let params = [
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", client_id),
+            ];
+            req = req
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&params);
+        }
+
+        match req.send().await {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(result) => {
+                    let access_token = result
+                        .get("access_token")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if access_token.is_empty() {
+                        last_error = Some(anyhow::anyhow!("Anthropic refresh response was missing access_token"));
+                        continue;
+                    }
+                    let next_refresh = result
+                        .get("refresh_token")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(refresh_token)
+                        .to_string();
+                    let expires_in = result
+                        .get("expires_in")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(3600);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    return Ok(RefreshedToken {
+                        access_token: access_token.to_string(),
+                        refresh_token: next_refresh,
+                        expires_at_ms: now_ms + (expires_in * 1000),
+                    });
+                }
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("Failed to parse response: {e}"));
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::debug!("Anthropic token refresh failed at {}: {}", endpoint, e);
+                last_error = Some(anyhow::anyhow!("Request failed: {e}"));
+                continue;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Anthropic token refresh failed")))
+}
+
+/// Write refreshed credentials back to ~/.claude/.credentials.json.
+///
+/// Mirrors Python `_write_claude_code_credentials()`. Preserves existing
+/// fields and optionally updates scopes.
+pub fn write_claude_code_credentials(
+    access_token: &str,
+    refresh_token: &str,
+    expires_at_ms: u64,
+    scopes: Option<&[String]>,
+) -> anyhow::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let cred_path = home.join(".claude").join(".credentials.json");
+
+    // Read existing file to preserve other fields
+    let mut existing: serde_json::Value = if cred_path.exists() {
+        let data = std::fs::read_to_string(&cred_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read credentials: {e}"))?;
+        serde_json::from_str(&data)
+            .map_err(|e| anyhow::anyhow!("Failed to parse credentials: {e}"))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let mut oauth_data = serde_json::Map::new();
+    oauth_data.insert("accessToken".to_string(), serde_json::json!(access_token));
+    oauth_data.insert("refreshToken".to_string(), serde_json::json!(refresh_token));
+    oauth_data.insert("expiresAt".to_string(), serde_json::json!(expires_at_ms));
+
+    // Handle scopes
+    if let Some(s) = scopes {
+        oauth_data.insert("scopes".to_string(), serde_json::json!(s));
+    } else if let Some(existing_oauth) = existing.get("claudeAiOauth") {
+        if let Some(existing_scopes) = existing_oauth.get("scopes") {
+            oauth_data.insert("scopes".to_string(), existing_scopes.clone());
+        }
+    }
+
+    if let Some(obj) = existing.as_object_mut() {
+        obj.insert("claudeAiOauth".to_string(), serde_json::Value::Object(oauth_data));
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = cred_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create directory: {e}"))?;
+    }
+
+    let output = serde_json::to_string_pretty(&existing)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, output)
+        .map_err(|e| anyhow::anyhow!("Failed to write credentials: {e}"))?;
+
+    // Restrict permissions (credentials file) — Unix only
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&cred_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(&cred_path, perms);
+        }
+    }
+
+    Ok(())
+}
+
+/// Attempt to refresh an expired Claude Code OAuth token.
+/// Returns the new access token on success.
+pub async fn try_refresh_oauth_token(
+    refresh_token: &str,
+) -> Option<String> {
+    if refresh_token.is_empty() {
+        tracing::debug!("No refresh token available — cannot refresh");
+        return None;
+    }
+
+    match refresh_anthropic_oauth_pure(refresh_token, false).await {
+        Ok(refreshed) => {
+            let scopes = None; // Preserve existing scopes during refresh
+            if let Err(e) = write_claude_code_credentials(
+                &refreshed.access_token,
+                &refreshed.refresh_token,
+                refreshed.expires_at_ms,
+                scopes,
+            ) {
+                tracing::debug!("Failed to write refreshed credentials: {}", e);
+            }
+            tracing::debug!("Successfully refreshed Claude Code OAuth token");
+            Some(refreshed.access_token)
+        }
+        Err(e) => {
+            tracing::debug!("Failed to refresh Claude Code token: {}", e);
+            None
+        }
+    }
+}
+
+/// Resolve a token from Claude Code credential files, refreshing if needed.
+///
+/// Priority: valid creds → expired creds with refresh → None.
+/// Returns (access_token, is_oauth=true).
+pub async fn resolve_claude_code_token_with_refresh() -> Option<(String, bool)> {
+    let creds = read_claude_code_credentials()?;
+
+    if creds.is_valid() {
+        tracing::debug!("Using Claude Code credentials (auto-detected)");
+        return Some((creds.access_token, true));
+    }
+
+    tracing::debug!("Claude Code credentials expired — attempting refresh");
+    if let Some(refresh_token) = &creds.refresh_token {
+        if let Some(new_token) = try_refresh_oauth_token(refresh_token).await {
+            return Some((new_token, true));
+        }
+        tracing::debug!("Token refresh failed — re-run 'claude setup-token' to reauthenticate");
+    }
+
+    None
+}
+
+/// Prefer Claude Code creds when a persisted env OAuth token would shadow refresh.
+///
+/// Hermes historically persisted setup tokens into ANTHROPIC_TOKEN. That makes
+/// later refresh impossible because the static env token wins before we ever
+/// inspect Claude Code's refreshable credential file. If we have a refreshable
+/// Claude Code credential record, prefer it over the static env OAuth token.
+pub async fn prefer_refreshable_claude_code_token(
+    env_token: &str,
+) -> Option<(String, bool)> {
+    if env_token.is_empty() || !is_oauth_token(env_token) {
+        return None;
+    }
+
+    let creds = read_claude_code_credentials()?;
+    if creds.refresh_token.is_none() || creds.refresh_token.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+        return None;
+    }
+
+    if let Some((resolved, is_oauth)) = resolve_claude_code_token_with_refresh().await {
+        if resolved != env_token {
+            tracing::debug!(
+                "Preferring Claude Code credential file over static env OAuth token so refresh can proceed"
+            );
+            return Some((resolved, is_oauth));
+        }
+    }
+
+    None
+}
+
 /// Resolve an Anthropic token from all available sources.
 ///
 /// Priority:
@@ -637,6 +889,7 @@ pub struct AnthropicRequestBuilder {
     pub thinking_enabled: bool,
     pub thinking_effort: Option<String>, // "low", "medium", "high", "xhigh"
     pub fast_mode: bool,
+    pub stream: bool,
 }
 
 impl AnthropicRequestBuilder {
@@ -696,6 +949,11 @@ impl AnthropicRequestBuilder {
                     body["effort"] = json!(effort_to_adaptive(effort));
                 }
             }
+        }
+
+        // Streaming
+        if self.stream {
+            body["stream"] = json!(true);
         }
 
         // Fast mode (Claude 4.6+ Opus/Sonnet)
@@ -779,6 +1037,526 @@ fn detect_claude_code_version_impl() -> String {
 /// Get the detected Claude Code version.
 pub fn detect_claude_code_version() -> String {
     CACHED_CLAUDE_VERSION.clone()
+}
+
+// ── OAuth credential resolution (enhanced resolve_anthropic_token) ───────
+
+/// Enhanced token resolution that tries OAuth refresh from Claude Code credentials.
+///
+/// Mirrors Python's combined resolution: env vars → credentials file (with refresh) → API key.
+/// Returns (token, is_oauth).
+pub async fn resolve_anthropic_token_async() -> Option<(String, bool)> {
+    // 1. ANTHROPIC_TOKEN
+    if let Ok(token) = std::env::var("ANTHROPIC_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            let is_oauth = is_oauth_token(&token);
+            // Check if Claude Code has a refreshable credential that should take priority
+            if is_oauth {
+                if let Some((resolved, _)) = prefer_refreshable_claude_code_token(&token).await {
+                    return Some((resolved, true));
+                }
+            }
+            return Some((token, is_oauth));
+        }
+    }
+
+    // 2. CLAUDE_CODE_OAUTH_TOKEN
+    if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            let is_oauth = is_oauth_token(&token);
+            if is_oauth {
+                if let Some((resolved, _)) = prefer_refreshable_claude_code_token(&token).await {
+                    return Some((resolved, true));
+                }
+            }
+            return Some((token, is_oauth));
+        }
+    }
+
+    // 3. Claude Code credentials (with auto-refresh)
+    if let Some(result) = resolve_claude_code_token_with_refresh().await {
+        return Some(result);
+    }
+
+    // 4. ANTHROPIC_API_KEY
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            let is_oauth = is_oauth_token(&key);
+            return Some((key, is_oauth));
+        }
+    }
+
+    None
+}
+
+// ── Message preprocessing ────────────────────────────────────────────────
+
+/// Thinking block types that require signature management.
+const THINKING_TYPES: &[&str] = &["thinking", "redacted_thinking"];
+
+/// Preprocess Anthropic messages for API submission.
+///
+/// Mirrors Python's post-conversion processing:
+/// - Strip orphaned tool_use blocks (no matching tool_result follows)
+/// - Strip orphaned tool_result blocks (no matching tool_use precedes them)
+/// - Enforce strict role alternation (merge consecutive same-role messages)
+/// - Strip thinking block signatures for third-party endpoints
+/// - Validate non-empty content
+///
+/// Returns the preprocessed messages.
+pub fn preprocess_anthropic_messages(
+    messages: Vec<Value>,
+    base_url: Option<&str>,
+) -> Vec<Value> {
+    let is_third_party = is_third_party_endpoint(base_url);
+    let mut result = messages;
+
+    // Strip orphaned tool_use blocks (no matching tool_result follows)
+    let mut tool_result_ids = std::collections::HashSet::new();
+    for m in &result {
+        if m.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some(arr) = m.get("content").and_then(Value::as_array) {
+                for block in arr {
+                    if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        tool_result_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for m in &mut result {
+        if m.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(content) = m.get_mut("content") {
+                if let Some(arr) = content.as_array_mut() {
+                    *arr = arr
+                        .drain(..)
+                        .filter(|b: &Value| {
+                            b.get("type").and_then(Value::as_str) != Some("tool_use")
+                                || b.get("id").and_then(Value::as_str).map(|s| tool_result_ids.contains(s)).unwrap_or(true)
+                        })
+                        .collect();
+                    if arr.is_empty() {
+                        arr.push(json!({"type": "text", "text": "(tool call removed)"}));
+                    }
+                }
+            }
+        }
+    }
+
+    // Strip orphaned tool_result blocks (no matching tool_use precedes them)
+    let mut tool_use_ids = std::collections::HashSet::new();
+    for m in &result {
+        if m.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(arr) = m.get("content").and_then(Value::as_array) {
+                for block in arr {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        tool_use_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for m in &mut result {
+        if m.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some(content) = m.get_mut("content") {
+                if let Some(arr) = content.as_array_mut() {
+                    *arr = arr
+                        .drain(..)
+                        .filter(|b: &Value| {
+                            b.get("type").and_then(Value::as_str) != Some("tool_result")
+                                || b.get("tool_use_id").and_then(Value::as_str).map(|s| tool_use_ids.contains(s)).unwrap_or(true)
+                        })
+                        .collect();
+                    if arr.is_empty() {
+                        arr.push(json!({"type": "text", "text": "(tool result removed)"}));
+                    }
+                }
+            }
+        }
+    }
+
+    // Enforce strict role alternation (merge consecutive same-role messages)
+    let mut fixed: Vec<Value> = Vec::new();
+    for m in result {
+        if let Some(last) = fixed.last() {
+            let last_role = last.get("role").and_then(Value::as_str).unwrap_or("");
+            let curr_role = m.get("role").and_then(Value::as_str).unwrap_or("");
+            if last_role == curr_role {
+                let last_idx = fixed.len() - 1;
+                if curr_role == "user" {
+                    // Merge consecutive user messages
+                    let prev = fixed[last_idx]["content"].clone();
+                    let curr = m["content"].clone();
+                    fixed[last_idx]["content"] = merge_content_blocks(&prev, &curr);
+                } else {
+                    // Consecutive assistant messages — merge text, drop thinking from second
+                    let mut curr_content = m["content"].clone();
+                    if let Some(arr) = curr_content.as_array_mut() {
+                        *arr = arr
+                            .drain(..)
+                            .filter(|b: &Value| {
+                                !b.get("type").and_then(Value::as_str).map(|t| THINKING_TYPES.contains(&t)).unwrap_or(false)
+                            })
+                            .collect();
+                    }
+                    let prev = fixed[last_idx]["content"].clone();
+                    fixed[last_idx]["content"] = merge_content_blocks(&prev, &curr_content);
+                }
+                continue;
+            }
+        }
+        fixed.push(m);
+    }
+    result = fixed;
+
+    // Strip thinking blocks for third-party endpoints (signatures are Anthropic-proprietary)
+    if is_third_party {
+        for m in &mut result {
+            if m.get("role").and_then(Value::as_str) == Some("assistant") {
+                if let Some(content) = m.get_mut("content") {
+                    if let Some(arr) = content.as_array_mut() {
+                        // Extract thinking text before removing
+                        let mut thinking_texts = Vec::new();
+                        for b in arr.iter() {
+                            if let Some(obj) = b.as_object() {
+                                if let Some(t) = obj.get("type").and_then(Value::as_str) {
+                                    if THINKING_TYPES.contains(&t) {
+                                        if let Some(thinking) = obj.get("thinking").and_then(Value::as_str) {
+                                            if !thinking.is_empty() {
+                                                thinking_texts.push(thinking.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Remove thinking/redacted_thinking blocks
+                        *arr = arr
+                            .drain(..)
+                            .filter(|b: &Value| {
+                                !b.get("type").and_then(Value::as_str).map(|t| THINKING_TYPES.contains(&t)).unwrap_or(false)
+                            })
+                            .collect();
+                        // Preserve thinking text as regular text
+                        for text in thinking_texts {
+                            arr.insert(0, json!({"type": "text", "text": text}));
+                        }
+                        if arr.is_empty() {
+                            arr.push(json!({"type": "text", "text": "(empty)"}));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strip cache_control from thinking blocks — cache markers interfere with signature validation
+    for m in &mut result {
+        if let Some(content) = m.get_mut("content") {
+            if let Some(arr) = content.as_array_mut() {
+                for block in arr.iter_mut() {
+                    if let Some(obj) = block.as_object_mut() {
+                        if let Some(t) = obj.get("type").and_then(|v: &Value| v.as_str()) {
+                            if THINKING_TYPES.contains(&t) {
+                                obj.remove("cache_control");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Merge two content blocks (string, array, or mixed).
+fn merge_content_blocks(prev: &Value, curr: &Value) -> Value {
+    match (prev, curr) {
+        (Value::String(a), Value::String(b)) => Value::String(format!("{}\n{}", a, b)),
+        (Value::Array(a), Value::Array(b)) => {
+            let mut merged = a.clone();
+            merged.extend(b.clone());
+            Value::Array(merged)
+        }
+        _ => {
+            // Mixed types — normalize both to list and merge
+            let to_array = |v: &Value| -> Vec<Value> {
+                if let Some(arr) = v.as_array() {
+                    arr.clone()
+                } else if let Some(s) = v.as_str() {
+                    vec![json!({"type": "text", "text": s})]
+                } else {
+                    vec![json!({"type": "text", "text": v.to_string()})]
+                }
+            };
+            let mut merged = to_array(prev);
+            merged.extend(to_array(curr));
+            Value::Array(merged)
+        }
+    }
+}
+
+// ── Response normalization ───────────────────────────────────────────────
+
+/// Normalized Anthropic response.
+///
+/// Mirrors Python `normalize_anthropic_response()`. Maps Anthropic's
+/// response shape to the internal dict format expected by AIAgent.
+#[derive(Debug, Clone)]
+pub struct NormalizedAnthropicResponse {
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<Value>>,
+    pub reasoning: Option<String>,
+    pub reasoning_details: Option<Vec<Value>>,
+    pub finish_reason: String,
+    pub usage: Option<Value>,
+}
+
+/// Normalize an Anthropic API response JSON to internal format.
+///
+/// Maps Anthropic stop_reason to OpenAI finish_reason:
+/// - `end_turn` → `stop`
+/// - `tool_use` → `tool_calls`
+/// - `max_tokens` → `length`
+/// - `stop_sequence` → `stop`
+///
+/// When `strip_tool_prefix` is true, removes the `mcp_` prefix from tool names
+/// (used for OAuth Claude Code compatibility).
+pub fn normalize_anthropic_response(
+    response: &Value,
+    strip_tool_prefix: bool,
+) -> NormalizedAnthropicResponse {
+    let mcp_prefix = "mcp_";
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
+    let mut reasoning_details: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    if let Some(content_arr) = response.get("content").and_then(Value::as_array) {
+        for block in content_arr {
+            if let Some(obj) = block.as_object() {
+                match obj.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(thinking) = obj.get("thinking").and_then(Value::as_str) {
+                            reasoning_parts.push(thinking.to_string());
+                        }
+                        reasoning_details.push(block.clone());
+                    }
+                    Some("tool_use") => {
+                        let mut name = obj
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if strip_tool_prefix && name.starts_with(mcp_prefix) {
+                            name = name[mcp_prefix.len()..].to_string();
+                        }
+                        let tool_call = json!({
+                            "id": obj.get("id").and_then(Value::as_str).unwrap_or(""),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": obj.get("input").cloned().unwrap_or_else(|| json!({})).to_string(),
+                            }
+                        });
+                        tool_calls.push(tool_call);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Map Anthropic stop_reason to OpenAI finish_reason
+    let finish_reason = match response.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn") => "stop".to_string(),
+        Some("tool_use") => "tool_calls".to_string(),
+        Some("max_tokens") => "length".to_string(),
+        Some("stop_sequence") => "stop".to_string(),
+        _ => "stop".to_string(),
+    };
+
+    let usage = response.get("usage").cloned();
+
+    NormalizedAnthropicResponse {
+        content: if text_parts.is_empty() { None } else { Some(text_parts.join("\n")) },
+        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+        reasoning: if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join("\n\n"))
+        },
+        reasoning_details: if reasoning_details.is_empty() {
+            None
+        } else {
+            Some(reasoning_details)
+        },
+        finish_reason,
+        usage,
+    }
+}
+
+/// Convert normalized response back to a serde_json::Value dict.
+pub fn normalized_response_to_value(resp: &NormalizedAnthropicResponse) -> Value {
+    let mut result = serde_json::Map::new();
+    if let Some(ref content) = resp.content {
+        result.insert("content".to_string(), json!(content));
+    }
+    if let Some(ref tool_calls) = resp.tool_calls {
+        result.insert("tool_calls".to_string(), json!(tool_calls));
+    }
+    if let Some(ref reasoning) = resp.reasoning {
+        result.insert("reasoning".to_string(), json!(reasoning));
+    }
+    if let Some(ref details) = resp.reasoning_details {
+        result.insert("reasoning_details".to_string(), json!(details));
+    }
+    result.insert("finish_reason".to_string(), json!(resp.finish_reason));
+    if let Some(ref usage) = resp.usage {
+        result.insert("usage".to_string(), usage.clone());
+    }
+    Value::Object(result)
+}
+
+// ── Error context extraction ─────────────────────────────────────────────
+
+/// Parse available output tokens from an Anthropic API error message.
+///
+/// Anthropic returns errors like:
+/// "Your max_tokens setting of 16000 is too large for the given context size.
+///  Available output tokens: 8192 (20480 context - 12288 used in prompt)"
+///
+/// Returns the available output tokens if extractable.
+pub fn parse_available_output_tokens_from_error(error_message: &str) -> Option<usize> {
+    static AVAILABLE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"[Aa]vailable output tokens:\s*(\d+)").unwrap()
+    });
+    AVAILABLE_RE
+        .captures(error_message)
+        .and_then(|cap| cap.get(1))
+        .and_then(|m| m.as_str().parse::<usize>().ok())
+}
+
+/// Parse the max_tokens value from an Anthropic API error message.
+///
+/// Returns the max_tokens value that was rejected.
+pub fn parse_max_tokens_from_error(error_message: &str) -> Option<usize> {
+    static MAX_TOKENS_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"max_tokens.*?(\d+)").unwrap()
+    });
+    MAX_TOKENS_RE
+        .captures(error_message)
+        .and_then(|cap| cap.get(1))
+        .and_then(|m| m.as_str().parse::<usize>().ok())
+}
+
+/// Compute an ephemeral max_output_tokens value from context length and prompt size.
+///
+/// When Anthropic rejects a request due to context overflow, compute a safe
+/// retry value. Mirrors Python's _ephemeral_max_output_tokens logic.
+pub fn ephemeral_max_output_tokens(
+    context_length: usize,
+    prompt_tokens: usize,
+    buffer: usize,
+) -> usize {
+    let available = context_length.saturating_sub(prompt_tokens);
+    available.saturating_sub(buffer).max(1)
+}
+
+/// Extract structured error context from an Anthropic API error.
+///
+/// Returns a map with keys like:
+/// - "error_type": classification of the error
+/// - "retryable": whether the error is likely retryable
+/// - "available_output_tokens": if context overflow, how many tokens remain
+/// - "suggested_max_tokens": if context overflow, a safe retry value
+#[derive(Debug, Default)]
+pub struct AnthropicErrorContext {
+    pub error_type: String,
+    pub retryable: bool,
+    pub available_output_tokens: Option<usize>,
+    pub suggested_max_tokens: Option<usize>,
+    pub raw_message: Option<String>,
+}
+
+impl AnthropicErrorContext {
+    /// Parse an Anthropic error message into structured context.
+    pub fn from_error(status_code: u16, error_message: &str) -> Self {
+        let mut ctx = AnthropicErrorContext::default();
+        ctx.raw_message = Some(error_message.to_string());
+
+        // Context overflow — retry with smaller max_tokens
+        if error_message.contains("max_tokens")
+            && (error_message.contains("too large") || error_message.contains("context"))
+        {
+            ctx.error_type = "context_overflow".to_string();
+            ctx.retryable = true;
+            ctx.available_output_tokens = parse_available_output_tokens_from_error(error_message);
+        }
+        // Rate limit
+        else if status_code == 429
+            || error_message.contains("rate limit")
+            || error_message.contains("overloaded")
+        {
+            ctx.error_type = "rate_limit".to_string();
+            ctx.retryable = true;
+        }
+        // Invalid thinking signature — retry without signatures
+        else if error_message.contains("Invalid signature")
+            || error_message.contains("thinking block")
+        {
+            ctx.error_type = "invalid_thinking_signature".to_string();
+            ctx.retryable = true;
+        }
+        // Server error — retryable
+        else if status_code >= 500 {
+            ctx.error_type = "server_error".to_string();
+            ctx.retryable = true;
+        }
+        // Authentication error — not retryable
+        else if status_code == 401 || status_code == 403 {
+            ctx.error_type = "auth_error".to_string();
+            ctx.retryable = false;
+        }
+        // Invalid request — not retryable
+        else if status_code == 400 {
+            ctx.error_type = "invalid_request".to_string();
+            ctx.retryable = false;
+        }
+        // Unknown
+        else {
+            ctx.error_type = "unknown".to_string();
+            ctx.retryable = status_code >= 500;
+        }
+
+        ctx
+    }
+
+    /// Convert to a serde_json::Value for structured logging.
+    pub fn to_value(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("error_type".to_string(), json!(self.error_type));
+        map.insert("retryable".to_string(), json!(self.retryable));
+        if let Some(tokens) = self.available_output_tokens {
+            map.insert("available_output_tokens".to_string(), json!(tokens));
+        }
+        if let Some(tokens) = self.suggested_max_tokens {
+            map.insert("suggested_max_tokens".to_string(), json!(tokens));
+        }
+        if let Some(ref msg) = self.raw_message {
+            map.insert("raw_message".to_string(), json!(msg));
+        }
+        Value::Object(map)
+    }
 }
 
 #[cfg(test)]
@@ -928,5 +1706,227 @@ mod tests {
         let source = image_source_from_openai_url("https://example.com/image.jpg");
         assert_eq!(source["type"], "url");
         assert_eq!(source["url"], "https://example.com/image.jpg");
+    }
+
+    #[test]
+    fn test_response_normalization_text() {
+        let response = json!({
+            "id": "msg_123",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let normalized = normalize_anthropic_response(&response, false);
+        assert_eq!(normalized.content, Some("Hello!".to_string()));
+        assert_eq!(normalized.finish_reason, "stop");
+        assert!(normalized.tool_calls.is_none());
+        assert!(normalized.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_response_normalization_tool_use() {
+        let response = json!({
+            "content": [
+                {"type": "tool_use", "id": "tool_1", "name": "mcp_read_file", "input": {"path": "test.txt"}}
+            ],
+            "stop_reason": "tool_use"
+        });
+        let normalized = normalize_anthropic_response(&response, true);
+        assert!(normalized.content.is_none());
+        assert_eq!(normalized.finish_reason, "tool_calls");
+        let tools = normalized.tool_calls.as_ref().unwrap();
+        assert_eq!(tools.len(), 1);
+        // mcp_ prefix stripped
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn test_response_normalization_thinking() {
+        let response = json!({
+            "content": [
+                {"type": "thinking", "thinking": "Let me think...", "signature": "abc123"},
+                {"type": "text", "text": "Done thinking."}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let normalized = normalize_anthropic_response(&response, false);
+        assert_eq!(normalized.content, Some("Done thinking.".to_string()));
+        assert_eq!(normalized.reasoning, Some("Let me think...".to_string()));
+        assert!(normalized.reasoning_details.is_some());
+        let details = normalized.reasoning_details.as_ref().unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["thinking"], "Let me think...");
+    }
+
+    #[test]
+    fn test_response_stop_reason_mapping() {
+        let test_cases = [
+            ("end_turn", "stop"),
+            ("tool_use", "tool_calls"),
+            ("max_tokens", "length"),
+            ("stop_sequence", "stop"),
+            ("unknown", "stop"),
+        ];
+        for (input, expected) in test_cases {
+            let response = json!({
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": input
+            });
+            let normalized = normalize_anthropic_response(&response, false);
+            assert_eq!(normalized.finish_reason, expected, "Failed for stop_reason={}", input);
+        }
+    }
+
+    #[test]
+    fn test_normalized_response_to_value() {
+        let resp = NormalizedAnthropicResponse {
+            content: Some("Hello".to_string()),
+            tool_calls: None,
+            reasoning: Some("Thinking...".to_string()),
+            reasoning_details: None,
+            finish_reason: "stop".to_string(),
+            usage: Some(json!({"input_tokens": 10})),
+        };
+        let value = normalized_response_to_value(&resp);
+        assert_eq!(value["content"], "Hello");
+        assert_eq!(value["reasoning"], "Thinking...");
+        assert_eq!(value["finish_reason"], "stop");
+        assert_eq!(value["usage"]["input_tokens"], 10);
+    }
+
+    #[test]
+    fn test_parse_output_tokens_from_error() {
+        let msg = "Your max_tokens setting of 16000 is too large for the given context size. Available output tokens: 8192 (20480 context - 12288 used in prompt)";
+        assert_eq!(parse_available_output_tokens_from_error(msg), Some(8192));
+        assert!(parse_available_output_tokens_from_error("no relevant info").is_none());
+    }
+
+    #[test]
+    fn test_parse_max_tokens_from_error() {
+        let msg = "max_tokens must be less than 4096, got 8192";
+        assert!(parse_max_tokens_from_error(msg).is_some());
+    }
+
+    #[test]
+    fn test_ephemeral_max_output_tokens() {
+        assert_eq!(ephemeral_max_output_tokens(20480, 12288, 1024), 7168);
+        assert_eq!(ephemeral_max_output_tokens(8192, 8000, 1000), 1); // minimum 1
+        assert_eq!(ephemeral_max_output_tokens(4096, 1000, 500), 2596);
+    }
+
+    #[test]
+    fn test_error_context_classification() {
+        // Context overflow
+        let ctx = AnthropicErrorContext::from_error(400, "max_tokens too large for context");
+        assert_eq!(ctx.error_type, "context_overflow");
+        assert!(ctx.retryable);
+
+        // Rate limit
+        let ctx = AnthropicErrorContext::from_error(429, "rate limit exceeded");
+        assert_eq!(ctx.error_type, "rate_limit");
+        assert!(ctx.retryable);
+
+        // Invalid signature
+        let ctx = AnthropicErrorContext::from_error(400, "Invalid signature in thinking block");
+        assert_eq!(ctx.error_type, "invalid_thinking_signature");
+        assert!(ctx.retryable);
+
+        // Server error
+        let ctx = AnthropicErrorContext::from_error(500, "internal server error");
+        assert_eq!(ctx.error_type, "server_error");
+        assert!(ctx.retryable);
+
+        // Auth error
+        let ctx = AnthropicErrorContext::from_error(401, "unauthorized");
+        assert_eq!(ctx.error_type, "auth_error");
+        assert!(!ctx.retryable);
+
+        // Invalid request
+        let ctx = AnthropicErrorContext::from_error(400, "bad request");
+        assert_eq!(ctx.error_type, "invalid_request");
+        assert!(!ctx.retryable);
+    }
+
+    #[test]
+    fn test_error_context_to_value() {
+        let ctx = AnthropicErrorContext::from_error(400, "max_tokens too large for context");
+        let value = ctx.to_value();
+        assert_eq!(value["error_type"], "context_overflow");
+        assert_eq!(value["retryable"], true);
+        assert!(value.get("raw_message").is_some());
+    }
+
+    #[test]
+    fn test_preprocess_orphan_tool_use_stripped() {
+        // tool_use with no matching tool_result
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tool_1", "name": "read_file", "input": {}},
+                    {"type": "text", "text": "Let me check"}
+                ]
+            }),
+            json!({"role": "user", "content": "OK"}),
+        ];
+        let preprocessed = preprocess_anthropic_messages(messages, None);
+        // tool_use should be stripped since no tool_result references it
+        let assistant = &preprocessed[0];
+        let content = assistant["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1); // only the text block remains
+        assert_eq!(content[0]["text"], "Let me check");
+    }
+
+    #[test]
+    fn test_preprocess_merging_consecutive_user() {
+        let messages = vec![
+            json!({"role": "user", "content": "Hello"}),
+            json!({"role": "user", "content": "World"}),
+        ];
+        let preprocessed = preprocess_anthropic_messages(messages, None);
+        assert_eq!(preprocessed.len(), 1);
+        assert_eq!(preprocessed[0]["content"], "Hello\nWorld");
+    }
+
+    #[test]
+    fn test_preprocess_third_party_strips_thinking() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Hmm...", "signature": "sig123"},
+                    {"type": "text", "text": "Answer"}
+                ]
+            }),
+        ];
+        // Third-party endpoint should strip thinking blocks
+        let preprocessed = preprocess_anthropic_messages(messages, Some("https://api.minimax.io/anthropic"));
+        let content = preprocessed[0]["content"].as_array().unwrap();
+        // Thinking converted to text
+        assert!(content.iter().any(|b| b.get("text").and_then(Value::as_str) == Some("Hmm...")));
+        // No thinking blocks remain
+        assert!(!content.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("thinking")));
+    }
+
+    #[test]
+    fn test_merge_content_blocks() {
+        // String + string
+        let merged = merge_content_blocks(&Value::String("a".to_string()), &Value::String("b".to_string()));
+        assert_eq!(merged, Value::String("a\nb".to_string()));
+
+        // Array + array
+        let merged = merge_content_blocks(
+            &json!([{"type": "text", "text": "a"}]),
+            &json!([{"type": "text", "text": "b"}]),
+        );
+        assert_eq!(merged.as_array().unwrap().len(), 2);
+
+        // Mixed (string + array)
+        let merged = merge_content_blocks(
+            &Value::String("text".to_string()),
+            &json!([{"type": "text", "text": "block"}]),
+        );
+        assert_eq!(merged.as_array().unwrap().len(), 2);
     }
 }

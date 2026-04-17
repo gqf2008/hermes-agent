@@ -673,7 +673,10 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_basic() {
-        let config = PromptBuilderConfig::default();
+        let config = PromptBuilderConfig {
+            skip_context_files: true,
+            ..Default::default()
+        };
         let result = build_system_prompt(&config, None);
         assert!(!result.system_prompt.is_empty());
         // Should contain default identity
@@ -743,11 +746,10 @@ mod tests {
         let hermes_home = hermes_core::get_hermes_home();
         let soul_path = hermes_home.join("SOUL.md");
         let had_soul = soul_path.exists();
+        let original_content = had_soul.then(|| std::fs::read_to_string(&soul_path).ok()).flatten();
 
-        // Temporarily create a SOUL.md
-        if !had_soul {
-            std::fs::write(&soul_path, "# SOUL\n\nYou are a coding assistant.").unwrap();
-        }
+        // Temporarily write test SOUL.md
+        std::fs::write(&soul_path, "# SOUL\n\nYou are a coding assistant.").unwrap();
 
         let config = PromptBuilderConfig {
             skip_context_files: false,
@@ -755,8 +757,10 @@ mod tests {
         };
         let result = build_system_prompt(&config, None);
 
-        // Clean up if we created it
-        if !had_soul {
+        // Restore original file
+        if let Some(content) = original_content {
+            std::fs::write(&soul_path, content).unwrap();
+        } else {
             let _ = std::fs::remove_file(&soul_path);
         }
 

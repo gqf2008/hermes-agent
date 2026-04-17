@@ -449,6 +449,185 @@ impl WeComAdapter {
         !self.config.bot_id.is_empty() && !self.config.secret.is_empty()
     }
 
+    // --- Rich media send methods (mirrors Python wecom.py:830-1050) ---
+
+    /// Send an image via WeCom HTTP API.
+    #[allow(dead_code)]
+    pub async fn send_image(&self, chat_id: &str, media_id: &str) -> Result<String, String> {
+        self.send_media_message(chat_id, "image", media_id).await
+    }
+
+    /// Send a voice/audio via WeCom HTTP API.
+    #[allow(dead_code)]
+    pub async fn send_voice(&self, chat_id: &str, media_id: &str) -> Result<String, String> {
+        self.send_media_message(chat_id, "voice", media_id).await
+    }
+
+    /// Send a document/file via WeCom HTTP API.
+    #[allow(dead_code)]
+    pub async fn send_document(&self, chat_id: &str, media_id: &str) -> Result<String, String> {
+        self.send_media_message(chat_id, "file", media_id).await
+    }
+
+    /// Send a video via WeCom HTTP API.
+    #[allow(dead_code)]
+    pub async fn send_video(&self, chat_id: &str, media_id: &str) -> Result<String, String> {
+        self.send_media_message(chat_id, "video", media_id).await
+    }
+
+    /// Generic media message send (image/voice/file/video).
+    async fn send_media_message(
+        &self,
+        chat_id: &str,
+        msg_type: &str,
+        media_id: &str,
+    ) -> Result<String, String> {
+        let token = self.get_access_token().await?;
+        let is_dm = chat_id.starts_with("dm:");
+        let user_or_chat_id = if is_dm {
+            chat_id.strip_prefix("dm:").unwrap_or(chat_id)
+        } else {
+            chat_id
+        };
+
+        let media_key = match msg_type {
+            "image" => "media_id",
+            "voice" => "media_id",
+            "file" => "media_id",
+            "video" => "media_id",
+            _ => "media_id",
+        };
+
+        if is_dm {
+            let Some(agent_id) = self.get_agent_id() else {
+                return Err("WECOM_AGENT_ID not configured or invalid".to_string());
+            };
+            let resp = self
+                .client
+                .post(format!(
+                    "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
+                ))
+                .json(&serde_json::json!({
+                    "touser": user_or_chat_id,
+                    "msgtype": msg_type,
+                    "agentid": agent_id,
+                    msg_type: {
+                        media_key: media_id,
+                    },
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send {msg_type}: {e}"))?;
+
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+            let errcode = body.get("errcode").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if errcode != 0 {
+                return Err(format!(
+                    "WeCom {msg_type} send failed: errcode={errcode}, errmsg={}",
+                    body.get("errmsg").and_then(|v| v.as_str()).unwrap_or("")
+                ));
+            }
+        } else {
+            let resp = self
+                .client
+                .post(format!(
+                    "https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token={token}"
+                ))
+                .json(&serde_json::json!({
+                    "chatid": user_or_chat_id,
+                    "msgtype": msg_type,
+                    msg_type: {
+                        media_key: media_id,
+                    },
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send group {msg_type}: {e}"))?;
+
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+            let errcode = body.get("errcode").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if errcode != 0 {
+                return Err(format!(
+                    "WeCom group {msg_type} send failed: errcode={errcode}, errmsg={}",
+                    body.get("errmsg").and_then(|v| v.as_str()).unwrap_or("")
+                ));
+            }
+        }
+
+        debug!("WeCom {msg_type} sent to {chat_id}");
+        Ok("ok".to_string())
+    }
+
+    /// Flush a text batch (send multiple messages in sequence).
+    ///
+    /// Mirrors Python `_flush_text_batch()` (wecom.py:972).
+    #[allow(dead_code)]
+    pub async fn flush_text_batch(
+        &self,
+        chat_id: &str,
+        messages: &[String],
+    ) -> Result<Vec<String>, String> {
+        let mut msg_ids = Vec::new();
+        for (i, msg) in messages.iter().enumerate() {
+            let msg_id = self.send_text(chat_id, msg).await?;
+            msg_ids.push(msg_id);
+            // Rate limit: small delay between batch items
+            if i < messages.len() - 1 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok(msg_ids)
+    }
+
+    /// Get chat info via WeCom HTTP API.
+    ///
+    /// Mirrors Python `get_chat_info()` (wecom.py:1010).
+    #[allow(dead_code)]
+    pub async fn get_chat_info(&self, chat_id: &str) -> Result<serde_json::Value, String> {
+        let token = self.get_access_token().await?;
+
+        let resp = self
+            .client
+            .get(format!(
+                "https://qyapi.weixin.qq.com/cgi-bin/appchat/get?access_token={token}&chatid={chat_id}"
+            ))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get chat info: {e}"))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+        let errcode = body.get("errcode").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if errcode != 0 {
+            return Err(format!(
+                "WeCom chat info failed: errcode={errcode}, errmsg={}",
+                body.get("errmsg").and_then(|v| v.as_str()).unwrap_or("")
+            ));
+        }
+
+        Ok(body)
+    }
+
+    /// Send typing indicator (not natively supported by WeCom).
+    ///
+    /// Mirrors Python `send_typing()` (wecom.py:1085) — no-op in WeCom.
+    #[allow(dead_code)]
+    pub async fn send_typing(&self, _chat_id: &str) -> Result<String, String> {
+        // WeCom does not support typing indicators
+        Ok("not_supported".to_string())
+    }
+
     /// Send a reply via WebSocket, trying respond_msg first then falling back to send_msg.
     async fn send_reply(
         ws_state: &WsState,

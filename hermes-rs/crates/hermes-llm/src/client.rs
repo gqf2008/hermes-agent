@@ -6,14 +6,18 @@
 //! Provider is resolved from model prefix: `anthropic/...` → Anthropic,
 //! `openai/...` → OpenAI, `openrouter/...` → OpenAI-compatible.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use futures::StreamExt;
 use reqwest::Client as HttpClient;
 use serde_json::{json, Value};
 
+use crate::credential_pool::load_from_env;
 use crate::error_classifier::{classify_api_error, ClassifiedError};
 use crate::provider::{parse_provider, ProviderType};
+use crate::retry::{retry_with_backoff, RetryConfig};
 
 /// LLM call parameters.
 #[derive(Debug, Clone)]
@@ -28,6 +32,9 @@ pub struct LlmRequest {
     pub timeout_secs: Option<u64>,
     /// Provider preferences (only sent to OpenRouter endpoints).
     pub provider_preferences: Option<ProviderPreferences>,
+    /// API mode override: "openai", "anthropic_messages", "codex_responses".
+    /// When set, takes precedence over provider auto-detection from model prefix.
+    pub api_mode: Option<String>,
 }
 
 /// Provider preferences for OpenRouter model routing.
@@ -40,6 +47,8 @@ pub struct ProviderPreferences {
     pub ignore: Option<Vec<String>>,
     pub order: Option<Vec<String>>,
     pub sort: Option<String>,
+    pub require_parameters: Option<bool>,
+    pub data_collection: Option<String>,
 }
 
 impl ProviderPreferences {
@@ -57,6 +66,12 @@ impl ProviderPreferences {
         }
         if let Some(ref sort) = self.sort {
             obj.insert("sort".to_string(), serde_json::json!(sort));
+        }
+        if let Some(rp) = self.require_parameters {
+            obj.insert("require_parameters".to_string(), serde_json::json!(rp));
+        }
+        if let Some(ref dc) = self.data_collection {
+            obj.insert("data_collection".to_string(), serde_json::json!(dc));
         }
         Value::Object(obj)
     }
@@ -80,8 +95,42 @@ pub struct UsageInfo {
     pub total_tokens: u64,
 }
 
-/// Dispatch to the correct provider API based on model prefix.
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+/// Single event emitted from a streaming LLM response.
+///
+/// Mirrors Python's `_fire_stream_delta()` / `_fire_reasoning_delta()` events.
+#[derive(Debug, Clone)]
+pub enum LlmStreamEvent {
+    /// Text content delta.
+    TextDelta { delta: String },
+    /// Reasoning / thinking delta.
+    ReasoningDelta { delta: String },
+    /// Tool-call generation has started (name first available).
+    ///
+    /// Mirrors Python `_fire_tool_gen_started()` (run_agent.py:5172).
+    ToolGenStarted { name: String },
+    /// A complete tool_call has been assembled.
+    ToolCall { id: String, name: String, arguments: String },
+    /// Stream completed successfully.
+    Done { usage: Option<UsageInfo> },
+    /// Terminal error.
+    Error { message: String },
+}
+
+/// Dispatch to the correct provider API based on `api_mode` or model prefix.
 pub async fn call_llm(request: LlmRequest) -> Result<LlmResponse, ClassifiedError> {
+    // api_mode takes precedence over model-prefix detection
+    if let Some(ref mode) = request.api_mode {
+        match mode.as_str() {
+            "codex" | "codex_responses" => return call_codex(&request).await,
+            "anthropic" | "anthropic_messages" => return call_anthropic(&request).await,
+            _ => {} // fall through to provider detection
+        }
+    }
+
     // Parse provider from model string (e.g., "anthropic/claude-opus-4.6")
     let provider_str = request.model.split('/').next().unwrap_or("").to_lowercase();
     let provider = parse_provider(&provider_str);
@@ -89,19 +138,78 @@ pub async fn call_llm(request: LlmRequest) -> Result<LlmResponse, ClassifiedErro
     // Non-aggregator providers go direct; aggregators use OpenAI-compatible API
     match provider {
         ProviderType::Anthropic => call_anthropic(&request).await,
+        ProviderType::Codex => call_codex(&request).await,
         // All others: use OpenAI-compatible Chat Completions API
-        ProviderType::OpenAI | ProviderType::OpenRouter | ProviderType::Codex
+        ProviderType::OpenAI | ProviderType::OpenRouter
         | ProviderType::Nous | ProviderType::Gemini | ProviderType::Zai
         | ProviderType::Kimi | ProviderType::Minimax | ProviderType::Custom
         | ProviderType::Unknown => call_openai_compat(&request).await,
     }
 }
 
+/// Dispatch a **streaming** LLM call.
+///
+/// Returns an async stream of `LlmStreamEvent` deltas.  The caller is
+/// responsible for collecting text / tool_calls and invoking display
+/// callbacks (mirrors Python `_stream_response()` in `run_agent.py`).
+///
+/// Currently supports:
+/// - OpenAI-compatible Chat Completions (`stream=true`)
+/// - Codex Responses API
+///
+/// Anthropic streaming is TODO — falls back to non-streaming with a single
+/// `TextDelta` containing the full response.
+pub async fn call_llm_stream(
+    request: LlmRequest,
+) -> Result<Box<dyn futures::Stream<Item = LlmStreamEvent> + Send + Unpin>, ClassifiedError> {
+    // api_mode takes precedence
+    if let Some(ref mode) = request.api_mode {
+        match mode.as_str() {
+            "codex" | "codex_responses" => {
+                let s = call_codex_stream(&request).await?;
+                return Ok(Box::new(s));
+            }
+            _ => {}
+        }
+    }
+
+    let provider_str = request.model.split('/').next().unwrap_or("").to_lowercase();
+    let provider = parse_provider(&provider_str);
+
+    match provider {
+        ProviderType::Anthropic => {
+            let s = call_anthropic_stream(&request).await?;
+            Ok(Box::new(s))
+        }
+        ProviderType::Codex => {
+            let s = call_codex_stream(&request).await?;
+            Ok(Box::new(s))
+        }
+        _ => {
+            let s = call_openai_compat_stream(&request).await?;
+            Ok(Box::new(s))
+        }
+    }
+}
+
 /// Call OpenAI-compatible Chat Completions API.
 async fn call_openai_compat(request: &LlmRequest) -> Result<LlmResponse, ClassifiedError> {
-    let api_key = resolve_api_key(request, "OPENAI");
+    // Resolve provider from model prefix for credential pool lookup
+    let provider_str = request.model.split('/').next().unwrap_or("").to_lowercase();
+    let _provider = parse_provider(&provider_str);
+    let provider_name = provider_str.as_str();
+
+    // Resolve API key: request > credential pool > env
+    let api_key = request.api_key.clone()
+        .or_else(|| resolve_api_key_from_pool(provider_name))
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .unwrap_or_default();
+
+    // Resolve base URL: request > credential pool > env > default
     let base_url = request.base_url.clone()
-        .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+        .map(|u| crate::auxiliary_client::to_openai_base_url(&u))
+        .or_else(|| resolve_base_url_from_pool(provider_name))
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok().map(|u| crate::auxiliary_client::to_openai_base_url(&u)))
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
     // Fail-fast validation of malformed base URLs (mirrors Python f4724803)
@@ -167,50 +275,438 @@ async fn call_openai_compat(request: &LlmRequest) -> Result<LlmResponse, Classif
         }
     }
 
-    let result = client.chat().create(chat_req).await;
+    // Retry config for transport resilience (mirrors Python tenacity retry)
+    let retry_config = RetryConfig {
+        max_retries: 2,
+        base_delay: Duration::from_millis(500),
+        max_delay: Duration::from_secs(5),
+        jitter: true,
+    };
 
-    match result {
-        Ok(response) => {
-            let choice = response.choices.first();
-            let content = choice.and_then(|c| c.message.content.clone());
-            let finish_reason = choice.and_then(|c| {
-                c.finish_reason.as_ref().map(|fr| serde_json::to_value(fr).map(|v| v.to_string()).ok())
-            }).flatten();
-
-            // Extract tool calls
-            let tool_calls = choice.and_then(|c| c.message.tool_calls.as_ref()).map(|tc| {
-                tc.iter().map(|tool_call| {
-                    let function = &tool_call.function;
-                    json!({
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": function.name,
-                            "arguments": function.arguments,
-                        }
-                    })
-                }).collect::<Vec<_>>()
-            });
-
-            let usage = response.usage.as_ref().map(|u| UsageInfo {
-                prompt_tokens: u.prompt_tokens as u64,
-                completion_tokens: u.completion_tokens as u64,
-                total_tokens: u.total_tokens as u64,
-            });
-
-            Ok(LlmResponse {
-                content,
-                tool_calls,
-                model: response.model.clone(),
-                usage,
-                finish_reason,
-            })
+    let response = retry_with_backoff(&retry_config, |attempt| {
+        let client = client.clone();
+        let chat_req = chat_req.clone();
+        async move {
+            let result = client.chat().create(chat_req).await;
+            if attempt > 0 {
+                if let Err(ref e) = result {
+                    tracing::warn!(
+                        attempt, provider = %provider_name,
+                        error = %e, "OpenAI-compatible call retrying"
+                    );
+                }
+            }
+            result
         }
-        Err(e) => {
-            let status = extract_openai_status(&e);
-            Err(classify_api_error("openai_compat", &request.model, status, &e.to_string()))
+    }).await.map_err(|e| {
+        let status = extract_openai_status(&e);
+        classify_api_error("openai_compat", &request.model, status, &e.to_string())
+    })?;
+
+    let choice = response.choices.first();
+    let content = choice.and_then(|c| c.message.content.clone());
+    let finish_reason = choice.and_then(|c| {
+        c.finish_reason.as_ref().map(|fr| serde_json::to_value(fr).map(|v| v.to_string()).ok())
+    }).flatten();
+
+    // Extract tool calls
+    let tool_calls = choice.and_then(|c| c.message.tool_calls.as_ref()).map(|tc| {
+        tc.iter().map(|tool_call| {
+            let function = &tool_call.function;
+            json!({
+                "id": tool_call.id,
+                "type": "function",
+                "function": {
+                    "name": function.name,
+                    "arguments": function.arguments,
+                }
+            })
+        }).collect::<Vec<_>>()
+    });
+
+    let usage = response.usage.as_ref().map(|u| UsageInfo {
+        prompt_tokens: u.prompt_tokens as u64,
+        completion_tokens: u.completion_tokens as u64,
+        total_tokens: u.total_tokens as u64,
+    });
+
+    Ok(LlmResponse {
+        content,
+        tool_calls,
+        model: response.model.clone(),
+        usage,
+        finish_reason,
+    })
+}
+
+/// Streaming version of `call_openai_compat`.
+///
+/// Uses `async_openai::Client::chat().create_stream()` and maps
+/// `ChatCompletionChunk` events to `LlmStreamEvent`.
+async fn call_openai_compat_stream(
+    request: &LlmRequest,
+) -> Result<impl futures::Stream<Item = LlmStreamEvent> + Send, ClassifiedError> {
+    let provider_str = request.model.split('/').next().unwrap_or("").to_lowercase();
+    let provider_name = provider_str.as_str();
+
+    let api_key = request.api_key.clone()
+        .or_else(|| resolve_api_key_from_pool(provider_name))
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .unwrap_or_default();
+
+    let base_url = request.base_url.clone()
+        .map(|u| crate::auxiliary_client::to_openai_base_url(&u))
+        .or_else(|| resolve_base_url_from_pool(provider_name))
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok().map(|u| crate::auxiliary_client::to_openai_base_url(&u)))
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    let config = async_openai::config::OpenAIConfig::new()
+        .with_api_key(&api_key)
+        .with_api_base(&base_url);
+    let client = build_client(request, &config)?;
+
+    let model = request.model
+        .strip_prefix("openai/")
+        .or_else(|| request.model.strip_prefix("openrouter/"))
+        .or_else(|| request.model.strip_prefix("nous/"))
+        .or_else(|| request.model.strip_prefix("codex/"))
+        .or_else(|| request.model.strip_prefix("gemini/"))
+        .or_else(|| request.model.strip_prefix("deepseek/"))
+        .or_else(|| request.model.strip_prefix("groq/"))
+        .unwrap_or(&request.model);
+
+    let messages = build_openai_messages(&request.messages)?;
+
+    let mut builder = async_openai::types::CreateChatCompletionRequestArgs::default();
+    builder.model(model).messages(messages).stream(true);
+
+    if let Some(t) = request.temperature {
+        builder.temperature(t as f32);
+    }
+    if let Some(m) = request.max_tokens {
+        builder.max_tokens(m as u32);
+    }
+    if let Some(ref tools) = request.tools {
+        let openai_tools: Vec<async_openai::types::ChatCompletionTool> = tools
+            .iter()
+            .filter_map(|t| serde_json::from_value(t.clone()).ok())
+            .collect();
+        if !openai_tools.is_empty() {
+            builder.tools(openai_tools);
         }
     }
+
+    let chat_req = builder.build().map_err(|e| {
+        classify_api_error("openai_compat", &request.model, None,
+            &format!("Failed to build stream request: {e}"))
+    })?;
+
+    let stream = client.chat().create_stream(chat_req).await.map_err(|e| {
+        classify_api_error("openai_compat", &request.model, extract_openai_status(&e), &e.to_string())
+    })?;
+
+    // Accumulate partial tool calls across chunks and emit multiple events
+    // from a single chunk using a channel-based bridge.
+    #[derive(Default)]
+    struct PartialToolCall {
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    }
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<LlmStreamEvent>();
+
+    tokio::spawn(async move {
+        let mut tc_state: HashMap<u32, PartialToolCall> = HashMap::new();
+        let mut stream = stream;
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    let usage = chunk.usage.as_ref().map(|u| UsageInfo {
+                        prompt_tokens: u.prompt_tokens as u64,
+                        completion_tokens: u.completion_tokens as u64,
+                        total_tokens: u.total_tokens as u64,
+                    });
+
+                    let choice = match chunk.choices.first() {
+                        Some(c) => c,
+                        None => {
+                            if usage.is_some() {
+                                let _ = tx.unbounded_send(LlmStreamEvent::Done { usage });
+                            }
+                            continue;
+                        }
+                    };
+
+                    let delta = &choice.delta;
+
+                    // Text delta
+                    if let Some(content) = delta.content.as_ref() {
+                        if !content.is_empty() {
+                            let _ = tx.unbounded_send(LlmStreamEvent::TextDelta { delta: content.clone() });
+                        }
+                    }
+
+                    // Tool call deltas — accumulate by index
+                    if let Some(ref tcs) = delta.tool_calls {
+                        for tc in tcs {
+                            let idx = tc.index;
+                            let partial = tc_state.entry(idx).or_default();
+                            let had_name_before = partial.name.is_some();
+                            if let Some(ref id) = tc.id {
+                                partial.id = Some(id.clone());
+                            }
+                            if let Some(ref func) = tc.function {
+                                if let Some(ref name) = func.name {
+                                    partial.name = Some(name.clone());
+                                }
+                                if let Some(ref args) = func.arguments {
+                                    partial.arguments.push_str(args);
+                                }
+                            }
+                            // Fire ToolGenStarted when name first becomes available
+                            if !had_name_before && partial.name.is_some() {
+                                if let Some(ref name) = partial.name {
+                                    let _ = tx.unbounded_send(LlmStreamEvent::ToolGenStarted {
+                                        name: name.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Finish reason
+                    if let Some(ref finish) = choice.finish_reason {
+                        if matches!(finish, async_openai::types::FinishReason::Stop) {
+                            let _ = tx.unbounded_send(LlmStreamEvent::Done { usage });
+                        } else if matches!(finish, async_openai::types::FinishReason::ToolCalls) {
+                            let mut sorted: Vec<_> = tc_state.drain().collect();
+                            sorted.sort_by_key(|(k, _)| *k);
+                            for (_, partial) in sorted {
+                                if let (Some(id), Some(name)) = (partial.id, partial.name) {
+                                    let _ = tx.unbounded_send(LlmStreamEvent::ToolCall {
+                                        id,
+                                        name,
+                                        arguments: partial.arguments,
+                                    });
+                                }
+                            }
+                            let _ = tx.unbounded_send(LlmStreamEvent::Done { usage });
+                        }
+                    } else if usage.is_some() {
+                        let _ = tx.unbounded_send(LlmStreamEvent::Done { usage });
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.unbounded_send(LlmStreamEvent::Error {
+                        message: format!("OpenAI stream error: {e}"),
+                    });
+                    break;
+                }
+            }
+        }
+
+        // Stream ended — drain any remaining tool calls
+        let mut sorted: Vec<_> = tc_state.drain().collect();
+        sorted.sort_by_key(|(k, _)| *k);
+        for (_, partial) in sorted {
+            if let (Some(id), Some(name)) = (partial.id, partial.name) {
+                let _ = tx.unbounded_send(LlmStreamEvent::ToolCall {
+                    id,
+                    name,
+                    arguments: partial.arguments,
+                });
+            }
+        }
+    });
+
+    let stream = rx.filter(|evt| {
+        std::future::ready(!matches!(evt, LlmStreamEvent::TextDelta { delta } if delta.is_empty()))
+    });
+
+    // Filter out empty text deltas
+    let stream = stream.filter(|evt| {
+        std::future::ready(!matches!(evt, LlmStreamEvent::TextDelta { delta } if delta.is_empty()))
+    });
+
+    Ok(stream)
+}
+
+/// Call OpenAI Codex Responses API.
+///
+/// Converts chat messages to Responses API input items, streams the response,
+/// and maps events back to the standard `LlmResponse` shape.
+async fn call_codex(request: &LlmRequest) -> Result<LlmResponse, ClassifiedError> {
+    let api_key = request.api_key.clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .unwrap_or_default();
+    let base_url = request.base_url.clone()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    // Extract system prompt as instructions; everything else becomes input items
+    let mut instructions = String::new();
+    let mut chat_messages = Vec::new();
+    for msg in &request.messages {
+        if let Some(role) = msg.get("role").and_then(Value::as_str) {
+            if role == "system" {
+                if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                    instructions.push_str(content);
+                }
+            } else {
+                chat_messages.push(msg.clone());
+            }
+        }
+    }
+
+    let input = crate::codex::chat_to_responses_input(&chat_messages);
+
+    let mut api_kwargs = json!({
+        "model": request.model.strip_prefix("codex/").unwrap_or(&request.model),
+        "instructions": instructions,
+        "input": input,
+        "store": false,
+    });
+    if let Some(t) = request.temperature {
+        api_kwargs["temperature"] = json!(t);
+    }
+    if let Some(m) = request.max_tokens {
+        api_kwargs["max_output_tokens"] = json!(m);
+    }
+
+    let params = crate::codex::preflight_codex_kwargs(&api_kwargs, true)
+        .map_err(|e| classify_api_error("codex", &request.model, None, &e.to_string()))?;
+
+    let timeout = request.timeout_secs.unwrap_or(300);
+    let mut stream = crate::codex::call_codex_responses_stream(&params, &base_url, &api_key, timeout)
+        .await?;
+
+    use futures::StreamExt;
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            crate::codex::CodexStreamEvent::TextDelta { delta } => {
+                content_parts.push(delta);
+            }
+            crate::codex::CodexStreamEvent::FunctionCall { call_id, name, arguments } => {
+                tool_calls.push(json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                }));
+            }
+            crate::codex::CodexStreamEvent::ResponseCompleted { .. } => break,
+            crate::codex::CodexStreamEvent::ResponseFailed { response } => {
+                let msg = response.get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("Codex response failed");
+                return Err(classify_api_error("codex", &request.model, None, msg));
+            }
+            crate::codex::CodexStreamEvent::ResponseIncomplete { .. } => break,
+            _ => {}
+        }
+    }
+
+    let content = if content_parts.is_empty() {
+        None
+    } else {
+        Some(content_parts.join(""))
+    };
+
+    Ok(LlmResponse {
+        content,
+        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+        model: request.model.clone(),
+        usage: None,
+        finish_reason: None,
+    })
+}
+
+/// Streaming version of `call_codex`.
+///
+/// Returns a stream of `LlmStreamEvent` mapped from `CodexStreamEvent`s.
+async fn call_codex_stream(
+    request: &LlmRequest,
+) -> Result<impl futures::Stream<Item = LlmStreamEvent> + Send, ClassifiedError> {
+    let api_key = request.api_key.clone()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .unwrap_or_default();
+    let base_url = request.base_url.clone()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    let mut instructions = String::new();
+    let mut chat_messages = Vec::new();
+    for msg in &request.messages {
+        if let Some(role) = msg.get("role").and_then(Value::as_str) {
+            if role == "system" {
+                if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                    instructions.push_str(content);
+                }
+            } else {
+                chat_messages.push(msg.clone());
+            }
+        }
+    }
+
+    let input = crate::codex::chat_to_responses_input(&chat_messages);
+
+    let mut api_kwargs = json!({
+        "model": request.model.strip_prefix("codex/").unwrap_or(&request.model),
+        "instructions": instructions,
+        "input": input,
+        "store": false,
+    });
+    if let Some(t) = request.temperature {
+        api_kwargs["temperature"] = json!(t);
+    }
+    if let Some(m) = request.max_tokens {
+        api_kwargs["max_output_tokens"] = json!(m);
+    }
+
+    let params = crate::codex::preflight_codex_kwargs(&api_kwargs, true)
+        .map_err(|e| classify_api_error("codex", &request.model, None, &e.to_string()))?;
+
+    let timeout = request.timeout_secs.unwrap_or(300);
+    let codex_stream = crate::codex::call_codex_responses_stream(&params, &base_url, &api_key, timeout)
+        .await?;
+
+    let llm_stream = codex_stream.map(|evt| match evt {
+        crate::codex::CodexStreamEvent::TextDelta { delta } => {
+            LlmStreamEvent::TextDelta { delta }
+        }
+        crate::codex::CodexStreamEvent::ReasoningDelta { delta } => {
+            LlmStreamEvent::ReasoningDelta { delta }
+        }
+        crate::codex::CodexStreamEvent::FunctionCall { call_id, name, arguments } => {
+            LlmStreamEvent::ToolCall { id: call_id, name, arguments }
+        }
+        crate::codex::CodexStreamEvent::ResponseCompleted { .. } => {
+            LlmStreamEvent::Done { usage: None }
+        }
+        crate::codex::CodexStreamEvent::ResponseIncomplete { .. } => {
+            LlmStreamEvent::Done { usage: None }
+        }
+        crate::codex::CodexStreamEvent::ResponseFailed { response } => {
+            let msg = response.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("Codex response failed")
+                .to_string();
+            LlmStreamEvent::Error { message: msg }
+        }
+        _ => LlmStreamEvent::TextDelta { delta: String::new() },
+    });
+
+    // Filter empty text deltas
+    let llm_stream = llm_stream.filter(|evt| {
+        std::future::ready(!matches!(evt, LlmStreamEvent::TextDelta { delta } if delta.is_empty()))
+    });
+
+    Ok(llm_stream)
 }
 
 /// Send OpenRouter request with provider preferences via raw HTTP.
@@ -294,9 +790,15 @@ async fn send_openrouter_with_provider_prefs(
 
 /// Call Anthropic Messages API.
 async fn call_anthropic(request: &LlmRequest) -> Result<LlmResponse, ClassifiedError> {
-    let api_key = resolve_api_key(request, "ANTHROPIC");
+    // Resolve API key: request > credential pool > env
+    let api_key = request.api_key.clone()
+        .or_else(|| resolve_api_key_from_pool("anthropic"))
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .unwrap_or_default();
     let base_url = request.base_url.clone()
-        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok());
+        .map(|u| crate::auxiliary_client::to_openai_base_url(&u))
+        .or_else(|| resolve_base_url_from_pool("anthropic"))
+        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok().map(|u| crate::auxiliary_client::to_openai_base_url(&u)));
 
     // Convert messages using the Anthropic adapter
     let (system_prompt, messages) = crate::anthropic::convert_messages(&request.messages, true);
@@ -315,15 +817,116 @@ async fn call_anthropic(request: &LlmRequest) -> Result<LlmResponse, ClassifiedE
         thinking_enabled: false,
         thinking_effort: None,
         fast_mode: false,
+        stream: false,
     };
 
     let (body_str, headers, url) = builder.build();
+    let timeout_secs = request.timeout_secs.unwrap_or(300);
 
-    // Set default user-agent at the client level to avoid empty user-agent
-    // issues with some proxies. The headers HashMap may override this.
+    // Retry config for transport resilience
+    let retry_config = RetryConfig {
+        max_retries: 2,
+        base_delay: Duration::from_millis(500),
+        max_delay: Duration::from_secs(5),
+        jitter: true,
+    };
+
+    let (status, text) = retry_with_backoff(&retry_config, |attempt| {
+        let body_str = body_str.clone();
+        let headers = headers.clone();
+        let url = url.clone();
+        let model = request.model.clone();
+        async move {
+            // Set default user-agent at the client level to avoid empty user-agent
+            // issues with some proxies. The headers HashMap may override this.
+            let client = HttpClient::builder()
+                .user_agent("reqwest/0.12.12")
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .map_err(|e| classify_api_error("anthropic", &model, None,
+                    &format!("Failed to build HTTP client: {e}")))?;
+
+            let mut req = client.post(&url);
+            for (key, value) in &headers {
+                req = req.header(key, value);
+            }
+
+            if attempt == 0 {
+                tracing::debug!("Anthropic request: model={}, url={}, body_size={}",
+                    model, url, body_str.len());
+            }
+
+            let resp = req.body(body_str).send().await.map_err(|e| {
+                classify_api_error("anthropic", &model, None, &format!("Request failed: {e}"))
+            })?;
+
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+
+            // Only retry on transport errors (5xx / timeout / connection issues)
+            if status >= 500 || status == 429 || status == 408 {
+                return Err(classify_api_error("anthropic", &model, Some(status), &text));
+            }
+
+            Ok((status, text))
+        }
+    }).await?;
+
+    if status >= 400 {
+        return Err(classify_api_error("anthropic", &request.model,
+            Some(status), &text));
+    }
+
+    let json: Value = serde_json::from_str(&text).map_err(|e| {
+        classify_api_error("anthropic", &request.model, Some(status),
+            &format!("Failed to parse response: {e}"))
+    })?;
+
+    parse_anthropic_response(&json, &request.model)
+}
+
+/// Streaming variant of `call_anthropic`.
+///
+/// Sends a streaming request to Anthropic Messages API and parses SSE
+/// events into `LlmStreamEvent`s. Mirrors Python `_call_anthropic` in
+/// `run_agent.py:~5515`.
+async fn call_anthropic_stream(
+    request: &LlmRequest,
+) -> Result<impl futures::Stream<Item = LlmStreamEvent> + Send, ClassifiedError> {
+    let api_key = request.api_key.clone()
+        .or_else(|| resolve_api_key_from_pool("anthropic"))
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .unwrap_or_default();
+    let base_url = request.base_url.clone()
+        .map(|u| crate::auxiliary_client::to_openai_base_url(&u))
+        .or_else(|| resolve_base_url_from_pool("anthropic"))
+        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok().map(|u| crate::auxiliary_client::to_openai_base_url(&u)));
+
+    let (system_prompt, messages) = crate::anthropic::convert_messages(&request.messages, true);
+
+    let builder = crate::anthropic::AnthropicRequestBuilder {
+        model: request.model.clone(),
+        messages,
+        system_prompt,
+        max_tokens: request.max_tokens.unwrap_or(
+            crate::anthropic::get_anthropic_max_output(&request.model),
+        ),
+        temperature: request.temperature,
+        tools: request.tools.clone(),
+        api_key,
+        base_url,
+        thinking_enabled: false,
+        thinking_effort: None,
+        fast_mode: false,
+        stream: true,
+    };
+
+    let (body_str, headers, url) = builder.build();
+    let timeout_secs = request.timeout_secs.unwrap_or(300);
+
     let client = HttpClient::builder()
         .user_agent("reqwest/0.12.12")
-        .timeout(Duration::from_secs(request.timeout_secs.unwrap_or(300)))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| classify_api_error("anthropic", &request.model, None,
             &format!("Failed to build HTTP client: {e}")))?;
@@ -333,33 +936,196 @@ async fn call_anthropic(request: &LlmRequest) -> Result<LlmResponse, ClassifiedE
         req = req.header(key, value);
     }
 
-    tracing::debug!("Anthropic request: model={}, url={}, body_size={}",
-        request.model, url, body_str.len());
+    let resp = req.body(body_str).send().await.map_err(|e| {
+        classify_api_error("anthropic", &request.model, None, &format!("Request failed: {e}"))
+    })?;
 
-    let resp = req.body(body_str).send().await;
-
-    match resp {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
-
-            if status >= 400 {
-                return Err(classify_api_error("anthropic", &request.model,
-                    Some(status), &text));
-            }
-
-            let json: Value = serde_json::from_str(&text).map_err(|e| {
-                classify_api_error("anthropic", &request.model, Some(status),
-                    &format!("Failed to parse response: {e}"))
-            })?;
-
-            parse_anthropic_response(&json, &request.model)
-        }
-        Err(e) => {
-            Err(classify_api_error("anthropic", &request.model, None,
-                &format!("Request failed: {e}")))
-        }
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_api_error("anthropic", &request.model, Some(status), &text));
     }
+
+    let body = resp.bytes_stream();
+    let (tx, rx) = futures::channel::mpsc::unbounded::<LlmStreamEvent>();
+
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
+        // index -> (id, name, accumulated_json)
+        let mut tool_inputs: HashMap<usize, (String, String, String)> = HashMap::new();
+
+        use futures::StreamExt;
+        let mut body = body;
+
+        while let Some(result) = body.next().await {
+            let bytes = match result {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.unbounded_send(LlmStreamEvent::Error {
+                        message: format!("Anthropic stream error: {e}"),
+                    });
+                    break;
+                }
+            };
+
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            // Process complete SSE messages (blank-line delimited)
+            loop {
+                let mut end = 0usize;
+                let mut found = false;
+                while end < buffer.len() {
+                    if end + 1 < buffer.len() && &buffer[end..end + 2] == "\n\n" {
+                        end += 2;
+                        found = true;
+                        break;
+                    }
+                    if end + 1 < buffer.len() && &buffer[end..end + 2] == "\r\n" {
+                        if end + 3 < buffer.len() && &buffer[end + 2..end + 4] == "\r\n" {
+                            end += 4;
+                            found = true;
+                            break;
+                        }
+                    }
+                    end += 1;
+                }
+
+                if !found {
+                    break;
+                }
+
+                let chunk = buffer[..end].to_string();
+                buffer = buffer[end..].to_string();
+
+                if chunk.trim().is_empty() {
+                    continue;
+                }
+
+                let mut event_type = None;
+                let mut data_str = None;
+                for line in chunk.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(rest) = line.strip_prefix("event: ") {
+                        event_type = Some(rest.to_string());
+                    } else if let Some(rest) = line.strip_prefix("data: ") {
+                        data_str = Some(rest.to_string());
+                    }
+                }
+
+                if data_str.as_deref() == Some("[DONE]") {
+                    continue;
+                }
+
+                let data: Value = match data_str.and_then(|s| serde_json::from_str(&s).ok()) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let evt_type = event_type.as_deref().unwrap_or("");
+                if evt_type == "ping" {
+                    continue;
+                }
+
+                match data.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        if let Some(msg) = data.get("message") {
+                            if let Some(u) = msg.get("usage") {
+                                input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                                output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            }
+                        }
+                    }
+                    Some("content_block_start") => {
+                        if let Some(block) = data.get("content_block") {
+                            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                let idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                let id = block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                                let name = block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                                if !name.is_empty() {
+                                    let _ = tx.unbounded_send(LlmStreamEvent::ToolGenStarted {
+                                        name: name.clone(),
+                                    });
+                                }
+                                tool_inputs.insert(idx, (id, name, String::new()));
+                            }
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        if let Some(delta) = data.get("delta") {
+                            match delta.get("type").and_then(Value::as_str) {
+                                Some("text_delta") => {
+                                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                        let _ = tx.unbounded_send(LlmStreamEvent::TextDelta {
+                                            delta: text.to_string(),
+                                        });
+                                    }
+                                }
+                                Some("thinking_delta") => {
+                                    if let Some(t) = delta.get("thinking").and_then(Value::as_str) {
+                                        let _ = tx.unbounded_send(LlmStreamEvent::ReasoningDelta {
+                                            delta: t.to_string(),
+                                        });
+                                    }
+                                }
+                                Some("input_json_delta") => {
+                                    let idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                                    if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                                        if let Some((_, _, ref mut acc)) = tool_inputs.get_mut(&idx) {
+                                            acc.push_str(partial);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        let idx = data.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        if let Some((id, name, args)) = tool_inputs.remove(&idx) {
+                            let _ = tx.unbounded_send(LlmStreamEvent::ToolCall {
+                                id,
+                                name,
+                                arguments: args,
+                            });
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(u) = data.get("usage") {
+                            output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        }
+                    }
+                    Some("message_stop") => {
+                        let usage = Some(UsageInfo {
+                            prompt_tokens: input_tokens,
+                            completion_tokens: output_tokens,
+                            total_tokens: input_tokens + output_tokens,
+                        });
+                        let _ = tx.unbounded_send(LlmStreamEvent::Done { usage });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Stream ended — ensure Done is sent even if message_stop was missed
+        let usage = Some(UsageInfo {
+            prompt_tokens: input_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: input_tokens + output_tokens,
+        });
+        let _ = tx.unbounded_send(LlmStreamEvent::Done { usage });
+    });
+
+    let stream = rx.filter(|evt| {
+        std::future::ready(!matches!(evt, LlmStreamEvent::TextDelta { delta } if delta.is_empty()))
+    });
+
+    Ok(stream)
 }
 
 fn parse_anthropic_response(json: &Value, model: &str) -> Result<LlmResponse, ClassifiedError> {
@@ -608,10 +1374,28 @@ fn build_client(
     }
 }
 
-fn resolve_api_key(request: &LlmRequest, env_prefix: &str) -> String {
-    request.api_key.clone()
-        .or_else(|| std::env::var(format!("{env_prefix}_API_KEY")).ok())
-        .unwrap_or_default()
+/// Resolve API key from credential pool.
+fn resolve_api_key_from_pool(provider: &str) -> Option<String> {
+    let pool = load_from_env(provider)?;
+    if !pool.has_credentials() {
+        return None;
+    }
+    let entry = pool.select()?;
+    let key = entry.runtime_api_key();
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// Resolve base URL from credential pool.
+fn resolve_base_url_from_pool(provider: &str) -> Option<String> {
+    let pool = load_from_env(provider)?;
+    if !pool.has_credentials() {
+        return None;
+    }
+    let entry = pool.select()?;
+    entry.runtime_base_url().map(|u| crate::auxiliary_client::to_openai_base_url(u))
 }
 
 fn extract_openai_status(err: &async_openai::error::OpenAIError) -> Option<u16> {
@@ -762,6 +1546,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .unwrap();
@@ -835,6 +1620,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .unwrap();
@@ -882,6 +1668,7 @@ mod tests {
             api_key: Some("test-anthropic-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .unwrap();
@@ -937,6 +1724,7 @@ mod tests {
             api_key: Some("anthropic-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .unwrap();
@@ -970,6 +1758,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -977,7 +1766,7 @@ mod tests {
         assert_eq!(err.reason, FailoverReason::Billing);
         assert!(!err.retryable);
         assert!(err.should_fallback);
-        assert!(err.should_compress);
+        assert!(err.should_rotate_credential); // billing → rotate keys
     }
 
     /// Test HTTP rate limit via message pattern matching (no status code).
@@ -1013,6 +1802,7 @@ mod tests {
             api_key: Some("invalid-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -1044,6 +1834,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -1073,6 +1864,7 @@ mod tests {
             api_key: Some("key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -1102,6 +1894,7 @@ mod tests {
             api_key: Some("key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -1133,6 +1926,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -1162,6 +1956,7 @@ mod tests {
             api_key: Some("key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await
         .expect_err("Expected error");
@@ -1207,6 +2002,7 @@ mod tests {
             api_key: Some("or-key".to_string()),
             timeout_secs: Some(10),
             provider_preferences: None,
+            api_mode: None,
         })
         .await;
 
@@ -1230,6 +2026,7 @@ mod tests {
             api_key: Some("test-key".to_string()),
             timeout_secs: None,
             provider_preferences: None,
+            api_mode: None,
         })
         .await;
 
