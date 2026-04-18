@@ -1274,4 +1274,100 @@ mod tests {
         let cfg = WhatsAppConfig::default();
         assert_eq!(cfg.bridge_port, DEFAULT_BRIDGE_PORT);
     }
+
+    #[test]
+    fn test_clean_bot_mention_text() {
+        let adapter = WhatsAppAdapter::new(WhatsAppConfig::default());
+        assert_eq!(
+            adapter.clean_bot_mention_text("Hello @bot how are you?", &["bot@s.whatsapp.net".to_string()]),
+            "Hello how are you?"
+        );
+        assert_eq!(
+            adapter.clean_bot_mention_text("No mentions here", &["bot@s.whatsapp.net".to_string()]),
+            "No mentions here"
+        );
+    }
+
+    #[test]
+    fn test_should_process_message_dm() {
+        let adapter = WhatsAppAdapter::new(WhatsAppConfig::default());
+        let dm_msg = serde_json::json!({ "isGroup": false, "chatId": "123@s.whatsapp.net" });
+        assert!(adapter.should_process_message(&dm_msg));
+    }
+
+    #[test]
+    fn test_should_process_message_group_require_mention() {
+        let mut config = WhatsAppConfig::default();
+        config.require_mention = true;
+        let adapter = WhatsAppAdapter::new(config);
+
+        // Group message without mention
+        let group_msg = serde_json::json!({
+            "isGroup": true,
+            "chatId": "123@g.us",
+            "body": "Hello everyone",
+        });
+        assert!(!adapter.should_process_message(&group_msg));
+
+        // Group message with slash command
+        let slash_msg = serde_json::json!({
+            "isGroup": true,
+            "chatId": "123@g.us",
+            "body": "/help",
+        });
+        assert!(adapter.should_process_message(&slash_msg));
+    }
+
+    #[test]
+    fn test_should_process_message_free_response_chat() {
+        let mut config = WhatsAppConfig::default();
+        config.require_mention = true;
+        config.free_response_chats = vec!["123@g.us".to_string()];
+        let adapter = WhatsAppAdapter::new(config);
+
+        let group_msg = serde_json::json!({
+            "isGroup": true,
+            "chatId": "123@g.us",
+            "body": "Hello everyone",
+        });
+        assert!(adapter.should_process_message(&group_msg));
+    }
+
+    #[test]
+    fn test_message_mentions_bot_mentioned_ids() {
+        let adapter = WhatsAppAdapter::new(WhatsAppConfig::default());
+        let msg = serde_json::json!({
+            "botIds": ["bot@s.whatsapp.net"],
+            "mentionedIds": ["bot@s.whatsapp.net"],
+            "body": "Hello",
+        });
+        assert!(adapter.message_mentions_bot(&msg));
+    }
+
+    #[test]
+    fn test_message_mentions_bot_body() {
+        let adapter = WhatsAppAdapter::new(WhatsAppConfig::default());
+        let msg = serde_json::json!({
+            "botIds": ["bot123@s.whatsapp.net"],
+            "mentionedIds": [],
+            "body": "Hey bot123 can you help?",
+        });
+        assert!(adapter.message_mentions_bot(&msg));
+    }
+
+    #[test]
+    fn test_message_is_reply_to_bot() {
+        let adapter = WhatsAppAdapter::new(WhatsAppConfig::default());
+        let msg = serde_json::json!({
+            "botIds": ["bot@s.whatsapp.net"],
+            "quotedParticipant": "bot@s.whatsapp.net",
+        });
+        assert!(adapter.message_is_reply_to_bot(&msg));
+
+        let msg_not_reply = serde_json::json!({
+            "botIds": ["bot@s.whatsapp.net"],
+            "quotedParticipant": "user@s.whatsapp.net",
+        });
+        assert!(!adapter.message_is_reply_to_bot(&msg_not_reply));
+    }
 }

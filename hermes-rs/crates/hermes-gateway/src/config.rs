@@ -68,6 +68,37 @@ impl std::fmt::Display for Platform {
     }
 }
 
+impl Platform {
+    /// Parse a platform name string into a `Platform` enum variant.
+    ///
+    /// Returns `None` for unknown names. Names are expected in snake_case
+    /// (e.g. `"api_server"`, `"wecom_callback"`).
+    pub fn from_str(name: &str) -> Option<Self> {
+        match name {
+            "local" => Some(Self::Local),
+            "telegram" => Some(Self::Telegram),
+            "discord" => Some(Self::Discord),
+            "whatsapp" => Some(Self::Whatsapp),
+            "slack" => Some(Self::Slack),
+            "signal" => Some(Self::Signal),
+            "mattermost" => Some(Self::Mattermost),
+            "matrix" => Some(Self::Matrix),
+            "homeassistant" => Some(Self::Homeassistant),
+            "email" => Some(Self::Email),
+            "sms" => Some(Self::Sms),
+            "dingtalk" => Some(Self::Dingtalk),
+            "api_server" => Some(Self::ApiServer),
+            "webhook" => Some(Self::Webhook),
+            "feishu" => Some(Self::Feishu),
+            "wecom" => Some(Self::Wecom),
+            "wecom_callback" => Some(Self::WecomCallback),
+            "weixin" => Some(Self::Weixin),
+            "bluebubbles" => Some(Self::Bluebubbles),
+            _ => None,
+        }
+    }
+}
+
 // ── HomeChannel ────────────────────────────────────────────────────────────
 
 /// Default destination for a platform.

@@ -22,6 +22,7 @@ use crate::platforms::discord::{DiscordAdapter, DiscordConfig};
 use crate::platforms::feishu::{FeishuAdapter, FeishuConfig, FeishuConnectionMode, FeishuMessageEvent};
 use crate::platforms::slack::{SlackAdapter, SlackConfig, SlackMessageEvent};
 use crate::platforms::telegram::{TelegramAdapter, TelegramConfig, TelegramMessageEvent};
+use crate::platforms::webhook::{WebhookAdapter, WebhookConfig};
 use crate::platforms::wecom::{WeComAdapter, WeComConfig};
 use crate::platforms::weixin::{WeixinAdapter, WeixinConfig, WeixinMessageEvent};
 use crate::platforms::whatsapp::{WhatsAppAdapter, WhatsAppConfig, WhatsAppMessageEvent};
@@ -98,6 +99,7 @@ struct HealthCheckStatus {
     dingtalk: bool,
     wecom: bool,
     whatsapp: bool,
+    webhook: bool,
 }
 
 /// Health check HTTP handler.
@@ -114,6 +116,7 @@ async fn health_handler(
     platforms.insert("dingtalk".into(), serde_json::json!(status.dingtalk));
     platforms.insert("wecom".into(), serde_json::json!(status.wecom));
     platforms.insert("whatsapp".into(), serde_json::json!(status.whatsapp));
+    platforms.insert("webhook".into(), serde_json::json!(status.webhook));
 
     let body = serde_json::json!({
         "status": if status.running.load(Ordering::SeqCst) { "ok" } else { "stopped" },
@@ -134,6 +137,7 @@ pub struct GatewayRunner {
     dingtalk_adapter: Option<Arc<DingtalkAdapter>>,
     wecom_adapter: Option<Arc<WeComAdapter>>,
     whatsapp_adapter: Option<Arc<WhatsAppAdapter>>,
+    webhook_adapter: Option<Arc<WebhookAdapter>>,
     api_server_shutdown_tx: Vec<oneshot::Sender<()>>,
     dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
     feishu_shutdown_tx: Vec<oneshot::Sender<()>>,
@@ -141,6 +145,7 @@ pub struct GatewayRunner {
     discord_shutdown_tx: Vec<oneshot::Sender<()>>,
     slack_shutdown_tx: Vec<oneshot::Sender<()>>,
     whatsapp_shutdown_tx: Vec<oneshot::Sender<()>>,
+    webhook_shutdown_tx: Vec<oneshot::Sender<()>>,
     /// Health check server shutdown sender.
     health_check_shutdown_tx: Option<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
@@ -168,6 +173,7 @@ impl GatewayRunner {
             dingtalk_adapter: None,
             wecom_adapter: None,
             whatsapp_adapter: None,
+            webhook_adapter: None,
             api_server_shutdown_tx: Vec::new(),
             dingtalk_shutdown_tx: Vec::new(),
             feishu_shutdown_tx: Vec::new(),
@@ -175,6 +181,7 @@ impl GatewayRunner {
             discord_shutdown_tx: Vec::new(),
             slack_shutdown_tx: Vec::new(),
             whatsapp_shutdown_tx: Vec::new(),
+            webhook_shutdown_tx: Vec::new(),
             health_check_shutdown_tx: None,
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
@@ -287,6 +294,11 @@ impl GatewayRunner {
                         warn!("WhatsApp enabled but not configured (missing bridge script)");
                     }
                 }
+                Platform::Webhook => {
+                    let webhook_config = WebhookConfig::from_env();
+                    info!("Initializing Webhook adapter...");
+                    self.webhook_adapter = Some(Arc::new(WebhookAdapter::new(webhook_config)));
+                }
                 _ => {
                     warn!("Platform {} not yet implemented in Rust", entry.platform.as_str());
                 }
@@ -302,12 +314,13 @@ impl GatewayRunner {
         let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
         let wecom_count = self.wecom_adapter.is_some() as usize;
         let whatsapp_count = self.whatsapp_adapter.is_some() as usize;
+        let webhook_count = self.webhook_adapter.is_some() as usize;
         let feishu_webhook_count = self.feishu_adapter.as_ref()
             .map(|a| matches!(a.config.connection_mode, FeishuConnectionMode::Webhook))
             .unwrap_or(false) as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
-            feishu_count + weixin_count + telegram_count + discord_count + slack_count + api_server_count + dingtalk_count + wecom_count + whatsapp_count
+            feishu_count + weixin_count + telegram_count + discord_count + slack_count + api_server_count + dingtalk_count + wecom_count + whatsapp_count + webhook_count
         );
         if feishu_webhook_count > 0 {
             info!("Feishu webhook: port={} path={}",
@@ -619,6 +632,28 @@ impl GatewayRunner {
             }
         }
 
+        // Webhook: start HTTP server
+        if let Some(adapter) = &self.webhook_adapter {
+            if let Err(e) = adapter.validate_routes().await {
+                error!("Webhook validation failed: {e}");
+            } else {
+                let adapter = adapter.clone();
+                let handler = self.message_handler.clone();
+                let running = self.running.clone();
+                let running_sessions = self.running_sessions.clone();
+                let busy_ack_ts = self.busy_ack_ts.clone();
+                let session_store = self.session_store.clone();
+                let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = adapter.run(handler, running, running_sessions, busy_ack_ts, session_store, shutdown_rx).await {
+                        error!("Webhook server error: {e}");
+                    }
+                });
+                self.webhook_shutdown_tx.push(shutdown_tx);
+                handles.push(handle);
+            }
+        }
+
         // Health check endpoint
         let health_port = std::env::var("HERMES_GATEWAY_HEALTH_PORT")
             .ok()
@@ -635,6 +670,7 @@ impl GatewayRunner {
             dingtalk: self.dingtalk_adapter.is_some(),
             wecom: self.wecom_adapter.is_some(),
             whatsapp: self.whatsapp_adapter.is_some(),
+            webhook: self.webhook_adapter.is_some(),
         };
         let (health_shutdown_tx, health_shutdown_rx) = oneshot::channel::<()>();
         let health_handle = tokio::spawn(async move {
@@ -714,6 +750,11 @@ impl GatewayRunner {
                 adapter.disconnect().await;
             });
         }
+        // Trigger Webhook graceful shutdown
+        let senders = std::mem::take(&mut self.webhook_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
         // Trigger health check server graceful shutdown
         if let Some(tx) = self.health_check_shutdown_tx.take() {
             let _ = tx.send(());
@@ -743,6 +784,7 @@ impl GatewayRunner {
             dingtalk_configured: self.dingtalk_adapter.is_some(),
             wecom_configured: self.wecom_adapter.is_some(),
             whatsapp_configured: self.whatsapp_adapter.is_some(),
+            webhook_configured: self.webhook_adapter.is_some(),
             platform_count: self.config.platforms.iter().filter(|p| p.enabled).count(),
         }
     }
@@ -761,6 +803,7 @@ pub struct GatewayStatus {
     pub dingtalk_configured: bool,
     pub wecom_configured: bool,
     pub whatsapp_configured: bool,
+    pub webhook_configured: bool,
     pub platform_count: usize,
 }
 
@@ -1139,6 +1182,7 @@ pub fn load_gateway_config() -> GatewayConfig {
                                     "slack" => Platform::Slack,
                                     "api_server" => Platform::ApiServer,
                                     "whatsapp" => Platform::Whatsapp,
+                                    "webhook" => Platform::Webhook,
                                     _ => Platform::Local,
                                 };
                                 let cfg = PlatformConfig::default();
@@ -1216,6 +1260,13 @@ pub fn load_gateway_config() -> GatewayConfig {
         if std::env::var("SLACK_BOT_TOKEN").is_ok() {
             platforms.push(PlatformConfigEntry {
                 platform: Platform::Slack,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
+        if std::env::var("WEBHOOK_PORT").is_ok() || std::env::var("WEBHOOK_SECRET").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Webhook,
                 enabled: true,
                 config: PlatformConfig::default(),
             });
@@ -1418,5 +1469,57 @@ mod tests {
         assert!(!status.dingtalk_configured);
         assert!(!status.wecom_configured);
         assert!(!status.whatsapp_configured);
+    }
+
+    #[test]
+    fn test_gateway_runner_platform_count() {
+        let config = GatewayConfig {
+            platforms: vec![
+                PlatformConfigEntry {
+                    platform: Platform::Whatsapp,
+                    enabled: true,
+                    config: PlatformConfig::default(),
+                },
+                PlatformConfigEntry {
+                    platform: Platform::Telegram,
+                    enabled: false,
+                    config: PlatformConfig::default(),
+                },
+            ],
+            default_model: "test".to_string(),
+        };
+        let runner = GatewayRunner::new(config);
+        let status = runner.status();
+        assert_eq!(status.platform_count, 1); // Only Whatsapp is enabled
+    }
+
+    #[test]
+    fn test_health_check_status_platforms() {
+        let running = Arc::new(AtomicBool::new(true));
+        let status = HealthCheckStatus {
+            running: running.clone(),
+            feishu: true,
+            weixin: false,
+            telegram: true,
+            discord: false,
+            slack: true,
+            api_server: false,
+            dingtalk: true,
+            wecom: false,
+            whatsapp: true,
+            webhook: false,
+        };
+        // Verify clone works since HealthCheckStatus derives Clone
+        let cloned = status.clone();
+        assert!(cloned.running.load(Ordering::SeqCst));
+        assert!(cloned.whatsapp);
+        assert!(!cloned.weixin);
+    }
+
+    #[test]
+    fn test_platform_config_roundtrip() {
+        // Verify that load_gateway_config falls back correctly when no config file exists
+        let config = load_gateway_config();
+        assert!(!config.default_model.is_empty());
     }
 }

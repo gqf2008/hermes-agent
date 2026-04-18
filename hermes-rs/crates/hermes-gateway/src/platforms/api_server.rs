@@ -2198,6 +2198,10 @@ fn build_sse_stream(
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the global RESPONSE_STORE to prevent
+    /// concurrent-test interference (cargo test runs tests in parallel).
+    static RESPONSE_STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_config_defaults() {
         let config = ApiServerConfig::default();
@@ -2266,6 +2270,8 @@ mod tests {
 
     #[test]
     fn test_response_store_session_chain() {
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
+
         // Simulate: request 1 has no session_id, gets a UUID.
         // Request 2 uses previous_response_id from response 1,
         // and should inherit the same session_id.
@@ -2298,6 +2304,7 @@ mod tests {
 
     #[test]
     fn test_response_store_trim_on_overflow() {
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
         RESPONSE_STORE.lock().unwrap().entries.clear();
         RESPONSE_STORE.lock().unwrap().order.clear();
         RESPONSE_STORE.lock().unwrap().conversations.clear();
@@ -2341,6 +2348,7 @@ mod tests {
 
     #[test]
     fn test_response_store_conversation_mapping() {
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
         RESPONSE_STORE.lock().unwrap().entries.clear();
         RESPONSE_STORE.lock().unwrap().order.clear();
         RESPONSE_STORE.lock().unwrap().conversations.clear();
@@ -2368,6 +2376,7 @@ mod tests {
 
     #[test]
     fn test_response_store_delete() {
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
         RESPONSE_STORE.lock().unwrap().entries.clear();
         RESPONSE_STORE.lock().unwrap().order.clear();
         RESPONSE_STORE.lock().unwrap().conversations.clear();
