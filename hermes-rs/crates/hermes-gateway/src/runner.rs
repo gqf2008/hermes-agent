@@ -84,6 +84,41 @@ pub trait MessageHandler: Send + Sync + 'static {
     }
 }
 
+/// Shared state for the health check endpoint.
+#[derive(Clone)]
+struct HealthCheckStatus {
+    running: Arc<AtomicBool>,
+    feishu: bool,
+    weixin: bool,
+    telegram: bool,
+    discord: bool,
+    slack: bool,
+    api_server: bool,
+    dingtalk: bool,
+    wecom: bool,
+}
+
+/// Health check HTTP handler.
+async fn health_handler(
+    axum::extract::State(status): axum::extract::State<Arc<HealthCheckStatus>>,
+) -> axum::Json<serde_json::Value> {
+    let mut platforms = serde_json::Map::new();
+    platforms.insert("feishu".into(), serde_json::json!(status.feishu));
+    platforms.insert("weixin".into(), serde_json::json!(status.weixin));
+    platforms.insert("telegram".into(), serde_json::json!(status.telegram));
+    platforms.insert("discord".into(), serde_json::json!(status.discord));
+    platforms.insert("slack".into(), serde_json::json!(status.slack));
+    platforms.insert("api_server".into(), serde_json::json!(status.api_server));
+    platforms.insert("dingtalk".into(), serde_json::json!(status.dingtalk));
+    platforms.insert("wecom".into(), serde_json::json!(status.wecom));
+
+    let body = serde_json::json!({
+        "status": if status.running.load(Ordering::SeqCst) { "ok" } else { "stopped" },
+        "platforms": platforms,
+    });
+    axum::Json(body)
+}
+
 /// Gateway runner managing platform adapter lifecycles.
 pub struct GatewayRunner {
     config: GatewayConfig,
@@ -101,6 +136,8 @@ pub struct GatewayRunner {
     telegram_shutdown_tx: Vec<oneshot::Sender<()>>,
     discord_shutdown_tx: Vec<oneshot::Sender<()>>,
     slack_shutdown_tx: Vec<oneshot::Sender<()>>,
+    /// Health check server shutdown sender.
+    health_check_shutdown_tx: Option<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
     /// Track which sessions are currently running (chat_id -> start timestamp).
@@ -131,6 +168,7 @@ impl GatewayRunner {
             telegram_shutdown_tx: Vec::new(),
             discord_shutdown_tx: Vec::new(),
             slack_shutdown_tx: Vec::new(),
+            health_check_shutdown_tx: None,
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -543,6 +581,46 @@ impl GatewayRunner {
             handles.push(handle);
         }
 
+        // Health check endpoint
+        let health_port = std::env::var("HERMES_GATEWAY_HEALTH_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8080);
+        let health_status = HealthCheckStatus {
+            running: self.running.clone(),
+            feishu: self.feishu_adapter.is_some(),
+            weixin: self.weixin_adapter.is_some(),
+            telegram: self.telegram_adapter.is_some(),
+            discord: self.discord_adapter.is_some(),
+            slack: self.slack_adapter.is_some(),
+            api_server: self.api_server_adapter.is_some(),
+            dingtalk: self.dingtalk_adapter.is_some(),
+            wecom: self.wecom_adapter.is_some(),
+        };
+        let (health_shutdown_tx, health_shutdown_rx) = oneshot::channel::<()>();
+        let health_handle = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route("/health", axum::routing::get(health_handler))
+                .with_state(Arc::new(health_status));
+
+            let listener = match tokio::net::TcpListener::bind(("0.0.0.0", health_port)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("Health check bind failed on port {health_port}: {e}");
+                    return;
+                }
+            };
+            info!("Health check endpoint on http://0.0.0.0:{health_port}/health");
+
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = health_shutdown_rx.await;
+                })
+                .await;
+        });
+        self.health_check_shutdown_tx = Some(health_shutdown_tx);
+        handles.push(health_handle);
+
         // Wait for all platform tasks
         for handle in handles {
             if let Err(e) = handle.await {
@@ -584,6 +662,10 @@ impl GatewayRunner {
         // Trigger Slack graceful shutdown
         let senders = std::mem::take(&mut self.slack_shutdown_tx);
         for tx in senders {
+            let _ = tx.send(());
+        }
+        // Trigger health check server graceful shutdown
+        if let Some(tx) = self.health_check_shutdown_tx.take() {
             let _ = tx.send(());
         }
         self.running.store(false, Ordering::SeqCst);
