@@ -37,6 +37,9 @@ tokio-tungstenite = "0.26"
 # Weixin AES-128-ECB media decryption
 aes = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 serial_test = "3"

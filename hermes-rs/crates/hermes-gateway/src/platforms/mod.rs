@@ -12,3 +12,4 @@ pub mod slack;
 pub mod telegram;
 pub mod wecom;
 pub mod weixin;
+pub mod whatsapp;

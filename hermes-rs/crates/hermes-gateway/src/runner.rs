@@ -24,6 +24,7 @@ use crate::platforms::slack::{SlackAdapter, SlackConfig, SlackMessageEvent};
 use crate::platforms::telegram::{TelegramAdapter, TelegramConfig, TelegramMessageEvent};
 use crate::platforms::wecom::{WeComAdapter, WeComConfig};
 use crate::platforms::weixin::{WeixinAdapter, WeixinConfig, WeixinMessageEvent};
+use crate::platforms::whatsapp::{WhatsAppAdapter, WhatsAppConfig, WhatsAppMessageEvent};
 
 /// Gateway configuration.
 #[derive(Debug, Clone)]
@@ -96,6 +97,7 @@ struct HealthCheckStatus {
     api_server: bool,
     dingtalk: bool,
     wecom: bool,
+    whatsapp: bool,
 }
 
 /// Health check HTTP handler.
@@ -111,6 +113,7 @@ async fn health_handler(
     platforms.insert("api_server".into(), serde_json::json!(status.api_server));
     platforms.insert("dingtalk".into(), serde_json::json!(status.dingtalk));
     platforms.insert("wecom".into(), serde_json::json!(status.wecom));
+    platforms.insert("whatsapp".into(), serde_json::json!(status.whatsapp));
 
     let body = serde_json::json!({
         "status": if status.running.load(Ordering::SeqCst) { "ok" } else { "stopped" },
@@ -130,12 +133,14 @@ pub struct GatewayRunner {
     api_server_adapter: Option<Arc<ApiServerAdapter>>,
     dingtalk_adapter: Option<Arc<DingtalkAdapter>>,
     wecom_adapter: Option<Arc<WeComAdapter>>,
+    whatsapp_adapter: Option<Arc<WhatsAppAdapter>>,
     api_server_shutdown_tx: Vec<oneshot::Sender<()>>,
     dingtalk_shutdown_tx: Vec<oneshot::Sender<()>>,
     feishu_shutdown_tx: Vec<oneshot::Sender<()>>,
     telegram_shutdown_tx: Vec<oneshot::Sender<()>>,
     discord_shutdown_tx: Vec<oneshot::Sender<()>>,
     slack_shutdown_tx: Vec<oneshot::Sender<()>>,
+    whatsapp_shutdown_tx: Vec<oneshot::Sender<()>>,
     /// Health check server shutdown sender.
     health_check_shutdown_tx: Option<oneshot::Sender<()>>,
     message_handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
@@ -162,12 +167,14 @@ impl GatewayRunner {
             api_server_adapter: None,
             dingtalk_adapter: None,
             wecom_adapter: None,
+            whatsapp_adapter: None,
             api_server_shutdown_tx: Vec::new(),
             dingtalk_shutdown_tx: Vec::new(),
             feishu_shutdown_tx: Vec::new(),
             telegram_shutdown_tx: Vec::new(),
             discord_shutdown_tx: Vec::new(),
             slack_shutdown_tx: Vec::new(),
+            whatsapp_shutdown_tx: Vec::new(),
             health_check_shutdown_tx: None,
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
@@ -271,6 +278,15 @@ impl GatewayRunner {
                         );
                     }
                 }
+                Platform::Whatsapp => {
+                    let whatsapp_config = WhatsAppConfig::from_env();
+                    if !whatsapp_config.bridge_script.is_empty() {
+                        info!("Initializing WhatsApp adapter...");
+                        self.whatsapp_adapter = Some(Arc::new(WhatsAppAdapter::new(whatsapp_config)));
+                    } else {
+                        warn!("WhatsApp enabled but not configured (missing bridge script)");
+                    }
+                }
                 _ => {
                     warn!("Platform {} not yet implemented in Rust", entry.platform.as_str());
                 }
@@ -285,12 +301,13 @@ impl GatewayRunner {
         let api_server_count = self.api_server_adapter.is_some() as usize;
         let dingtalk_count = self.dingtalk_adapter.is_some() as usize;
         let wecom_count = self.wecom_adapter.is_some() as usize;
+        let whatsapp_count = self.whatsapp_adapter.is_some() as usize;
         let feishu_webhook_count = self.feishu_adapter.as_ref()
             .map(|a| matches!(a.config.connection_mode, FeishuConnectionMode::Webhook))
             .unwrap_or(false) as usize;
         info!(
             "Gateway initialized: {} platform(s) ready",
-            feishu_count + weixin_count + telegram_count + discord_count + slack_count + api_server_count + dingtalk_count + wecom_count
+            feishu_count + weixin_count + telegram_count + discord_count + slack_count + api_server_count + dingtalk_count + wecom_count + whatsapp_count
         );
         if feishu_webhook_count > 0 {
             info!("Feishu webhook: port={} path={}",
@@ -581,6 +598,27 @@ impl GatewayRunner {
             handles.push(handle);
         }
 
+        // WhatsApp: connect bridge and start polling
+        if let Some(adapter) = &self.whatsapp_adapter {
+            let adapter = adapter.clone();
+            if let Err(e) = adapter.connect().await {
+                error!("WhatsApp connect failed: {e}");
+            } else {
+                let adapter = adapter.clone();
+                let handler = self.message_handler.clone();
+                let running = self.running.clone();
+                let running_sessions = self.running_sessions.clone();
+                let busy_ack_ts = self.busy_ack_ts.clone();
+                let session_store = self.session_store.clone();
+                let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+                let handle = tokio::spawn(async move {
+                    run_whatsapp_poll(adapter, handler, running, running_sessions, busy_ack_ts, session_store).await;
+                });
+                self.whatsapp_shutdown_tx.push(shutdown_tx);
+                handles.push(handle);
+            }
+        }
+
         // Health check endpoint
         let health_port = std::env::var("HERMES_GATEWAY_HEALTH_PORT")
             .ok()
@@ -596,6 +634,7 @@ impl GatewayRunner {
             api_server: self.api_server_adapter.is_some(),
             dingtalk: self.dingtalk_adapter.is_some(),
             wecom: self.wecom_adapter.is_some(),
+            whatsapp: self.whatsapp_adapter.is_some(),
         };
         let (health_shutdown_tx, health_shutdown_rx) = oneshot::channel::<()>();
         let health_handle = tokio::spawn(async move {
@@ -664,6 +703,17 @@ impl GatewayRunner {
         for tx in senders {
             let _ = tx.send(());
         }
+        // Trigger WhatsApp graceful shutdown
+        let senders = std::mem::take(&mut self.whatsapp_shutdown_tx);
+        for tx in senders {
+            let _ = tx.send(());
+        }
+        // Disconnect WhatsApp adapter
+        if let Some(adapter) = self.whatsapp_adapter.take() {
+            tokio::spawn(async move {
+                adapter.disconnect().await;
+            });
+        }
         // Trigger health check server graceful shutdown
         if let Some(tx) = self.health_check_shutdown_tx.take() {
             let _ = tx.send(());
@@ -692,6 +742,7 @@ impl GatewayRunner {
             api_server_configured: self.api_server_adapter.is_some(),
             dingtalk_configured: self.dingtalk_adapter.is_some(),
             wecom_configured: self.wecom_adapter.is_some(),
+            whatsapp_configured: self.whatsapp_adapter.is_some(),
             platform_count: self.config.platforms.iter().filter(|p| p.enabled).count(),
         }
     }
@@ -709,6 +760,7 @@ pub struct GatewayStatus {
     pub api_server_configured: bool,
     pub dingtalk_configured: bool,
     pub wecom_configured: bool,
+    pub whatsapp_configured: bool,
     pub platform_count: usize,
 }
 
@@ -1086,6 +1138,7 @@ pub fn load_gateway_config() -> GatewayConfig {
                                     "discord" => Platform::Discord,
                                     "slack" => Platform::Slack,
                                     "api_server" => Platform::ApiServer,
+                                    "whatsapp" => Platform::Whatsapp,
                                     _ => Platform::Local,
                                 };
                                 let cfg = PlatformConfig::default();
@@ -1146,6 +1199,13 @@ pub fn load_gateway_config() -> GatewayConfig {
                 config: PlatformConfig::default(),
             });
         }
+        if std::env::var("WHATSAPP_BRIDGE_SCRIPT").is_ok() {
+            platforms.push(PlatformConfigEntry {
+                platform: Platform::Whatsapp,
+                enabled: true,
+                config: PlatformConfig::default(),
+            });
+        }
         if std::env::var("DISCORD_BOT_TOKEN").is_ok() {
             platforms.push(PlatformConfigEntry {
                 platform: Platform::Discord,
@@ -1165,6 +1225,167 @@ pub fn load_gateway_config() -> GatewayConfig {
     GatewayConfig {
         platforms,
         default_model,
+    }
+}
+
+/// Poll WhatsApp for inbound messages and route to the agent.
+async fn run_whatsapp_poll(
+    adapter: Arc<WhatsAppAdapter>,
+    handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
+    running: Arc<AtomicBool>,
+    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    session_store: Arc<SessionStore>,
+) {
+    let mut poll_interval = interval(Duration::from_secs(1));
+    let mut consecutive_errors = 0u32;
+
+    info!("WhatsApp poll loop started");
+
+    while running.load(Ordering::SeqCst) {
+        poll_interval.tick().await;
+
+        match adapter.get_updates().await {
+            Ok(events) => {
+                consecutive_errors = 0;
+                for event in events {
+                    let handler_guard = handler.lock().await;
+                    let handler_ref = handler_guard.as_ref().cloned();
+                    drop(handler_guard);
+
+                    route_whatsapp_message(
+                        &adapter,
+                        handler_ref.as_ref(),
+                        &event,
+                        &running_sessions,
+                        &busy_ack_ts,
+                        &session_store,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors > 5 {
+                    warn!("WhatsApp: {consecutive_errors} consecutive errors: {e}");
+                } else {
+                    error!("WhatsApp poll error: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    info!("WhatsApp poll loop stopped");
+}
+
+/// Route a WhatsApp message to the agent handler.
+async fn route_whatsapp_message(
+    adapter: &WhatsAppAdapter,
+    handler: Option<&Arc<dyn MessageHandler>>,
+    event: &WhatsAppMessageEvent,
+    running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    session_store: &Arc<SessionStore>,
+) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if event.content.is_empty() {
+        return;
+    }
+
+    let chat_id = &event.chat_id;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    // Check if this session is already running (busy session handling)
+    let busy_elapsed_min: Option<f64> = {
+        let sessions = running_sessions.lock().unwrap();
+        sessions.get(chat_id).map(&|start_ts| {
+            let elapsed_secs = now - start_ts;
+            elapsed_secs / 60.0
+        })
+    };
+
+    if let Some(elapsed_min) = busy_elapsed_min {
+        let should_ack = {
+            let mut ack_map = busy_ack_ts.lock().unwrap();
+            let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
+            if now - last_ack < 30.0 {
+                false
+            } else {
+                ack_map.insert(chat_id.to_string(), now);
+                true
+            }
+        };
+
+        if should_ack {
+            if let Some(h) = handler {
+                h.interrupt(chat_id, &event.content);
+            }
+            info!(
+                "Session {chat_id}: busy — agent interrupted after {elapsed_min:.1} min"
+            );
+
+            let busy_msg = format!(
+                "Still processing your previous message ({elapsed_min:.0}m elapsed). \
+                 Please wait for my response before sending another prompt."
+            );
+            let _ = adapter.send_text(chat_id, &busy_msg).await;
+        }
+        return;
+    }
+
+    info!(
+        "WhatsApp message from {}: {}",
+        chat_id,
+        event.content.chars().take(50).collect::<String>(),
+    );
+
+    {
+        let mut sessions = running_sessions.lock().unwrap();
+        sessions.insert(chat_id.clone(), now);
+    }
+
+    let Some(handler_ref) = handler else {
+        running_sessions.lock().unwrap().remove(chat_id);
+        warn!("No message handler registered for WhatsApp messages");
+        return;
+    };
+
+    match handler_ref
+        .handle_message(Platform::Whatsapp, chat_id, &event.content)
+        .await
+    {
+        Ok(result) => {
+            running_sessions.lock().unwrap().remove(chat_id);
+            busy_ack_ts.lock().unwrap().remove(chat_id);
+
+            if result.compression_exhausted {
+                let session_key = format!("whatsapp:{}", chat_id);
+                session_store.reset_session(&session_key);
+                warn!("Session {chat_id}: compression exhausted — auto-reset performed");
+                let reset_msg = "Session reset: conversation context grew too large. \
+                    Starting fresh — previous context has been cleared.";
+                let _ = adapter.send_text(chat_id, reset_msg).await;
+            }
+            if !result.response.is_empty() {
+                if let Err(e) = adapter.send_text(chat_id, &result.response).await {
+                    error!("WhatsApp send failed: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            running_sessions.lock().unwrap().remove(chat_id);
+            busy_ack_ts.lock().unwrap().remove(chat_id);
+
+            error!("Agent handler failed for WhatsApp message: {e}");
+            let _ = adapter
+                .send_text(chat_id, "Sorry, I encountered an error processing your message.")
+                .await;
+        }
     }
 }
 
@@ -1196,5 +1417,6 @@ mod tests {
         assert!(!status.api_server_configured);
         assert!(!status.dingtalk_configured);
         assert!(!status.wecom_configured);
+        assert!(!status.whatsapp_configured);
     }
 }
