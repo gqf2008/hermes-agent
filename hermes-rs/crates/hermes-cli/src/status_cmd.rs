@@ -77,6 +77,40 @@ pub fn cmd_status(_all: bool, _deep: bool) -> anyhow::Result<()> {
     };
     println!("  {:20} {}", "API Keys", keys_status);
 
+    // Nous Subscription Features
+    if hermes_tools::tool_backend_helpers::managed_nous_tools_enabled() {
+        let features = crate::nous_subscription::get_nous_subscription_features(None);
+        println!();
+        println!("{}", cyan().apply_to("◆ Nous Subscription Features"));
+        let (portal_marker, portal_state) = if features.nous_auth_present {
+            (green().apply_to("✓"), "managed tools available")
+        } else {
+            (red().apply_to("✗"), "not logged in")
+        };
+        println!("  {:<15} {} {}", "Nous Portal", portal_marker, portal_state);
+        for feature in features.items() {
+            let state = if feature.managed_by_nous {
+                "active via Nous subscription"
+            } else if feature.active {
+                let current = if feature.current_provider.is_empty() {
+                    "configured provider"
+                } else {
+                    &feature.current_provider
+                };
+                &format!("active via {current}")
+            } else if feature.included_by_default && features.nous_auth_present {
+                "included by subscription, not currently selected"
+            } else if feature.key == "modal" && features.nous_auth_present {
+                "available via subscription (optional)"
+            } else {
+                "not configured"
+            };
+            let available = feature.available || feature.active || feature.managed_by_nous;
+            let marker = if available { green().apply_to("✓") } else { red().apply_to("✗") };
+            println!("  {:<15} {} {}", feature.label, marker, state);
+        }
+    }
+
     // Sessions DB
     let db_path = home.join("sessions.db");
     let db_status = if db_path.exists() {
