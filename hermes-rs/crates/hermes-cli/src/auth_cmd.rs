@@ -482,36 +482,36 @@ fn auth_store_path() -> PathBuf {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct AuthStore {
+pub(crate) struct AuthStore {
     #[serde(default)]
-    version: u32,
+    pub(crate) version: u32,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    providers: std::collections::HashMap<String, ProviderState>,
+    pub(crate) providers: std::collections::HashMap<String, ProviderState>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    active_provider: Option<String>,
+    pub(crate) active_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    credential_pool: Option<serde_json::Value>,
+    pub(crate) credential_pool: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    suppressed_sources: Option<serde_json::Value>,
+    pub(crate) suppressed_sources: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    updated_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct ProviderState {
+pub(crate) struct ProviderState {
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    access_token: Option<String>,
+    pub(crate) access_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    tokens: Option<CodexTokens>,
+    pub(crate) tokens: Option<CodexTokens>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct CodexTokens {
+pub(crate) struct CodexTokens {
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    access_token: Option<String>,
+    pub(crate) access_token: Option<String>,
 }
 
-fn load_auth_store() -> anyhow::Result<AuthStore> {
+pub(crate) fn load_auth_store() -> anyhow::Result<AuthStore> {
     hermes_core::with_auth_json_read_lock(|| {
         let path = auth_store_path();
         if !path.exists() {
@@ -524,7 +524,7 @@ fn load_auth_store() -> anyhow::Result<AuthStore> {
     }).map_err(|e| anyhow::anyhow!("Failed to read auth.json: {e}"))
 }
 
-fn save_auth_store(auth_store: &mut AuthStore) -> anyhow::Result<PathBuf> {
+pub(crate) fn save_auth_store(auth_store: &mut AuthStore) -> anyhow::Result<PathBuf> {
     hermes_core::with_auth_json_write_lock(|| {
         let path = auth_store_path();
         if let Some(parent) = path.parent() {

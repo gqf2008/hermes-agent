@@ -39,6 +39,13 @@ shellexpand.workspace = true
 rand.workspace = true
 which = "7"
 reqwest.workspace = true
+base64.workspace = true
+url.workspace = true
+
+# OAuth / Auth
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+axum = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
