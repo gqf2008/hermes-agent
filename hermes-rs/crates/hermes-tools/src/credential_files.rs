@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! File passthrough registry for remote terminal backends.
 //!
 //! Remote backends (Docker, Modal, SSH) create sandboxes with no host files.

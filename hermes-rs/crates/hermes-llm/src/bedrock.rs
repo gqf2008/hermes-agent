@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! AWS Bedrock Converse API adapter.
 //!
 //! Mirrors Python `agent/bedrock_adapter.py`: SigV4 signing, message/tool
@@ -503,7 +504,7 @@ fn convert_content_to_converse(content: &Value) -> Vec<Value> {
                                     if let Some((_header, data)) = url.split_once(",") {
                                         let media_type = extract_media_type(url);
                                         let fmt = if media_type.contains('/') {
-                                            media_type.split('/').last().unwrap_or("jpeg")
+                                            media_type.split('/').next_back().unwrap_or("jpeg")
                                         } else {
                                             "jpeg"
                                         };
@@ -931,10 +932,8 @@ pub fn process_stream_event(
                     if let Some(input) = tool_delta.get("input").and_then(|v| v.as_str()) {
                         if let Some(last_tool) = acc.tool_calls.last_mut() {
                             if let Some(fn_obj) = last_tool.get_mut("function").and_then(|v| v.as_object_mut()) {
-                                if let Some(args_val) = fn_obj.get_mut("arguments") {
-                                    if let Value::String(s) = args_val {
-                                        s.push_str(input);
-                                    }
+                                if let Some(Value::String(s)) = fn_obj.get_mut("arguments") {
+                                    s.push_str(input);
                                 }
                             }
                         }

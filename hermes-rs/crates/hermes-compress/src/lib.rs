@@ -1,4 +1,5 @@
 //! # Hermes Compress
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! Trajectory compression with LLM-based summarization.
 //! Mirrors the Python `trajectory_compressor.py`.

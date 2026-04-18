@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Send message tool.
 //!
 //! Mirrors the Python `tools/send_message_tool.py`.

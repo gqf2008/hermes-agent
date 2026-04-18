@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //! # Hermes CLI
 //!
 //! CLI application with TUI, subcommands, and setup wizard.

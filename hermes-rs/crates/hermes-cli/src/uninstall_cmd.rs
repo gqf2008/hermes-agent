@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Uninstall command.
 //!
 //! Mirrors Python: hermes uninstall (remove Hermes and optionally all data)

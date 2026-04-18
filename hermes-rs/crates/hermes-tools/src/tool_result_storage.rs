@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Tool result persistence — preserves large outputs instead of truncating.
 //!
 //! Defense against context-window overflow operates at three levels:

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Skills hub management — search, install, uninstall, inspect, browse, check, update.
 
 use console::Style;

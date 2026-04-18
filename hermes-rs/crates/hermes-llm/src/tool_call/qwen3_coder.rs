@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Qwen3-Coder tool call parser.
 //!
 //! Uses XML-style nested tags:

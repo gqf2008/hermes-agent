@@ -28,7 +28,8 @@ impl AIAgent {
     /// tool executions to terminate early.
     pub fn interrupt(&self, message: Option<&str>) {
         self.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = self.interrupt_message.lock() {
+        {
+            let mut guard = self.interrupt_message.lock();
             *guard = message.map(String::from);
         }
         if let Some(ref mgr) = self.subagent_mgr {
@@ -46,7 +47,8 @@ impl AIAgent {
     /// Mirrors Python: `clear_interrupt()` (run_agent.py:3094).
     pub fn clear_interrupt(&self) {
         self.interrupt.store(false, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = self.interrupt_message.lock() {
+        {
+            let mut guard = self.interrupt_message.lock();
             *guard = None;
         }
     }
@@ -125,10 +127,12 @@ impl AIAgent {
         self.force_ascii_payload = false;
         self.fallback_activated = false;
 
-        if let Ok(mut guard) = self.delegate_results.lock() {
+        {
+            let mut guard = self.delegate_results.lock();
             guard.clear();
         }
-        if let Ok(mut guard) = self.last_usage.lock() {
+        {
+            let mut guard = self.last_usage.lock();
             *guard = None;
         }
 
@@ -169,7 +173,7 @@ impl AIAgent {
     /// response. Useful for gateway deployments to display rate limit
     /// information to users.
     pub fn get_rate_limit_state(&self) -> Option<Value> {
-        self.rate_limit_state.lock().ok()?.clone()
+        self.rate_limit_state.lock().clone()
     }
 
     /// Capture rate limit state from provider response headers.
@@ -178,7 +182,8 @@ impl AIAgent {
     /// Parses x-ratelimit-* headers and caches the state for later
     /// retrieval via `get_rate_limit_state()`.
     pub fn capture_rate_limits(&self, rate_limit_data: Value) {
-        if let Ok(mut guard) = self.rate_limit_state.lock() {
+        {
+            let mut guard = self.rate_limit_state.lock();
             *guard = Some(rate_limit_data);
         }
     }
@@ -193,10 +198,12 @@ impl AIAgent {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        if let Ok(mut guard) = self.last_activity_ts.lock() {
+        {
+            let mut guard = self.last_activity_ts.lock();
             *guard = now;
         }
-        if let Ok(mut guard) = self.last_activity_desc.lock() {
+        {
+            let mut guard = self.last_activity_desc.lock();
             *guard = description.to_string();
         }
     }
@@ -213,10 +220,10 @@ impl AIAgent {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        let last_activity_ts = self.last_activity_ts.lock().ok().map(|g| *g).unwrap_or(0.0);
-        let last_activity_desc = self.last_activity_desc.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        let last_activity_ts = *self.last_activity_ts.lock();
+        let last_activity_desc = self.last_activity_desc.lock().clone();
         let seconds_since_activity = now - last_activity_ts;
-        let current_tool = self.current_tool.lock().ok().map(|g| g.clone());
+        let current_tool = self.current_tool.lock().clone();
         let budget_used = self.budget.used();
         let budget_max = self.budget.max_total;
 
@@ -239,7 +246,8 @@ impl AIAgent {
     /// summary with the tool currently being run.
     #[allow(dead_code)]
     fn set_current_tool(&self, tool_name: Option<&str>) {
-        if let Ok(mut guard) = self.current_tool.lock() {
+        {
+            let mut guard = self.current_tool.lock();
             *guard = tool_name.map(String::from);
         }
     }

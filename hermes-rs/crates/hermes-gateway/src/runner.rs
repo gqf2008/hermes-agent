@@ -153,9 +153,9 @@ pub struct GatewayRunner {
     /// Track which sessions are currently running (chat_id -> start timestamp).
     /// Used for busy-session interrupt logic (Python PR a8b7db35).
     /// std::sync::Mutex — critical sections are trivially fast (HashMap insert/get).
-    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     /// Busy ack timestamps for debouncing (chat_id -> last ack time).
-    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     /// Session store for persistence and auto-reset.
     session_store: Arc<SessionStore>,
 }
@@ -185,8 +185,8 @@ impl GatewayRunner {
             health_check_shutdown_tx: None,
             message_handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
-            running_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            busy_ack_ts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            running_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            busy_ack_ts: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             session_store: Arc::new(SessionStore::new(
                 hermes_core::get_hermes_home().join("gateway_sessions"),
                 crate::config::GatewayConfig::default(),
@@ -417,13 +417,13 @@ impl GatewayRunner {
                                 .unwrap_or_default()
                                 .as_secs_f64();
                             let is_busy = {
-                                let sessions = running_sessions.lock().unwrap();
+                                let sessions = running_sessions.lock();
                                 sessions.contains_key(chat_id)
                             };
 
                             if is_busy {
                                 let should_ack = {
-                                    let mut ack_map = busy_ack_ts.lock().unwrap();
+                                    let mut ack_map = busy_ack_ts.lock();
                                     let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
                                     if now - last_ack < 30.0 {
                                         false
@@ -441,14 +441,14 @@ impl GatewayRunner {
                             }
 
                             {
-                                let mut sessions = running_sessions.lock().unwrap();
+                                let mut sessions = running_sessions.lock();
                                 sessions.insert(chat_id.clone(), now);
                             }
 
                             match h.handle_message(Platform::Slack, chat_id, content).await {
                                 Ok(result) => {
-                                    running_sessions.lock().unwrap().remove(chat_id);
-                                    busy_ack_ts.lock().unwrap().remove(chat_id);
+                                    running_sessions.lock().remove(chat_id);
+                                    busy_ack_ts.lock().remove(chat_id);
 
                                     if result.compression_exhausted {
                                         let session_key = format!("slack:{}", chat_id);
@@ -468,8 +468,8 @@ impl GatewayRunner {
                                     }
                                 }
                                 Err(e) => {
-                                    running_sessions.lock().unwrap().remove(chat_id);
-                                    busy_ack_ts.lock().unwrap().remove(chat_id);
+                                    running_sessions.lock().remove(chat_id);
+                                    busy_ack_ts.lock().remove(chat_id);
                                     error!("Agent handler failed for Slack message: {e}");
                                     let _ = adapter.send_text(chat_id,
                                         "Sorry, I encountered an error processing your message.").await;
@@ -503,7 +503,6 @@ impl GatewayRunner {
                                 let handler = handler.clone();
                                 let running = running.clone();
                                 let adapter = adapter_for_cb.clone();
-                                let event = event;
                                 tokio::spawn(async move {
                                     if !running.load(Ordering::SeqCst) {
                                         return;
@@ -761,8 +760,8 @@ impl GatewayRunner {
         }
         self.running.store(false, Ordering::SeqCst);
         // Clear tracking state so it doesn't leak across stop/restart cycles.
-        self.running_sessions.lock().unwrap().clear();
-        self.busy_ack_ts.lock().unwrap().clear();
+        self.running_sessions.lock().clear();
+        self.busy_ack_ts.lock().clear();
         info!("Gateway stop requested");
     }
 
@@ -812,8 +811,8 @@ async fn run_weixin_poll(
     adapter: Arc<WeixinAdapter>,
     handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
-    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: Arc<SessionStore>,
 ) {
     let mut poll_interval = interval(Duration::from_secs(2));
@@ -870,8 +869,8 @@ async fn route_weixin_message(
     adapter: &WeixinAdapter,
     handler: Option<&Arc<dyn MessageHandler>>,
     event: &WeixinMessageEvent,
-    running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: &Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: &Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: &Arc<SessionStore>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -889,7 +888,7 @@ async fn route_weixin_message(
 
     // Check if this session is already running (busy session handling)
     let busy_elapsed_min: Option<f64> = {
-        let sessions = running_sessions.lock().unwrap();
+        let sessions = running_sessions.lock();
         sessions.get(chat_id).map(|&start_ts| {
             let elapsed_secs = now - start_ts;
             elapsed_secs / 60.0
@@ -901,7 +900,7 @@ async fn route_weixin_message(
 
         // Busy ack debounce: only send every 30 seconds
         let should_ack = {
-            let mut ack_map = busy_ack_ts.lock().unwrap();
+            let mut ack_map = busy_ack_ts.lock();
             let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
             if now - last_ack < 30.0 {
                 false // Debounced
@@ -939,12 +938,12 @@ async fn route_weixin_message(
 
     // Mark session as running
     {
-        let mut sessions = running_sessions.lock().unwrap();
+        let mut sessions = running_sessions.lock();
         sessions.insert(chat_id.clone(), now);
     }
 
     let Some(handler_ref) = handler else {
-        running_sessions.lock().unwrap().remove(chat_id);
+        running_sessions.lock().remove(chat_id);
         warn!("No message handler registered for Weixin messages");
         return;
     };
@@ -955,9 +954,9 @@ async fn route_weixin_message(
     {
         Ok(result) => {
             // Clear session running flag
-            running_sessions.lock().unwrap().remove(chat_id);
+            running_sessions.lock().remove(chat_id);
             // Clear busy ack timestamp
-            busy_ack_ts.lock().unwrap().remove(chat_id);
+            busy_ack_ts.lock().remove(chat_id);
 
             // Compression exhaustion — auto-reset session and notify user.
             // Mirrors Python gateway/run.py behavior.
@@ -977,8 +976,8 @@ async fn route_weixin_message(
         }
         Err(e) => {
             // Clear session running flag on error too
-            running_sessions.lock().unwrap().remove(chat_id);
-            busy_ack_ts.lock().unwrap().remove(chat_id);
+            running_sessions.lock().remove(chat_id);
+            busy_ack_ts.lock().remove(chat_id);
 
             error!("Agent handler failed for Weixin message: {e}");
             let _ = adapter
@@ -993,8 +992,8 @@ async fn run_telegram_poll(
     adapter: Arc<TelegramAdapter>,
     handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
-    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: Arc<SessionStore>,
 ) {
     let mut poll_interval = interval(Duration::from_secs(1));
@@ -1044,8 +1043,8 @@ async fn route_telegram_message(
     adapter: &TelegramAdapter,
     handler: Option<&Arc<dyn MessageHandler>>,
     event: &TelegramMessageEvent,
-    running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: &Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: &Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: &Arc<SessionStore>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1062,7 +1061,7 @@ async fn route_telegram_message(
 
     // Check if this session is already running (busy session handling)
     let busy_elapsed_min: Option<f64> = {
-        let sessions = running_sessions.lock().unwrap();
+        let sessions = running_sessions.lock();
         sessions.get(chat_id).map(|&start_ts| {
             let elapsed_secs = now - start_ts;
             elapsed_secs / 60.0
@@ -1071,7 +1070,7 @@ async fn route_telegram_message(
 
     if let Some(elapsed_min) = busy_elapsed_min {
         let should_ack = {
-            let mut ack_map = busy_ack_ts.lock().unwrap();
+            let mut ack_map = busy_ack_ts.lock();
             let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
             if now - last_ack < 30.0 {
                 false
@@ -1105,12 +1104,12 @@ async fn route_telegram_message(
     );
 
     {
-        let mut sessions = running_sessions.lock().unwrap();
+        let mut sessions = running_sessions.lock();
         sessions.insert(chat_id.clone(), now);
     }
 
     let Some(handler_ref) = handler else {
-        running_sessions.lock().unwrap().remove(chat_id);
+        running_sessions.lock().remove(chat_id);
         warn!("No message handler registered for Telegram messages");
         return;
     };
@@ -1120,8 +1119,8 @@ async fn route_telegram_message(
         .await
     {
         Ok(result) => {
-            running_sessions.lock().unwrap().remove(chat_id);
-            busy_ack_ts.lock().unwrap().remove(chat_id);
+            running_sessions.lock().remove(chat_id);
+            busy_ack_ts.lock().remove(chat_id);
 
             // Compression exhaustion — auto-reset session and notify user.
             if result.compression_exhausted {
@@ -1139,8 +1138,8 @@ async fn route_telegram_message(
             }
         }
         Err(e) => {
-            running_sessions.lock().unwrap().remove(chat_id);
-            busy_ack_ts.lock().unwrap().remove(chat_id);
+            running_sessions.lock().remove(chat_id);
+            busy_ack_ts.lock().remove(chat_id);
 
             error!("Agent handler failed for Telegram message: {e}");
             let _ = adapter
@@ -1284,8 +1283,8 @@ async fn run_whatsapp_poll(
     adapter: Arc<WhatsAppAdapter>,
     handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<AtomicBool>,
-    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: Arc<SessionStore>,
 ) {
     let mut poll_interval = interval(Duration::from_secs(1));
@@ -1335,8 +1334,8 @@ async fn route_whatsapp_message(
     adapter: &WhatsAppAdapter,
     handler: Option<&Arc<dyn MessageHandler>>,
     event: &WhatsAppMessageEvent,
-    running_sessions: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: &Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: &Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: &Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: &Arc<SessionStore>,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1353,7 +1352,7 @@ async fn route_whatsapp_message(
 
     // Check if this session is already running (busy session handling)
     let busy_elapsed_min: Option<f64> = {
-        let sessions = running_sessions.lock().unwrap();
+        let sessions = running_sessions.lock();
         sessions.get(chat_id).map(&|start_ts| {
             let elapsed_secs = now - start_ts;
             elapsed_secs / 60.0
@@ -1362,7 +1361,7 @@ async fn route_whatsapp_message(
 
     if let Some(elapsed_min) = busy_elapsed_min {
         let should_ack = {
-            let mut ack_map = busy_ack_ts.lock().unwrap();
+            let mut ack_map = busy_ack_ts.lock();
             let last_ack = ack_map.get(chat_id).copied().unwrap_or(0.0);
             if now - last_ack < 30.0 {
                 false
@@ -1396,12 +1395,12 @@ async fn route_whatsapp_message(
     );
 
     {
-        let mut sessions = running_sessions.lock().unwrap();
+        let mut sessions = running_sessions.lock();
         sessions.insert(chat_id.clone(), now);
     }
 
     let Some(handler_ref) = handler else {
-        running_sessions.lock().unwrap().remove(chat_id);
+        running_sessions.lock().remove(chat_id);
         warn!("No message handler registered for WhatsApp messages");
         return;
     };
@@ -1411,8 +1410,8 @@ async fn route_whatsapp_message(
         .await
     {
         Ok(result) => {
-            running_sessions.lock().unwrap().remove(chat_id);
-            busy_ack_ts.lock().unwrap().remove(chat_id);
+            running_sessions.lock().remove(chat_id);
+            busy_ack_ts.lock().remove(chat_id);
 
             if result.compression_exhausted {
                 let session_key = format!("whatsapp:{}", chat_id);
@@ -1429,8 +1428,8 @@ async fn route_whatsapp_message(
             }
         }
         Err(e) => {
-            running_sessions.lock().unwrap().remove(chat_id);
-            busy_ack_ts.lock().unwrap().remove(chat_id);
+            running_sessions.lock().remove(chat_id);
+            busy_ack_ts.lock().remove(chat_id);
 
             error!("Agent handler failed for WhatsApp message: {e}");
             let _ = adapter

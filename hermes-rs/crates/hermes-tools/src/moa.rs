@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Mixture-of-Agents (MoA) tool.
 //!
 //! Mirrors the Python `tools/mixture_of_agents_tool.py`.

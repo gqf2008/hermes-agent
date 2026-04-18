@@ -367,8 +367,8 @@ pub struct HistoryMessage {
 
 /// In-memory response store. Mirrors Python's SQLite-backed ResponseStore.
 /// Holds full response objects for Responses API stateful chaining.
-static RESPONSE_STORE: LazyLock<std::sync::Mutex<ResponseStore>> =
-    LazyLock::new(|| std::sync::Mutex::new(ResponseStore::default()));
+static RESPONSE_STORE: LazyLock<parking_lot::Mutex<ResponseStore>> =
+    LazyLock::new(|| parking_lot::Mutex::new(ResponseStore::default()));
 
 /// Maximum entries before LRU eviction.
 const RESPONSE_STORE_MAX: usize = 100;
@@ -531,8 +531,8 @@ impl IdempotencyCache {
     }
 }
 
-static IDEMPOTENCY_CACHE: LazyLock<std::sync::Mutex<IdempotencyCache>> =
-    LazyLock::new(|| std::sync::Mutex::new(IdempotencyCache::default()));
+static IDEMPOTENCY_CACHE: LazyLock<parking_lot::Mutex<IdempotencyCache>> =
+    LazyLock::new(|| parking_lot::Mutex::new(IdempotencyCache::default()));
 
 /// Compute a SHA-256 fingerprint of selected request fields.
 fn make_request_fingerprint(data: &serde_json::Value, keys: &[&str]) -> String {
@@ -886,7 +886,7 @@ async fn health_detailed_handler(
     let pid = std::process::id();
 
     // Count stored responses as active agents proxy
-    let active_agents = RESPONSE_STORE.lock().unwrap().entries.len();
+    let active_agents = RESPONSE_STORE.lock().entries.len();
 
     Json(DetailedHealthResponse {
         status: "ok".to_string(),
@@ -970,7 +970,7 @@ async fn chat_completions_handler(
 
     // Cache hit — return cached response without running agent
     if let Some((ref key, ref fp)) = idem_key_and_fp {
-        let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+        let mut cache = IDEMPOTENCY_CACHE.lock();
         if let Some(cached) = cache.get(key, fp) {
             debug!("Idempotency cache hit for chat completions, key={key}");
             if let Ok(resp) = serde_json::from_value::<ChatCompletionResponse>(cached) {
@@ -996,7 +996,7 @@ async fn chat_completions_handler(
     // Determine session ID — chain from previous_response_id if available.
     // Priority: explicit session_id > stored session_id from previous response > fresh UUID.
     let stored_session_id = if let Some(ref prev_id) = request.previous_response_id {
-        RESPONSE_STORE.lock().unwrap().get(prev_id).map(|e| e.session_id.clone())
+        RESPONSE_STORE.lock().get(prev_id).map(|e| e.session_id.clone())
     } else {
         None
     };
@@ -1045,7 +1045,7 @@ async fn chat_completions_handler(
     // Store session_id so subsequent requests with previous_response_id
     // can reuse the same session (multi-turn continuity).
     {
-        let mut store = RESPONSE_STORE.lock().unwrap();
+        let mut store = RESPONSE_STORE.lock();
         store.put(chat_id.clone(), ResponseStoreEntry {
             response_data: None,
             conversation_history: vec![],
@@ -1079,7 +1079,7 @@ async fn chat_completions_handler(
         // Cache response for idempotency
         if let Some((ref key, ref fp)) = idem_key_and_fp {
             if let Ok(json) = serde_json::to_value(&resp) {
-                let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+                let mut cache = IDEMPOTENCY_CACHE.lock();
                 cache.set(key.clone(), fp.clone(), json);
             }
         }
@@ -1138,7 +1138,7 @@ async fn responses_handler(
     // Resolve conversation name to latest response_id
     let mut prev_id = request.previous_response_id.clone();
     if let Some(ref conv) = request.conversation {
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         if let Some(resp_id) = store.get_conversation(conv) {
             prev_id = Some(resp_id.clone());
         }
@@ -1159,7 +1159,7 @@ async fn responses_handler(
             });
         }
     } else if let Some(ref prev_resp_id) = prev_id {
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         if let Some(stored) = store.get(prev_resp_id) {
             conversation_history = stored.conversation_history.clone();
             stored_session_id = Some(stored.session_id.clone());
@@ -1210,7 +1210,7 @@ async fn responses_handler(
 
     // Cache hit — return cached response without running agent
     if let Some((ref key, ref fp)) = idem_key_and_fp {
-        let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+        let mut cache = IDEMPOTENCY_CACHE.lock();
         if let Some(cached) = cache.get(key, fp) {
             debug!("Idempotency cache hit for responses, key={key}");
             if let Ok(resp) = serde_json::from_value::<ResponseData>(cached) {
@@ -1261,7 +1261,7 @@ async fn responses_handler(
 
     // Store for future chaining if requested
     if store_response {
-        let mut store = RESPONSE_STORE.lock().unwrap();
+        let mut store = RESPONSE_STORE.lock();
         // Build full history: existing history + user message + assistant response
         let mut full_history = conversation_history;
         full_history.push(HistoryMessage {
@@ -1290,7 +1290,7 @@ async fn responses_handler(
     // Cache response for idempotency (non-streaming only)
     if let Some((ref key, ref fp)) = idem_key_and_fp {
         if let Ok(json) = serde_json::to_value(&response_data) {
-            let mut cache = IDEMPOTENCY_CACHE.lock().unwrap();
+            let mut cache = IDEMPOTENCY_CACHE.lock();
             cache.set(key.clone(), fp.clone(), json);
         }
     }
@@ -1326,7 +1326,7 @@ async fn responses_stream_handler(
 
     let mut prev_id = request.previous_response_id.clone();
     if let Some(ref conv) = request.conversation {
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         if let Some(resp_id) = store.get_conversation(conv) {
             prev_id = Some(resp_id.clone());
         }
@@ -1344,7 +1344,7 @@ async fn responses_stream_handler(
             });
         }
     } else if let Some(ref prev_resp_id) = prev_id {
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         if let Some(stored) = store.get(prev_resp_id) {
             conversation_history = stored.conversation_history.clone();
             stored_session_id = Some(stored.session_id.clone());
@@ -1433,7 +1433,8 @@ fn build_responses_sse_stream(
         // Helper: emit an SSE event
         fn make_event(data: impl serde::Serialize) -> axum::response::sse::Event {
             axum::response::sse::Event::default()
-                .json_data(&data).unwrap()
+                .json_data(&data)
+                .unwrap_or_else(|e| axum::response::sse::Event::default().data(format!("{{\"error\":\"sse serialization: {e}\"}}")))
         }
 
         // response.created
@@ -1591,7 +1592,7 @@ fn build_responses_sse_stream(
 
         // Store for future chaining (same as batch mode)
         if store_response {
-            let mut store = RESPONSE_STORE.lock().unwrap();
+            let mut store = RESPONSE_STORE.lock();
             let output_items = extract_output_items(&response_text, &result_messages);
 
             let mut full_history = conversation_history;
@@ -1651,7 +1652,7 @@ async fn get_response_handler(
         }
     }
 
-    let store = RESPONSE_STORE.lock().unwrap();
+    let store = RESPONSE_STORE.lock();
     let Some(entry) = store.get(&response_id) else {
         return Err(not_found_error(&format!("Response not found: {}", response_id)));
     };
@@ -1680,7 +1681,7 @@ async fn delete_response_handler(
         }
     }
 
-    let deleted = RESPONSE_STORE.lock().unwrap().delete(&response_id);
+    let deleted = RESPONSE_STORE.lock().delete(&response_id);
     if !deleted {
         return Err(not_found_error(&format!("Response not found: {}", response_id)));
     }
@@ -1830,11 +1831,14 @@ async fn run_and_close(
     let _ = tx.send(started_event);
     sequence_number += 1;
 
-    // Resolve previous_response_id for conversation chaining
-    // TODO: wire resolved history into handler pipeline
+    // Resolve previous_response_id for conversation chaining.
+    // NOTE: Wiring resolved history into the handler pipeline requires
+    // extending `MessageHandler::handle_message` to accept an optional
+    // session resume / conversation_history parameter. The resolved
+    // session_id is computed below but not yet plumbed through.
     let _previous_resolved = if conversation_history.is_empty() {
         previous_response_id.as_ref().and_then(|prev_id| {
-            let store = RESPONSE_STORE.lock().unwrap();
+            let store = RESPONSE_STORE.lock();
             store.get(prev_id).map(|e| e.session_id.clone())
         })
     } else {
@@ -1975,7 +1979,8 @@ fn build_run_sse_stream(
                     let is_terminal = matches!(event.event.as_str(), "run.completed" | "run.failed");
                     let event_json = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
                     let sse_event = axum::response::sse::Event::default()
-                        .json_data(&event_json).unwrap();
+                        .json_data(&event_json)
+                        .unwrap_or_else(|e| axum::response::sse::Event::default().data(format!("{{\"error\":\"sse serialization: {e}\"}}")));
                     yield Ok::<_, std::convert::Infallible>(sse_event);
 
                     if is_terminal {
@@ -2131,7 +2136,8 @@ fn build_sse_stream(
             }],
         };
         let event = axum::response::sse::Event::default()
-            .json_data(&role_chunk).unwrap();
+            .json_data(&role_chunk)
+            .unwrap_or_else(|e| axum::response::sse::Event::default().data(format!("{{\"error\":\"sse serialization: {e}\"}}")));
         yield Ok::<_, std::convert::Infallible>(event);
 
         // Split response into character chunks (3 chars per chunk for pacing)
@@ -2156,7 +2162,8 @@ fn build_sse_stream(
                 }],
             };
             let event = axum::response::sse::Event::default()
-                .json_data(&content_chunk).unwrap();
+                .json_data(&content_chunk)
+                .unwrap_or_else(|e| axum::response::sse::Event::default().data(format!("{{\"error\":\"sse serialization: {e}\"}}")));
             yield Ok(event);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2177,7 +2184,8 @@ fn build_sse_stream(
             }],
         };
         let event = axum::response::sse::Event::default()
-            .json_data(&finish_chunk).unwrap();
+            .json_data(&finish_chunk)
+            .unwrap_or_else(|e| axum::response::sse::Event::default().data(format!("{{\"error\":\"sse serialization: {e}\"}}")));
         yield Ok(event);
 
         // Send [DONE] marker
@@ -2270,21 +2278,21 @@ mod tests {
 
     #[test]
     fn test_response_store_session_chain() {
-        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock();
 
         // Simulate: request 1 has no session_id, gets a UUID.
         // Request 2 uses previous_response_id from response 1,
         // and should inherit the same session_id.
 
         // Clear store first
-        RESPONSE_STORE.lock().unwrap().entries.clear();
-        RESPONSE_STORE.lock().unwrap().order.clear();
-        RESPONSE_STORE.lock().unwrap().conversations.clear();
+        RESPONSE_STORE.lock().entries.clear();
+        RESPONSE_STORE.lock().order.clear();
+        RESPONSE_STORE.lock().conversations.clear();
 
         // Simulate first turn
         let response_id_1 = "chatcmpl-first".to_string();
         let session_id_1 = "session-abc".to_string();
-        RESPONSE_STORE.lock().unwrap().put(response_id_1.clone(), ResponseStoreEntry {
+        RESPONSE_STORE.lock().put(response_id_1.clone(), ResponseStoreEntry {
             response_data: None,
             conversation_history: vec![],
             instructions: None,
@@ -2293,7 +2301,7 @@ mod tests {
         });
 
         // Simulate second turn with previous_response_id
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         let stored = store.get(&response_id_1).map(|e| e.session_id.clone());
         assert_eq!(stored, Some(session_id_1));
 
@@ -2304,14 +2312,14 @@ mod tests {
 
     #[test]
     fn test_response_store_trim_on_overflow() {
-        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
-        RESPONSE_STORE.lock().unwrap().entries.clear();
-        RESPONSE_STORE.lock().unwrap().order.clear();
-        RESPONSE_STORE.lock().unwrap().conversations.clear();
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock();
+        RESPONSE_STORE.lock().entries.clear();
+        RESPONSE_STORE.lock().order.clear();
+        RESPONSE_STORE.lock().conversations.clear();
 
         // Insert RESPONSE_STORE_MAX + 1 entries
         for i in 0..=RESPONSE_STORE_MAX {
-            RESPONSE_STORE.lock().unwrap().put(
+            RESPONSE_STORE.lock().put(
                 format!("resp-{i}"),
                 ResponseStoreEntry {
                     response_data: None,
@@ -2325,7 +2333,7 @@ mod tests {
 
         // Next insert should trigger LRU eviction
         {
-            RESPONSE_STORE.lock().unwrap().put(
+            RESPONSE_STORE.lock().put(
                 "resp-new".to_string(),
                 ResponseStoreEntry {
                     response_data: None,
@@ -2338,7 +2346,7 @@ mod tests {
         }
 
         // Store should have exactly RESPONSE_STORE_MAX entries
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         assert_eq!(store.entries.len(), RESPONSE_STORE_MAX);
         // The new entry should be present
         assert!(store.entries.contains_key("resp-new"));
@@ -2348,13 +2356,13 @@ mod tests {
 
     #[test]
     fn test_response_store_conversation_mapping() {
-        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
-        RESPONSE_STORE.lock().unwrap().entries.clear();
-        RESPONSE_STORE.lock().unwrap().order.clear();
-        RESPONSE_STORE.lock().unwrap().conversations.clear();
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock();
+        RESPONSE_STORE.lock().entries.clear();
+        RESPONSE_STORE.lock().order.clear();
+        RESPONSE_STORE.lock().conversations.clear();
 
         // Store with conversation name
-        RESPONSE_STORE.lock().unwrap().put(
+        RESPONSE_STORE.lock().put(
             "resp-1".to_string(),
             ResponseStoreEntry {
                 response_data: None,
@@ -2366,7 +2374,7 @@ mod tests {
         );
 
         // Lookup by conversation name
-        let store = RESPONSE_STORE.lock().unwrap();
+        let store = RESPONSE_STORE.lock();
         let resp_id = store.get_conversation("my-chat");
         assert_eq!(resp_id, Some(&"resp-1".to_string()));
 
@@ -2376,12 +2384,12 @@ mod tests {
 
     #[test]
     fn test_response_store_delete() {
-        let _guard = RESPONSE_STORE_TEST_LOCK.lock().unwrap();
-        RESPONSE_STORE.lock().unwrap().entries.clear();
-        RESPONSE_STORE.lock().unwrap().order.clear();
-        RESPONSE_STORE.lock().unwrap().conversations.clear();
+        let _guard = RESPONSE_STORE_TEST_LOCK.lock();
+        RESPONSE_STORE.lock().entries.clear();
+        RESPONSE_STORE.lock().order.clear();
+        RESPONSE_STORE.lock().conversations.clear();
 
-        RESPONSE_STORE.lock().unwrap().put(
+        RESPONSE_STORE.lock().put(
             "resp-to-delete".to_string(),
             ResponseStoreEntry {
                 response_data: None,
@@ -2392,9 +2400,9 @@ mod tests {
             },
         );
 
-        assert!(RESPONSE_STORE.lock().unwrap().delete("resp-to-delete"));
-        assert!(!RESPONSE_STORE.lock().unwrap().delete("resp-to-delete")); // already gone
-        assert!(RESPONSE_STORE.lock().unwrap().get("resp-to-delete").is_none());
+        assert!(RESPONSE_STORE.lock().delete("resp-to-delete"));
+        assert!(!RESPONSE_STORE.lock().delete("resp-to-delete")); // already gone
+        assert!(RESPONSE_STORE.lock().get("resp-to-delete").is_none());
     }
 
     #[test]

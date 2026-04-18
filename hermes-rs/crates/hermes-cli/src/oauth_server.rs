@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OAuth callback server for authorization-code flows.
 //!
 //! Spins up a temporary HTTP server on localhost, captures the authorization

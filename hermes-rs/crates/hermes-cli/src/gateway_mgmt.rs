@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Gateway service management — start, stop, status, install, uninstall.
 //!
 //! Mirrors the Python `hermes_cli/gateway.py` service management functions.

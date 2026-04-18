@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Nous subscription managed-tool capabilities.
 //!
 //! Mirrors Python `hermes_cli/nous_subscription.py`.
@@ -392,7 +393,7 @@ fn _resolve_browser_feature_state(
 pub fn get_nous_subscription_features(
     config: Option<&serde_yaml::Value>,
 ) -> NousSubscriptionFeatures {
-    let config = config.map(|c| c.clone()).unwrap_or_else(load_config_yaml);
+    let config = config.cloned().unwrap_or_else(load_config_yaml);
     let model_cfg = model_config_dict(&config);
     let provider_is_nous = model_cfg
         .get("provider")
@@ -447,10 +448,10 @@ pub fn get_nous_subscription_features(
         .unwrap_or("edge")
         .trim()
         .to_lowercase();
-    let browser_provider_explicit = browser_cfg.contains_key(&serde_yaml::Value::String("cloud_provider".into()));
+    let browser_provider_explicit = browser_cfg.contains_key(serde_yaml::Value::String("cloud_provider".into()));
     let browser_provider = normalize_browser_cloud_provider(
         browser_cfg
-            .get(&serde_yaml::Value::String("cloud_provider".into()))
+            .get(serde_yaml::Value::String("cloud_provider".into()))
             .and_then(|v| v.as_str()),
     );
     let terminal_backend = terminal_cfg
@@ -461,7 +462,7 @@ pub fn get_nous_subscription_features(
         .to_lowercase();
     let modal_mode = normalize_modal_mode(
         terminal_cfg
-            .get(&serde_yaml::Value::String("modal_mode".into()))
+            .get(serde_yaml::Value::String("modal_mode".into()))
             .and_then(|v| v.as_str()),
     );
 
@@ -577,8 +578,8 @@ pub fn get_nous_subscription_features(
     let tts_explicit_configured = {
         let raw_tts = config.get("tts");
         if let Some(m) = raw_tts.and_then(|v| v.as_mapping()) {
-            m.contains_key(&serde_yaml::Value::String("provider".into()))
-                && tts_provider != ""
+            m.contains_key(serde_yaml::Value::String("provider".into()))
+                && !tts_provider.is_empty()
                 && tts_provider != "edge"
         } else {
             false

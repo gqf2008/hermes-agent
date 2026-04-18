@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Fuzzy string matching tool.
 //!
 //! Mirrors the Python `tools/fuzzy_match.py` (482 lines).

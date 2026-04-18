@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! DeepSeek V3.1 tool call parser.
 //!
 //! Similar to V3 but simpler format:

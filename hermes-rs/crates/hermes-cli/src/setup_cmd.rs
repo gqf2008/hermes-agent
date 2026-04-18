@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Interactive setup wizard for Hermes Agent.
 //!
 //! Mirrors the Python `hermes_cli/setup.py`.

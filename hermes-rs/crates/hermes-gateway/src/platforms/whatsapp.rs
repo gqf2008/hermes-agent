@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! WhatsApp platform adapter.
 //!
 //! Mirrors Python `gateway/platforms/whatsapp.py`.
@@ -172,7 +173,10 @@ impl WhatsAppAdapter {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    reqwest::Client::new()
+                }),
             bridge_process: RwLock::new(None),
             dedup: MessageDeduplicator::with_params(300, 2000),
             connected: AtomicBool::new(false),
@@ -264,20 +268,24 @@ impl WhatsAppAdapter {
             .arg(&self.config.session_path)
             .arg("--mode")
             .arg(std::env::var("WHATSAPP_MODE").unwrap_or_else(|_| "self-chat".into()))
-            .stdout(Stdio::from(
-                std::fs::OpenOptions::new()
+            .stdout({
+                let file = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&bridge_log)
-                    .map_err(|e| format!("Failed to open bridge log: {e}"))?,
-            ))
-            .stderr(Stdio::from(
-                std::fs::OpenOptions::new()
+                    .await
+                    .map_err(|e| format!("Failed to open bridge log: {e}"))?;
+                Stdio::from(file.into_std().await)
+            })
+            .stderr({
+                let file = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&bridge_log)
-                    .map_err(|e| format!("Failed to open bridge log: {e}"))?,
-            ));
+                    .await
+                    .map_err(|e| format!("Failed to open bridge log: {e}"))?;
+                Stdio::from(file.into_std().await)
+            });
 
         // Pass reply prefix via env
         if let Some(ref prefix) = self.config.reply_prefix {
@@ -374,8 +382,12 @@ impl WhatsAppAdapter {
             {
                 // On Unix, try to kill the process group
                 unsafe {
-                    let pid = child.id() as i32;
-                    libc::kill(-pid, libc::SIGTERM);
+                    if let Some(pid) = child.id() {
+                        let pid_i32 = pid as i32;
+                        if pid_i32 > 0 {
+                            libc::kill(-pid_i32, libc::SIGTERM);
+                        }
+                    }
                 }
             }
             #[cfg(not(unix))]
@@ -390,8 +402,12 @@ impl WhatsAppAdapter {
                 #[cfg(unix)]
                 {
                     unsafe {
-                        let pid = child.id() as i32;
-                        libc::kill(-pid, libc::SIGKILL);
+                        if let Some(pid) = child.id() {
+                            let pid_i32 = pid as i32;
+                            if pid_i32 > 0 {
+                                libc::kill(-pid_i32, libc::SIGKILL);
+                            }
+                        }
                     }
                 }
                 #[cfg(not(unix))]
@@ -555,10 +571,7 @@ impl WhatsAppAdapter {
                         media_types.push("image/jpeg".to_string());
                     }
                 } else if msg_type == "voice" {
-                    if url.starts_with("http://") || url.starts_with("https://") {
-                        media_paths.push(url.to_string());
-                        media_types.push("audio/ogg".to_string());
-                    } else if Path::new(url).is_absolute() {
+                    if url.starts_with("http://") || url.starts_with("https://") || Path::new(url).is_absolute() {
                         media_paths.push(url.to_string());
                         media_types.push("audio/ogg".to_string());
                     }

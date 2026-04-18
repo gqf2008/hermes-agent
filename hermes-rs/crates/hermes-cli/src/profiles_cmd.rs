@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Profile management CLI commands.
 //!
 //! Mirrors the Python `hermes_cli/profiles.py` module.
@@ -683,11 +684,10 @@ pub fn cmd_profile_delete(name: &str, force: bool) -> anyhow::Result<()> {
     }
 
     // Remove wrapper script
-    if has_wrapper {
-        if remove_wrapper_script(name) {
+    if has_wrapper
+        && remove_wrapper_script(name) {
             println!("  {} Removed {}", green.apply_to("\u{2713}"), wrapper_path.display());
         }
-    }
 
     // Remove profile directory
     fs::remove_dir_all(&profile_dir)?;
@@ -1228,17 +1228,13 @@ fn stop_gateway_process(profile_dir: &Path) {
                 // Wait up to 10s for graceful shutdown
                 for _ in 0..20 {
                     std::thread::sleep(std::time::Duration::from_millis(500));
-                    unsafe {
-                        if libc::kill(pid as i32, 0) != 0 {
-                            println!("  \u{2713} Gateway stopped (PID {pid})");
-                            return;
-                        }
+                    if libc::kill(pid as i32, 0) != 0 {
+                        println!("  \u{2713} Gateway stopped (PID {pid})");
+                        return;
                     }
                 }
                 // Force kill
-                unsafe {
-                    let _ = libc::kill(pid as i32, libc::SIGKILL);
-                }
+                let _ = libc::kill(pid as i32, libc::SIGKILL);
                 println!("  \u{2713} Gateway force-stopped (PID {pid})");
             }
         }

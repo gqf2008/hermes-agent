@@ -9,6 +9,7 @@
 
 use regex::Regex;
 use serde_json::Value;
+use std::sync::LazyLock;
 
 /// Extract reasoning/thinking content from an assistant message.
 pub fn extract_reasoning(message: &Value) -> String {
@@ -73,21 +74,27 @@ static REASONING_PATTERNS: &[(&str, &str)] = &[
     ("<REASONING_SCRATCHPAD>", "</REASONING_SCRATCHPAD>"),
 ];
 
+static REASONING_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    REASONING_PATTERNS
+        .iter()
+        .map(|(open, close)| {
+            let pattern = format!("(?si){}(.*?){}", regex::escape(open), regex::escape(close));
+            Regex::new(&pattern).expect("static reasoning patterns are valid regex")
+        })
+        .collect()
+});
+
 fn extract_inline_reasoning(content: &str) -> Vec<String> {
     let mut results = Vec::new();
 
-    for &(open, close) in REASONING_PATTERNS {
-        // (?si) = DOTALL (dot matches newline) + case-insensitive
-        let pattern = format!("(?si){}(.*?){}", regex::escape(open), regex::escape(close));
-        if let Ok(re) = Regex::new(&pattern) {
-            for cap in re.captures_iter(content) {
-                if let Some(m) = cap.get(1) {
-                    let text = m.as_str().trim();
-                    if !text.is_empty() {
-                        // Dedup against already-collected results
-                        if !results.iter().any(|r| r == text) {
-                            results.push(text.to_string());
-                        }
+    for re in REASONING_REGEXES.iter() {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let text = m.as_str().trim();
+                if !text.is_empty() {
+                    // Dedup against already-collected results
+                    if !results.iter().any(|r| r == text) {
+                        results.push(text.to_string());
                     }
                 }
             }

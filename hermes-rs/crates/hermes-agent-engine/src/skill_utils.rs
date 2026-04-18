@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Lightweight skill metadata utilities shared by prompt_builder and skills_tool.
 //!
 //! Mirrors the Python `agent/skill_utils.py`. This module avoids importing
@@ -284,7 +285,7 @@ pub fn get_external_skills_dirs() -> Vec<PathBuf> {
 /// Expand `~` and `${VAR}` references in a path string.
 fn expand_path(s: &str) -> PathBuf {
     // Expand ~ and environment variables using shellexpand
-    let expanded = shellexpand::full(s).unwrap_or_else(|_| std::borrow::Cow::Borrowed(s));
+    let expanded = shellexpand::full(s).unwrap_or(std::borrow::Cow::Borrowed(s));
     PathBuf::from(expanded.as_ref())
 }
 

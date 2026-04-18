@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Base types, traits, and shared infrastructure for RL environments.
 //!
 //! Mirrors the Python `environments/hermes_base_env.py` and `environments/agent_loop.py`:
@@ -522,7 +523,7 @@ pub fn extract_domains(text: &str) -> std::collections::HashSet<String> {
     for cap in re.find_iter(text) {
         let url_str = cap.as_str();
         // Trim trailing punctuation
-        let url_str = url_str.trim_end_matches(|c: char| c == '.' || c == ',' || c == ')');
+        let url_str = url_str.trim_end_matches(['.', ',', ')']);
         if let Ok(parsed) = url::Url::parse(url_str) {
             let domain = parsed
                 .host_str()

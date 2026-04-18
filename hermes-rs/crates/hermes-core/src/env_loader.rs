@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! .env file loader.
 //!
 //! Loads `.env` files with the same precedence logic as the Python version:

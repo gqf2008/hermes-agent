@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Insights command — session analytics and usage statistics.
 
 use console::Style;

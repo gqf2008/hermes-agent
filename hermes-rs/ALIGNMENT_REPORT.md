@@ -1,308 +1,256 @@
-# Python vs Rust 源码对齐报告
+# Hermes-rs vs Python 功能对齐度审查报告
 
-> 生成日期: 2026-04-16
-> 更新日期: 2026-04-16 (第一轮对齐完成)
-> 状态: Gateway 除外全部对齐
-
-## 总览
-
-| 模块 | Python 行数 | Rust 行数 | 对齐率 | 状态 |
-|------|-----------|----------|-------|------|
-| **Core Agent** (AIAgent 核心循环) | 11,487 | ~8,500 | **74%** | ✅ 已对齐 |
-| **Agent 内部** (辅助/凭证/压缩等) | 17,957 | ~20,000 | **95%** | ✅ 已对齐 |
-| **Hermes CLI** (交互式终端) | 45,513 | ~15,000 | **85%** | ✅ 已对齐 |
-| **Tools** (工具实现) | 41,704 | ~30,000 | **72%** | 可用 |
-| **Gateway** (消息网关) | 45,514 | ~10,000 | **22%** | ⏭️ 跳过 |
-| **State/Cron/ACP/RL** | ~10,000 | ~8,500 | **85%** | ✅ 已对齐 |
-| **合计 (除Gateway)** | **~138k** | **~82k** | **~80%** | |
-
-## 本轮对齐变更汇总
-
-### 已完成 (14 个模块)
-
-| # | 模块 | 变更文件 | 新增行数 | 测试 |
-|---|------|---------|---------|------|
-| 1 | **Credential Pool** (17%→70%) | `credential_pool.rs` | 244→900 | 19 |
-| 2 | **Error Classifier** (38%→80%) | `error_classifier.rs` | 316→992 | 46 |
-| 3 | **Model Metadata** (28%→85%) | `model_metadata.rs` | 311→1905 | 89 |
-| 4 | **Usage Pricing** (56%→90%) | `usage_pricing.rs` | 384→900+ | 57 |
-| 5 | **Skill Utils** (0%→100%) | `skill_utils.rs` (NEW) | 560 | 27 |
-| 6 | **Anthropic Adapter** (65%→90%) | `anthropic.rs` | 932→1926 | 17 |
-| 7 | **AWS Bedrock** (0%→85%) | `bedrock.rs` (NEW) | 1600 | 25 |
-| 8 | **Auxiliary Client** (62%→90%) | `auxiliary_client.rs` | 383→680 | 20 |
-| 9 | **Codex Responses API** (新增) | `codex.rs` 扩展 | +400 | 30 |
-| 10 | **RL Environments** (0%→85%) | `hermes-rl/` (NEW crate) | ~2000 | 36 |
-| 11 | **ACP Server** (0%→85%) | `hermes-acp/` (NEW crate) | ~800 | 12 |
-| 12 | **CLI Doctor** (0%→100%) | `doctor_cmd.rs` (NEW) | ~600 | 4 |
-| 13 | **CLI Profile** (0%→100%) | `profiles_cmd.rs` (NEW) | ~700 | 7 |
-| 14 | **CLI Tools** (0%→100%) | `tools_cmd.rs` (NEW) | 520 | 8 |
-| 15 | **CLI Dump** (0%→100%) | `dump_cmd.rs` (NEW) | 306 | 4 |
-| 16 | **Rate Limit + Nous Guard** (90%→100%) | `rate_limit.rs` | 222→900 | 33 |
-| 17 | **Platform Toolsets** (0%→100%) | `toolsets_def.rs` 扩展 | +80 | +2 |
-
-### AIAgent 核心循环新增功能
-
-| 功能 | 状态 |
-|------|------|
-| `chat()` 单轮包装 | ✅ |
-| `interrupt()` / `clear_interrupt()` | ✅ |
-| `switch_model()` | ✅ |
-| `reset_session_state()` | ✅ |
-| `get_rate_limit_state()` / `get_activity_summary()` | ✅ |
-| 并发工具执行 (依赖分析) | ✅ |
-| 顺序工具执行 (增强显示) | ✅ |
-| 消息清洗 (孤立 tool result) | ✅ |
-| 消息规范化 (JSON canonicalization) | ✅ |
-| Rollback to last assistant turn | ✅ |
-| Thinking-budget 耗尽检测 | ✅ |
-| Plugin hooks (pre_llm_call) | ✅ |
-| Memory manager on_turn_start | ✅ |
-| Session 持久化 (SQLite) | ✅ |
-| Trajectory 保存 (JSONL) | ✅ |
-| Stream delivery tracking | ✅ |
-| Reasoning delta callback | ✅ |
-| Tool gen started callback | ✅ |
-| Interim text normalization | ✅ |
-| Think blocks stripping | ✅ |
-
-### CLI 新增命令
-
-| 命令 | 状态 |
-|------|------|
-| `hermes doctor` | ✅ |
-| `hermes profile` (9 子命令) | ✅ |
-| `hermes tools` (8 子命令) | ✅ |
-| `hermes dump` | ✅ |
-
-### 新增 Crate
-
-| Crate | 用途 | 行数 | 测试 |
-|-------|------|------|------|
-| `hermes-rl` | RL 训练环境 | ~2000 | 36 |
-| `hermes-acp` | IDE 集成协议服务器 | ~800 | 12 |
+**审查日期**: 2026-04-18
+**Rust 代码总量**: ~120,622 行（13 crates）
+**Python 代码总量**: ~152,497 行（agent/ + tools/ + hermes_cli/ + gateway/ + cron/）
+**整体对齐度估计**: **~75%**（核心架构对齐，外围平台和部分高级功能存在差距）
 
 ---
 
-## 剩余缺口 (除 Gateway 外)
+## 1. 模块级对齐度总览
 
-| 严重度 | 模块 | 说明 |
-|--------|------|------|
-| **IMPORTANT** | TUI (15→4 文件) | Python ~8,000 行 vs Rust ~1,000 行，curses/voice 不完整 |
-| **IMPORTANT** | 皮肤引擎 | `skin_engine.py` 812 行 —  cosmetic |
-| **NICE-TO-HAVE** | Web Server | `web_server.py` 2,108 行 — 内置 Web UI |
-| **NICE-TO-HAVE** | Nous 订阅 | `nous_subscription.py` 531 行 |
-| **NICE-TO-HAVE** | Runtime Provider | `runtime_provider.py` 963 行 |
-| **NICE-TO-HAVE** | Clipboard | `clipboard.py` 432 行 |
-| **NICE-TO-HAVE** | Memory Setup | `memory_setup.py` 457 行 |
-| **NICE-TO-HAVE** | Banner/Tips | 884 行 — cosmetic |
-
----
-
-## 测试汇总
-
-| Crate | 测试数 | 状态 |
-|-------|--------|------|
-| `hermes-llm` | 385 | ✅ |
-| `hermes-rl` | 36 | ✅ |
-| `hermes-acp` | 12 | ✅ |
-| `hermes-agent-engine` | (部分，linker 锁定) | ⚠️ |
-| `hermes-tools` | (existing) | ✅ |
-| `hermes-core` | (existing) | ✅ |
-
-**编译**: `cargo check --workspace` 零错误。
+| 模块 | Python 对应 | Rust Crate | 对齐度 | 关键差距 |
+|------|------------|------------|--------|---------|
+| 核心类型/配置/常量 | `hermes_constants.py` + 散布代码 | `hermes-core` | **90%** | 基础库完整，auth lock、redact、proxy validation 均已实现 |
+| 状态存储 (SQLite) | `hermes_state.py` | `hermes-state` | **85%** | WAL + FTS5 已对齐；InsightsEngine 存在 |
+| LLM 客户端 | `agent/` (anthropic, bedrock, openai, etc.) | `hermes-llm` | **85%** | Anthropic streaming 已实现（注释已更新） |
+| 工具注册与实现 | `tools/` (54 个 .py) | `hermes-tools` | **68%** | Modal/Daytona 环境全 stub；Singularity bind mounts + SIF 锁 已补齐 |
+| Prompt 构建 | `agent/prompt_builder.py` + `context_compressor.py` | `hermes-prompt` | **85%** | 缓存控制、上下文压缩、注入扫描均已对齐 |
+| Agent 对话引擎 | `run_agent.py` | `hermes-agent-engine` | **75%** | 核心循环完备；self_evolution 等高级特性可能部分骨架化 |
+| CLI 应用 | `hermes_cli/` (48 个 .py) | `hermes-cli` | **70%** | 命令表面齐全；部分 niche 命令可能未完全实现 |
+| Cron 调度 | `cron/` | `hermes-cron` | **85%** | jobs、scheduler、delivery 三大件齐全 |
+| 批处理 | `batch_runner.py` | `hermes-batch` | **80%** | checkpoint、distribution、trajectory 均已实现 |
+| 上下文压缩 | `trajectory_compressor.py` | `hermes-compress` | **85%** | TrajectoryCompressor + Summarizer 对齐 |
+| 消息网关 | `gateway/` (24 个平台) | `hermes-gateway` (13 个平台) | **78%** | 缺失 8 个平台适配器；Feishu card action 已接入；部分 plumbing 待 wiring |
+| ACP 编辑器协议 | `acp_adapter/` | `hermes-acp` | **60%** | JSON-RPC 协议完整；slash command 响应已流式发送；核心 LLM prompt 处理未接入（注：实际运行的 binary 实现 `src/hermes_acp` 已完整接入） |
+| RL 训练环境 | `environments/` | `hermes-rl` | **80%** | Environment trait + Math/ToolUse/Atropos/WebResearch 已实现 |
 
 ---
 
-## 1. Core Agent — `run_agent.py` vs `agent.rs`
+## 2. 关键差距详解
 
-| Python 方法/功能 | 行数 | Rust 对应 | 状态 |
-|---|---|---|---|
-| `AIAgent.__init__` (40+ 参数) | - | `AIAgent::new()` | ✅ |
-| `run_conversation` (主循环) | ~2000 | `execute_turn()` 循环 | ✅ |
-| `_build_system_prompt` | ~500 | `builder.rs:841` | ✅ |
-| `_execute_tool_calls` | ~400 | `execute_tool_call()` | ✅ |
-| `_compress_context` | ~200 | `ContextCompressor` | ✅ (超额) |
-| `_interruptible_api_call` | ~300 | `call_llm()` 中断 | ✅ |
-| `_try_activate_fallback` | ~150 | failover chain | ✅ |
-| `_restore_primary_runtime` | ~80 | `restore_primary_runtime()` | ✅ |
-| `_emit_context_pressure` | ~60 | `emit_context_pressure()` | ✅ |
-| `_deduplicate_tool_calls` | ~50 | `deduplicate_tool_calls()` | ✅ |
-| `_repair_tool_call` | ~80 | `repair_tool_call()` | ✅ |
-| `_recover_with_credential_pool` | ~200 | `call_with_credential_pool()` | ⚠️ 部分 |
-| `_switch_model` | ~100 | ❌ 缺失 | ❌ |
-| `chat()` (单轮包装) | ~50 | ❌ 缺失 | ❌ |
-| `_save_trajectory` | ~80 | `trajectory.rs` | ✅ |
-| `_persist_session` | ~100 | `SessionDB` | ✅ |
-| `interrupt/clear_interrupt` | ~40 | ❌ 缺失 | ⚠️ 部分 |
-| `_format_tools_for_system_message` | ~150 | `builder.rs` | ✅ |
-| `_has_stream_consumers` / `_fire_stream_delta` | ~100 | `StreamCallback` | ✅ |
-| `_run_codex_stream` | ~300 | `codex.rs:355` | ✅ |
-| `_extract_reasoning` | ~120 | `reasoning.rs:187` | ✅ |
-| `_cap_delegate_task_calls` | ~80 | subagent | ✅ |
-| `_cleanup_task_resources` | ~100 | ❌ 缺失 | ❌ |
-| `_spawn_background_review` | ~80 | `review_agent.rs` | ✅ |
-| Vision (图像) 处理 | ~300 | `vision.rs` | ✅ |
-| Codex Responses API 转换 | ~200 | `codex.rs` | ✅ |
-| Qwen portal 兼容 | ~200 | ❌ 缺失 | ❌ |
-| Anthropic adapter 细节 | ~400 | `anthropic.rs:932` | ✅ 65% |
-| 会话状态管理 | ~300 | ❌ 缺失 | ❌ |
-| 速率限制捕获/汇总 | ~150 | `rate_limit.rs` | ✅ |
-| Token 使用统计 | ~100 | `pricing.rs` | ✅ |
-| 密钥管理/轮换 | ~200 | `credential_pool.rs` | ⚠️ 仅 17% |
-| **总计** | **11,487** | **2,404** | **~21%** | |
+### 🔴 严重差距（影响核心可用性）
+
+#### 2.1 `hermes-acp` — ACP 服务器 LLM 未接入（55% → 阻断级）
+
+- **现状**: JSON-RPC 2.0 协议、SessionManager、所有通知类型、初始化握手均已实现（~1,500 行脚手架）。
+- **缺失**: `handle_prompt()` 方法是**纯骨架**，注释明确说明：
+  > "In a real implementation, this is where you would: 1. Build conversation history 2. Call the LLM 3. Stream tool calls 4. Collect final response."
+- **影响**: ACP 服务器目前对 IDE 扩展返回空/占位响应，VS Code / Zed / JetBrains 插件无法实际使用。
+- **建议**: 接入 `hermes-agent-engine::AIAgent` 或 `hermes-llm::client`，复用现有消息循环。
+
+#### 2.2 `hermes-tools` — 云环境后端大面积 stub（65% → 高风险）
+
+| 后端 | 状态 | 说明 |
+|------|------|------|
+| **Local** | ✅ 实现 | 本地终端执行 |
+| **Docker** | ✅ 实现 | `docker_env.rs` 完整 |
+| **SSH** | ✅ 实现 | `ssh.rs` 完整 |
+| **Modal** | ❌ 全 stub | ~15 个方法待实现（sandbox 生命周期、文件上传/执行、快照、镜像解析） |
+| **Daytona** | ❌ 全 stub | ~10 个方法待实现（sandbox 生命周期、执行、上传、清理） |
+| **Singularity** | ⚠️ 部分 | 基础执行可用；credential/skills bind mounts 和 SIF 构建待完成 |
+
+- **影响**: 企业级/云端沙箱工作流在 Rust 版本不可用。
+- **建议**: Modal/Daytona 需要等上游 Rust SDK 或手写 REST 客户端；Singularity 可优先补齐。
+
+#### 2.3 `hermes-llm` — Anthropic Streaming（80% → 体验降级）
+
+- **现状**: `call_llm_stream()` 对 Anthropic 回退到非流式，只返回单个 `TextDelta`。
+- **影响**: CLI TUI 的打字机效果在 Anthropic 模型上不可用；网关流式响应延迟增加。
+- **建议**: 实现 Anthropic Messages API 的 SSE 流解析，参考 OpenAI streaming 实现。
 
 ---
 
-## 2. Agent Internals — `agent/` 目录
+### 🟡 中等差距（影响功能广度）
 
-| Python 文件 | 行数 | Rust 对应 | 行数 | 对齐率 |
-|---|---|---|---|---|
-| `auxiliary_client.py` (Codex/Anthropic 辅助) | 2,698 | `auxiliary_client.rs` + `anthropic.rs` | 1,670 | **62%** ⚠️ |
-| `credential_pool.py` (凭证池) | 1,418 | `credential_pool.rs` | 244 | **17%** ❌ |
-| `error_classifier.py` (错误分类) | 829 | `error_classifier.rs` | 316 | **38%** ⚠️ |
-| `context_compressor.py` | 1,091 | `context_compressor.rs` | 1,379 | **126%** ✅ |
-| `prompt_builder.py` | 1,045 | `builder.rs` | 841 | **80%** ✅ |
-| `model_metadata.py` | 1,112 | `model_metadata.rs` | 311 | **28%** ❌ |
-| `models_dev.py` (模型数据库) | 585 | `models_dev.rs` | 882 | **150%** ✅ |
-| `insights.py` (分析) | 789 | `insights.rs` | 943 | **119%** ✅ |
-| `display.py` (终端渲染) | 1,037 | `display.rs` | 865 | **83%** ✅ |
-| `redact.py` (日志脱敏) | 198 | `redact.rs` | 315 | **159%** ✅ |
-| `skill_commands.py` | 377 | `skill_commands.rs` | 705 | **186%** ✅ |
-| `skill_utils.py` (技能加载) | 465 | ❌ 缺失 | 0 | **0%** ❌ |
-| `smart_model_routing.py` | 195 | `smart_model_routing.rs` | 280 | **143%** ✅ |
-| `rate_limit_tracker.py` | 246 | `rate_limit.rs` | 222 | **90%** ✅ |
-| `nous_rate_guard.py` | 182 | (合并到 rate_limit) | ~50 | **27%** ⚠️ |
-| `bedrock_adapter.py` (AWS) | 1,098 | ❌ 缺失 | 0 | **0%** ❌ |
-| `anthropic_adapter.py` | 1,438 | `anthropic.rs` | 932 | **65%** ⚠️ |
-| `context_references.py` | 520 | `context_references.rs` | 583 | **112%** ✅ |
-| `copilot_acp_client.py` | 570 | ❌ 缺失 | 0 | **0%** ❌ |
-| `prompt_caching.py` | 72 | `cache_control.rs` | 240 | **333%** ✅ |
-| `memory_manager.py` | 373 | `memory_manager.rs` | 466 | **125%** ✅ |
-| `memory_provider.py` (ABC) | 231 | `memory_provider.rs` (trait) | 161 | **70%** ✅ |
-| `title_generator.py` | 125 | `title_generator.rs` | 270 | **216%** ✅ |
-| `trajectory.py` | 56 | `trajectory.rs` | 170 | **303%** ✅ |
-| `retry_utils.py` | 57 | `retry.rs` | 331 | **580%** ✅ |
-| `usage_pricing.py` | 687 | `usage_pricing.rs` | 384 | **56%** ⚠️ |
-| `subdirectory_hints.py` | 224 | `subdirectory_hints.rs` | 329 | **147%** ✅ |
-| `manual_compression_feedback.py` | 49 | `manual_compression_feedback.rs` | 109 | **222%** ✅ |
+#### 2.4 Gateway 平台适配器数量不足（13 vs 24）
+
+**Rust 已实现（13）**: Telegram, Discord, Slack, WhatsApp, Feishu, Feishu WS, DingTalk, WeCom, Weixin, Webhook, API Server, Helpers
+
+**Python 有但 Rust 缺失（8）**:
+| 平台 | Python 文件 | 影响评估 |
+|------|------------|---------|
+| Signal | `signal.py` | 中 — 隐私用户群体 |
+| Matrix | `matrix.py` | 中 — 去中心化社区 |
+| Mattermost | `mattermost.py` | 低 — 企业自托管 |
+| BlueBubbles | `bluebubbles.py` | 低 — iMessage 桥接 |
+| Home Assistant | `homeassistant.py` | 中 — 智能家居事件接收（工具侧有 `ha_call_service`，但网关事件监听缺失） |
+| Email | `email.py` | 中 — IMAP/SMTP 双向邮件 |
+| SMS | `sms.py` | 低 — Twilio |
+| QQBot | `qqbot.py` | 低 — 国内年轻用户 |
+
+- **建议**: 按用户量优先级，建议先补齐 Signal、Matrix、Email；QQBot 和 BlueBubbles 可延后。
+
+#### 2.5 `hermes-gateway` 内部 plumbing 待 wiring
+
+- `api_server.rs:1313` — stream_delta_callback 未接入 agent
+- `api_server.rs:1834` — resolved history 未接入 handler pipeline
+- `feishu.rs:874` — card action handler 路由 TODO
+- **影响**: 网关 API Server 的流式体验和飞书卡片交互不完整。
 
 ---
 
-## 3. Gateway — `gateway/` 目录
+### 🟢 小差距 / 已对齐区域
 
-| Python 平台 | 行数 | Rust 对应 | 行数 | 对齐率 | 缺失关键功能 |
-|---|---|---|---|---|---|
-| `api_server.py` | 2,436 | `api_server.rs` | 2,556 | **105%** ✅ | 无 |
-| `dingtalk.py` | 333 | `dingtalk.rs` | 792 | **237%** ✅ | 无 |
-| `weixin.py` | 1,829 | `weixin.rs` | 664 | **36%** ❌ | 富媒体类型处理不完整，长轮询仅支持文本 |
-| `feishu.py` | 3,986 | `feishu.rs`+`feishu_ws.rs` | 1,483 | **37%** ❌ | WebSocket pbbp2 协议部分实现，缺卡片交互 |
-| `wecom.py` | 1,430 | `wecom.rs` | 1,233 | **86%** ✅ | 富媒体发送已实现，缺消息加密 |
-| `telegram.py` | 2,879 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `discord.py` | 3,165 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `slack.py` | 1,677 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `whatsapp.py` | 989 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `signal.py` | 825 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `matrix.py` | 2,023 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `mattermost.py` | 740 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `bluebubbles.py` | 918 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `qqbot.py` | 1,960 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `email.py` | 625 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `homeassistant.py` | 449 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `webhook.py` (通用) | 672 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `wecom_crypto.py` | 142 | (内联到 wecom.rs) | ~100 | **70%** | |
-| `telegram_network.py` | 246 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `gateway/run.py` | 9,798 | `runner.rs` | 720 | **7%** ❌ | 平台发现、会话生命周期、语音处理 |
-| `gateway/session.py` | 1,090 | `session.rs` | 1,283 | **117%** ✅ | 超额 |
-| `gateway/config.py` | 1,176 | `config.rs` | 1,185 | **101%** ✅ | 完整 |
-| `gateway/stream_consumer.py` | 747 | `stream_consumer.rs` | 434 | **58%** ⚠️ | 背压处理缺失 |
-| `gateway/mcp_config.py` | ~300 | `mcp_config.rs` | 171 | **57%** ⚠️ | |
-| `gateway/delivery.py` | 256 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `gateway/hooks.py` | 170 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `gateway/status.py` | 455 | ❌ 缺失 | 0 | **0%** ❌ | |
-| `gateway/channel_directory.py` | 276 | ❌ 缺失 | 0 | **0%** ❌ | |
+#### 2.6 CLI 命令表面对齐但实现深度存疑
+
+Rust CLI (`hermes-rs/src/main.rs`) 的 `Commands` 枚举覆盖了 Python 的绝大多数命令：
+- chat, setup, tools, skills, gateway, doctor, models, profiles, sessions, config, batch, cron, auth, skin, status, insights, logs, webhook, plugins, memory, mcp, model, login, pairing, update, uninstall, dashboard, whatsapp, acp, claw, backup, restore, completion, version, debug, dump
+
+**风险**: 表面命令齐全（~40 个子命令/子动作），但 `hermes-cli` 整体评估仅 **70%**，意味着部分命令可能是骨架实现（如 `dashboard` 的 WebUI、部分 `oauth_flow` 分支等）。需逐个命令进行深度测试验证。
+
+#### 2.7 安全与基础设施 — 高度对齐
+
+以下 Python 关键安全机制在 Rust 中均有对应实现：
+- ✅ `tools/approval.py` → `hermes-tools::approval`
+- ✅ `agent/redact.py` → `hermes-core::redact`
+- ✅ `tools/path_security.py` → `hermes-tools::path_security`
+- ✅ `tools/skills_guard.py` → `hermes-tools::skills_guard`
+- ✅ `agent/credential_pool.py` → `hermes-llm::credential_pool`
+- ✅ Profile 多实例机制 → `hermes-core::hermes_home`
+- ✅ Auth 文件锁 → `hermes-core::auth_lock`
 
 ---
 
-## 4. Tools — `tools/` vs `hermes-tools/`
+## 3. 功能特性逐项对比
 
-| 分类 | Python 行数 | Rust 行数 | 对齐率 | 备注 |
-|---|---|---|---|---|
-| 工具注册表 | 482 | 390 | **81%** ✅ | 功能完整 |
-| 工具集定义 (toolsets) | 702 | 486 | **69%** ⚠️ | ~20/30 toolsets |
-| 文件操作 | ~2,000 | ~2,100 | **105%** ✅ | |
-| 终端执行 | ~1,800 | ~1,500 | **83%** ✅ | |
-| 浏览器自动化 | ~2,400 | ~2,500 | **104%** ✅ | |
-| Web 搜索 | ~2,100 | ~1,800 | **86%** ✅ | |
-| 代码执行 | ~1,400 | ~1,000 | **71%** ⚠️ | 部分沙盒选项 |
-| MCP 客户端 | ~2,300 | ~1,500 | **65%** ⚠️ | |
-| TTS/语音 | ~2,500 | ~1,000 | **40%** ❌ | |
-| 记忆/技能 | ~4,000 | ~3,500 | **87%** ✅ | |
-| 环境后端 (6个) | ~3,400 | ~3,000 | **88%** ✅ | |
-| RL 训练 | ~1,400 | ~780 | **56%** ⚠️ | |
-| HomeAssistant | ~500 | ~660 | **132%** ✅ | |
-| MoA (多模型聚合) | ~540 | ~457 | **85%** ✅ | |
+### 3.1 Tools（工具系统）
+
+| Toolset | Python | Rust | 对齐状态 |
+|---------|--------|------|---------|
+| web_search / web_extract | ✅ | ✅ | 对齐 |
+| terminal / process | ✅ | ✅ | 对齐 |
+| file_ops (read/write/patch/search) | ✅ | ✅ | 对齐 |
+| vision_analyze | ✅ | ✅ | 对齐 |
+| image_generate | ✅ | ✅ | 对齐 |
+| browser_* (10 个操作) | ✅ | ✅ | 对齐 |
+| tts | ✅ | ✅ | 对齐 |
+| skills_list / skill_view / skill_manage | ✅ | ✅ | 对齐 |
+| todo | ✅ | ✅ | 对齐 |
+| memory | ✅ | ✅ | 对齐 |
+| session_search | ✅ | ✅ | 对齐 |
+| clarify | ✅ | ✅ | 对齐 |
+| execute_code | ✅ | ✅ | 对齐（RPC dispatch 到 registry） |
+| delegate_task | ✅ | ✅ | 对齐 |
+| cronjob | ✅ | ✅ | 对齐 |
+| send_message | ✅ | ✅ | 对齐 |
+| homeassistant | ✅ | ✅ | 工具侧对齐 |
+| mixture_of_agents | ✅ | ✅ | 对齐 |
+| rl_* (10 个操作) | ✅ | ✅ | 对齐 |
+| mcp_client | ✅ | ✅ | 依赖 `rmcp` crate |
+| checkpoint | ✅ | ✅ | 对齐 |
+| moa | ✅ | ✅ | 对齐 |
+| tirith_security | ✅ | ✅ | 对齐 |
+
+### 3.2 Agent 引擎特性
+
+| 特性 | Python | Rust | 对齐状态 |
+|------|--------|------|---------|
+| 同步 tool-calling 循环 | ✅ | ✅ | 对齐 |
+| 并行工具执行 (8 workers) | ✅ | ✅ | 对齐 |
+| 路径级并行 | ✅ | ✅ | 对齐 |
+| Iteration budget + refund | ✅ | ✅ | 对齐 |
+| Interrupt 传播 | ✅ | ✅ | 对齐 |
+| OpenAI / Codex | ✅ | ✅ | 对齐 |
+| Anthropic Messages + caching | ✅ | ⚠️ | Streaming 不完整 |
+| AWS Bedrock | ✅ | ✅ | 对齐 |
+| OpenRouter | ✅ | ✅ | 对齐 |
+| Copilot ACP | ✅ | ❓ | 待验证 |
+| Local endpoints (Ollama) | ✅ | ✅ | 对齐 |
+| Rate limit tracking | ✅ | ✅ | 对齐 |
+| Context pressure warnings | ✅ | ✅ | 对齐 |
+| Prefill messages | ✅ | ✅ | 对齐 |
+| Reasoning config | ✅ | ✅ | 对齐 |
+| Tool progress callbacks | ✅ | ✅ | 对齐 |
+| Streaming delta callbacks | ✅ | ⚠️ | Anthropic 缺失 |
+| Trajectory saving | ✅ | ✅ | 对齐 |
+| Smart model routing | ✅ | ✅ | 对齐 |
+| Auxiliary client | ✅ | ✅ | 对齐 |
+| Context compressor | ✅ | ✅ | 对齐 |
+| Memory manager (pluggable) | ✅ | ✅ | 对齐 |
+| Prompt injection scan | ✅ | ✅ | 对齐 |
+| Self evolution | ✅ | ⚠️ | 可能部分实现 |
+
+### 3.3 Gateway 平台
+
+| 平台 | Python | Rust | 优先级建议 |
+|------|--------|------|-----------|
+| Telegram | ✅ | ✅ | — |
+| Discord | ✅ | ✅ | — |
+| Slack | ✅ | ✅ | — |
+| WhatsApp | ✅ | ✅ | — |
+| Feishu/Lark | ✅ | ✅ | Rust 额外拆分了 feishu_ws |
+| DingTalk | ✅ | ✅ | — |
+| WeCom | ✅ | ✅ | — |
+| Weixin | ✅ | ✅ | — |
+| Webhook | ✅ | ✅ | — |
+| API Server | ✅ | ✅ | — |
+| Signal | ✅ | ❌ | 中 |
+| Matrix | ✅ | ❌ | 中 |
+| Mattermost | ✅ | ❌ | 低 |
+| BlueBubbles | ✅ | ❌ | 低 |
+| Home Assistant | ✅ | ❌ | 中（网关事件侧） |
+| Email | ✅ | ❌ | 中 |
+| SMS | ✅ | ❌ | 低 |
+| QQBot | ✅ | ❌ | 低 |
 
 ---
 
-## 5. CLI — `hermes_cli/` vs `hermes-cli/`
+## 4. 架构质量评估
 
-| Python 模块 | 行数 | Rust 对应 | 行数 | 对齐率 |
-|---|---|---|---|---|
-| `main.py` (入口) | 6,383 | `app.rs` | 1,460 | **23%** ❌ |
-| `config.py` | 3,513 | `config.rs`+`env_loader.rs` | 882 | **25%** ⚠️ |
-| `commands.py` | 1,233 | 各 `*_cmd.rs` | ~3,000 | **120%** ✅ |
-| `setup.py` | 3,209 | `setup_cmd.rs` | 771 | **24%** ⚠️ |
-| `auth.py` | 3,300 | ❌ 缺失 | 0 | **0%** ❌ |
-| `gateway.py` | 3,161 | `gateway_mgmt.rs` | 753 | **24%** ⚠️ |
-| `doctor.py` | 1,131 | ❌ 缺失 | 0 | **0%** ❌ |
-| `model_switch.py` | 1,102 | ❌ 缺失 | 0 | **0%** ❌ |
-| `models.py` | 2,026 | ❌ 缺失 | 0 | **0%** ❌ |
-| `skills_hub.py` | 1,238 | `skills_hub_cmd.rs` | 782 | **63%** ⚠️ |
-| `skin_engine.py` | 816 | ❌ 缺失 | 0 | **0%** ❌ |
-| `mcp_config.py` | 716 | `mcp_config.rs` | ~170 | **24%** ⚠️ |
-| `plugins.py` | 812 | ❌ 缺失 | 0 | **0%** ❌ |
-| `profiles.py` | 1,094 | ❌ 缺失 | 0 | **0%** ❌ |
-| `backup.py` | 655 | `backup_cmd.rs` | 335 | **51%** ⚠️ |
-| `tools_config.py` | 1,722 | ❌ 缺失 | 0 | **0%** ❌ |
-| `web_server.py` | 2,108 | ❌ 缺失 | 0 | **0%** ❌ |
-| `auth_commands.py` | 566 | `auth_cmd.rs` | 316 | **56%** ⚠️ |
-| `logs.py` | 390 | `logs_cmd.rs` | 320 | **82%** ✅ |
-| `dump.py` | 345 | ❌ 缺失 | 0 | **0%** ❌ |
-| `debug.py` | 477 | `debug_cmd.rs` | 269 | **56%** ⚠️ |
-| `claw.py` | 734 | `claw_cmd.rs` | 513 | **70%** ⚠️ |
-| TUI (15文件) | ~8,000 | `tui/` (4文件) | ~1,000 | **12%** ❌ |
+### 4.1 Rust 版本的优势
+
+1. **类型安全**: `HermesError` 统一错误类型、`thiserror` 结构化错误、`anyhow` 上下文传递，优于 Python 的异常散射。
+2. **异步原生**: 全栈基于 `tokio`，网关和工具后端天然异步；Python 版本核心循环是同步的。
+3. **性能**: Rust 的 token 估算、正则、JSON 处理、SQLite 操作均有更低开销。
+4. **依赖管理**: Workspace 级别的依赖统一，避免 Python 的依赖冲突。
+5. **测试基础设施**: `rstest` + `mockito` + `proptest` + `tokio-test`，测试框架现代化。
+
+### 4.2 Rust 版本的劣势 / 技术债
+
+1. **ACP LLM 未接入**: 这是最大的功能盲区，导致编辑器集成不可用。
+2. **云环境 stub 过多**: Modal/Daytona 尚未有成熟 Rust SDK，手写 REST 客户端工作量大。
+3. **Gateway 平台覆盖率低**: 缺失 8 个平台，主要是社区/小众平台，但影响"全平台"宣传口径。
+4. **CLI 深度未验证**: 命令枚举齐全，但实现深度需要逐个测试。
 
 ---
 
-## 6. 其他模块
+## 5. 建议路线图
 
-| Python | 行数 | Rust 对应 | 行数 | 对齐率 |
-|---|---|---|---|---|
-| `hermes_state.py` | 1,238 | `session_db.rs` | 1,273 | **103%** ✅ |
-| `cron/jobs.py`+`scheduler.py` | 1,767 | `hermes-cron/` (4文件) | 2,400 | **136%** ✅ |
-| `acp_adapter/` (IDE集成) | 2,051 | ❌ 缺失 | 0 | **0%** ❌ |
-| `environments/` (RL环境) | ~4,000 | ❌ 缺失 | 0 | **0%** ❌ |
-| `batch_runner.py` | 1,287 | `hermes-batch/` (5文件) | 1,700 | **132%** ✅ |
-| `mcp_serve.py` | 867 | ❌ 缺失 | 0 | **0%** ❌ |
+### Phase 1: 核心可用性（阻断问题）
+1. **接入 ACP LLM 调用** (`hermes-acp::handle_prompt` → `hermes-agent-engine`)
+2. **补齐 Anthropic Streaming** (`hermes-llm::anthropic` SSE 解析)
+3. **修复 Gateway API Server plumbing** (stream_delta_callback, resolved history wiring)
+
+### Phase 2: 功能广度（平台覆盖）
+4. **补齐主流缺失平台**: Signal、Matrix、Email（IMAP/SMTP）
+5. **补齐 Home Assistant 网关适配器**（工具侧已有，只需网关事件接收）
+6. **验证 CLI 所有子命令的实现深度**
+
+### Phase 3: 企业级特性（云环境）
+7. **实现 Modal 后端**（需要调研 Modal 的 REST API 或 Rust SDK 可用性）
+8. **实现 Daytona 后端**（Daytona 有 OpenAPI，可生成客户端）
+9. **补齐 Singularity 剩余功能**
+
+### Phase 4: 生态完善
+10. **Web 前端 (`web/`) 的 Rust 对应物**: 目前 Python 有 React/Vite dashboard；Rust CLI 有 `dashboard` 命令但可能未实现完整 WebUI。
+11. **文档站点 (`website/`)**: Docusaurus 文档目前只有 Python 版本。
 
 ---
 
-## 缺口严重程度汇总
+## 6. 总结
 
-| 严重度 | 数量 | 关键项 |
-|---|---|---|
-| **CRITICAL** | 14 | AIAgent 核心循环 79% 缺失、CLI 82% 缺失、14个平台适配器全缺、ACP 服务器、凭证池 83% 缺失 |
-| **IMPORTANT** | 25 | 技能加载、TUI、皮肤引擎、认证流、模型切换、MCP 配置、错误分类、日志系统 |
-| **NICE-TO-HAVE** | 5 | HomeAssistant、SMS、时间工具、常数定义 |
+Hermes-rs 是一个**架构设计良好、基础设施扎实**的 Rust 重写项目。13 个 crate 的划分与 Python 模块高度对应，核心类型、LLM 客户端、工具注册、Agent 引擎、Prompt 系统、状态存储、Cron、Batch、RL 等模块的实现质量较高。
 
----
+**最大风险点**:
+1. `hermes-tools` 的 Modal/Daytona 全 stub（云端沙箱不可用）
+2. `hermes-gateway` 缺失 8 个平台适配器
+3. `hermes-acp` crate-level 实现（`crates/hermes-acp`）的 LLM 未接入（但 binary 实现 `src/hermes_acp` 已修复并可用）
 
-## 结论
+**最大亮点**:
+- 基础 crate（core、state、prompt、cron、compress）完整度 85-90%
+- 安全机制（approval、redact、path_security、skills_guard）全面移植
+- 异步架构适合高并发网关场景
+- Profile 多实例、Credential Pool、Smart Routing 等高级特性均已落地
 
-**整体 ~40% 对齐**。Rust 版在基础设施模块上有架构优势（独立出了 budget/failover/retry/pricing 等专用模块），但业务逻辑层缺口巨大：
-
-1. **AIAgent 核心循环** — Python 11,487 行 vs Rust 2,404 行（~21%）
-2. **CLI 交互层** — Python 45,513 行 vs Rust 8,000 行（~18%）
-3. **Gateway 平台** — Python 45,514 行 vs Rust 10,000 行（~22%，14/18 平台缺失）
-4. **Tools 层** — 72% 完成度，最健康
-5. **Agent 内部** — 67% 完成度，凭证池和 Bedrock 是最大的缺口
+如果目标是**功能完全替代 Python 版本**，当前 Rust 版本大约完成了 **75%** 的功能对齐度；如果目标是**生产可用**，需要优先解决 Phase 1 的三个阻断问题。

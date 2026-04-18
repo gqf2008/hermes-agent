@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Generic webhook platform adapter.
 //!
 //! Runs an axum HTTP server that receives webhook POSTs from external
@@ -131,8 +132,8 @@ struct WebhookState {
     delivery_info_created: Arc<RwLock<HashMap<String, f64>>>,
     handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
     running: Arc<std::sync::atomic::AtomicBool>,
-    running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
-    busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+    running_sessions: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+    busy_ack_ts: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
     session_store: Arc<SessionStore>,
     cross_platform: Arc<RwLock<Option<Arc<dyn CrossPlatformDelivery>>>>,
 }
@@ -192,8 +193,8 @@ impl WebhookAdapter {
         &self,
         handler: Arc<Mutex<Option<Arc<dyn MessageHandler>>>>,
         running: Arc<std::sync::atomic::AtomicBool>,
-        running_sessions: Arc<std::sync::Mutex<HashMap<String, f64>>>,
-        busy_ack_ts: Arc<std::sync::Mutex<HashMap<String, f64>>>,
+        running_sessions: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
+        busy_ack_ts: Arc<parking_lot::Mutex<HashMap<String, f64>>>,
         session_store: Arc<SessionStore>,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), String> {
@@ -367,8 +368,8 @@ impl WebhookAdapter {
             "[webhook] Reloaded dynamic route(s): {}",
             {
                 let routes = self.routes.read().await;
-                let dynamic_count = routes.len() - self.config.static_routes.len();
-                dynamic_count
+                
+                routes.len() - self.config.static_routes.len()
             }
         );
     }
@@ -475,15 +476,14 @@ async fn handle_webhook(
 
     // Validate HMAC signature
     let secret = route_config.secret.as_ref().unwrap_or(&state.config.global_secret);
-    if !secret.is_empty() && secret != INSECURE_NO_AUTH {
-        if !validate_signature(&headers, &body, secret) {
+    if !secret.is_empty() && secret != INSECURE_NO_AUTH
+        && !validate_signature(&headers, &body, secret) {
             warn!("[webhook] Invalid signature for route {}", route_name);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "Invalid signature"})),
             );
         }
-    }
 
     // Parse payload
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
@@ -505,8 +505,8 @@ async fn handle_webhook(
         .unwrap_or("unknown")
         .to_string();
 
-    if !route_config.events.is_empty() && !route_config.events.contains(&"*".to_string()) {
-        if !route_config.events.contains(&event_type) {
+    if !route_config.events.is_empty() && !route_config.events.contains(&"*".to_string())
+        && !route_config.events.contains(&event_type) {
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -515,7 +515,6 @@ async fn handle_webhook(
                 })),
             );
         }
-    }
 
     // Render prompt
     let prompt = render_prompt(&route_config.prompt, &payload, &event_type, &route_name);
@@ -601,7 +600,7 @@ async fn handle_webhook(
             .as_secs_f64();
 
         let busy_elapsed_min: Option<f64> = {
-            let sessions = running_sessions.lock().unwrap();
+            let sessions = running_sessions.lock();
             sessions.get(&chat_id).map(|&start_ts| {
                 let elapsed_secs = now - start_ts;
                 elapsed_secs / 60.0
@@ -610,7 +609,7 @@ async fn handle_webhook(
 
         if let Some(elapsed_min) = busy_elapsed_min {
             let should_ack = {
-                let mut ack_map = busy_ack_ts.lock().unwrap();
+                let mut ack_map = busy_ack_ts.lock();
                 let last_ack = ack_map.get(&chat_id).copied().unwrap_or(0.0);
                 if now - last_ack < 30.0 {
                     false
@@ -634,14 +633,14 @@ async fn handle_webhook(
         }
 
         {
-            let mut sessions = running_sessions.lock().unwrap();
+            let mut sessions = running_sessions.lock();
             sessions.insert(chat_id.clone(), now);
         }
 
         match handler_ref.handle_message(Platform::Webhook, &chat_id, &prompt).await {
             Ok(result) => {
-                running_sessions.lock().unwrap().remove(&chat_id);
-                busy_ack_ts.lock().unwrap().remove(&chat_id);
+                running_sessions.lock().remove(&chat_id);
+                busy_ack_ts.lock().remove(&chat_id);
 
                 if result.compression_exhausted {
                     let session_key = format!("webhook:{}", chat_id);
@@ -659,8 +658,8 @@ async fn handle_webhook(
                 }
             }
             Err(e) => {
-                running_sessions.lock().unwrap().remove(&chat_id);
-                busy_ack_ts.lock().unwrap().remove(&chat_id);
+                running_sessions.lock().remove(&chat_id);
+                busy_ack_ts.lock().remove(&chat_id);
                 error!("Agent handler failed for webhook message: {}", e);
                 let _ = deliver_response(
                     &chat_id,

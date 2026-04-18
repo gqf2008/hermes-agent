@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Time utilities.
 //!
 //! Mirrors the Python `hermes_time.py` module.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Secure credential storage with OS keychain fallback.
 //!
 //! Mirrors Python `auth.py` secure storage patterns:

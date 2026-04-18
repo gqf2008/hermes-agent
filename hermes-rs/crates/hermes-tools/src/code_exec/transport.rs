@@ -219,7 +219,7 @@ mod unix_impl {
             match parse_request(&line) {
                 Ok((tool, mut args)) => {
                     if !is_tool_allowed(&tool, allowed_tools) {
-                        let resp = tool_error(&format!("Tool '{tool}' is not allowed in sandbox"));
+                        let resp = tool_error(format!("Tool '{tool}' is not allowed in sandbox"));
                         writeln!(writer, "{}", resp)?;
                         continue;
                     }
@@ -233,7 +233,7 @@ mod unix_impl {
                     writeln!(writer, "{}", format_response(&result))?;
                 }
                 Err(e) => {
-                    let resp = tool_error(&format!("Invalid request: {e}"));
+                    let resp = tool_error(format!("Invalid request: {e}"));
                     writeln!(writer, "{}", resp)?;
                 }
             }

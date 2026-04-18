@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Configuration management commands for the Hermes CLI.
 //!
 //! Mirrors the Python `hermes config` subcommand.

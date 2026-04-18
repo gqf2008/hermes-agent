@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Batch processing subcommands.
 //!
 //! Exposes `hermes batch run` for parallel RL/data generation runs.

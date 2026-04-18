@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Home Assistant tools for controlling smart home devices via REST API.
 //!
 //! Mirrors the Python `tools/homeassistant_tool.py`.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Debug session infrastructure.
 //!
 //! Records tool calls to JSON log files when debug mode is activated

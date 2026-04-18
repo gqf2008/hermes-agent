@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Generic OAuth 2.0 flows: device code, authorization code, token refresh.
 //!
 //! Mirrors Python `auth.py` OAuth helpers:

@@ -97,9 +97,9 @@ pub struct DiscordAdapter {
     client: Client,
     dedup: MessageDeduplicator,
     /// Sequence number for gateway heartbeat.
-    seq: Arc<std::sync::Mutex<Option<u64>>>,
+    seq: Arc<parking_lot::Mutex<Option<u64>>>,
     /// Session ID for gateway resume.
-    session_id: Arc<std::sync::Mutex<Option<String>>>,
+    session_id: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl DiscordAdapter {
@@ -108,10 +108,13 @@ impl DiscordAdapter {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    Client::new()
+                }),
             dedup: MessageDeduplicator::with_params(300, 2000),
-            seq: Arc::new(std::sync::Mutex::new(None)),
-            session_id: Arc::new(std::sync::Mutex::new(None)),
+            seq: Arc::new(parking_lot::Mutex::new(None)),
+            session_id: Arc::new(parking_lot::Mutex::new(None)),
             config,
         }
     }
@@ -255,7 +258,7 @@ impl DiscordAdapter {
         while running.load(Ordering::SeqCst) {
             // Check if we need to send heartbeat
             if last_heartbeat.elapsed() >= heartbeat_duration {
-                let s = *self.seq.lock().unwrap();
+                let s = *self.seq.lock();
                 let heartbeat = serde_json::json!({"op": 1, "d": s});
                 write
                     .send(WsMessage::Text(heartbeat.to_string().into()))
@@ -273,7 +276,7 @@ impl DiscordAdapter {
                         .map_err(|e| format!("Event parse error: {e}"))?;
 
                     if let Some(s) = event.get("s").and_then(|v| v.as_u64()) {
-                        *self.seq.lock().unwrap() = Some(s);
+                        *self.seq.lock() = Some(s);
                     }
 
                     let opcode = event.get("op").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -287,7 +290,7 @@ impl DiscordAdapter {
                                             if let Some(session_id) =
                                                 d.get("session_id").and_then(|v| v.as_str())
                                             {
-                                                *self.session_id.lock().unwrap() =
+                                                *self.session_id.lock() =
                                                     Some(session_id.to_string());
                                                 info!("Discord Gateway READY");
                                             }
@@ -331,7 +334,7 @@ impl DiscordAdapter {
                         }
                         1 => {
                             // Heartbeat request — send heartbeat immediately
-                            let s = *self.seq.lock().unwrap();
+                            let s = *self.seq.lock();
                             let heartbeat = serde_json::json!({"op": 1, "d": s});
                             write
                                 .send(WsMessage::Text(heartbeat.to_string().into()))
@@ -486,12 +489,12 @@ impl DiscordAdapter {
             .map_err(|e| format!("download bytes error: {e}"))?;
 
         let cache_dir = hermes_core::get_hermes_home().join("discord").join("media");
-        std::fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir failed: {e}"))?;
+        tokio::fs::create_dir_all(&cache_dir).await.map_err(|e| format!("mkdir failed: {e}"))?;
 
         let safe_name = file_name.replace('/', "_");
         let local_path = cache_dir.join(safe_name);
 
-        std::fs::write(&local_path, bytes).map_err(|e| format!("write failed: {e}"))?;
+        tokio::fs::write(&local_path, bytes).await.map_err(|e| format!("write failed: {e}"))?;
 
         Ok(local_path.to_string_lossy().to_string())
     }

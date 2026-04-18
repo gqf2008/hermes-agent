@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Proxy and base URL validation.
 //!
 //! Fail-fast detection of malformed proxy environment variables and custom
@@ -51,7 +52,7 @@ fn looks_like_valid_url(value: &str) -> bool {
         return false;
     }
     // After the scheme, there should be a host part
-    let after_scheme = value.splitn(2, "://").nth(1).unwrap_or("");
+    let after_scheme = value.split_once("://").map(|x| x.1).unwrap_or("");
     if after_scheme.is_empty() {
         return false;
     }
@@ -61,7 +62,7 @@ fn looks_like_valid_url(value: &str) -> bool {
     }
     // If there's a port (host:port), the port part should be purely numeric
     // until the first `/` or `?`. Catches `http://127.0.0.1:6153export`.
-    let host_part = after_scheme.splitn(2, '/').next().unwrap_or(after_scheme);
+    let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
     if let Some(colon_idx) = host_part.rfind(':') {
         let port_and_auth = &host_part[colon_idx + 1..];
         // Strip userinfo if present (user:pass@host)

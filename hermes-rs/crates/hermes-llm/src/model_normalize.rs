@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Per-provider model name normalization.
 //!
 //! Mirrors Python `hermes_cli/model_normalize.py`.

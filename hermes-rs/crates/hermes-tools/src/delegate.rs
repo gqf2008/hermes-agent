@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Delegate tool — spawn subagents with isolated context.
 //!
 //! Mirrors the Python `tools/delegate_tool.py`.

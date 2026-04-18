@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Cron management subcommands.
 //!
 //! Mirrors Python: hermes cron list/create/pause/resume/delete/edit/run/status/tick

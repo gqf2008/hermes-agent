@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use hermes_agent_engine::agent::{AgentConfig, AIAgent};
+use hermes_core::HermesConfig;
 use hermes_tools::registry::ToolRegistry;
 use std::sync::Arc;
 
@@ -558,17 +559,60 @@ struct AgentRunResult {
     cached_read_tokens: Option<u64>,
 }
 
+/// Resolve the default model from config, env vars, or a hardcoded fallback.
+fn resolve_default_model() -> String {
+    // 1. Try Hermes config.yaml
+    if let Ok(config) = HermesConfig::load() {
+        if let Some(model) = config.model.name {
+            if !model.is_empty() {
+                return model;
+            }
+        }
+    }
+    // 2. Try environment variables
+    if let Ok(model) = std::env::var("HERMES_DEFAULT_MODEL") {
+        if !model.is_empty() {
+            return model;
+        }
+    }
+    if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+        if !model.is_empty() {
+            return model;
+        }
+    }
+    if let Ok(model) = std::env::var("OPENAI_MODEL") {
+        if !model.is_empty() {
+            return model;
+        }
+    }
+    // 3. Hardcoded fallback
+    "anthropic/claude-sonnet-4-6".to_string()
+}
+
 async fn run_agent(
     session_manager: &SessionManager,
     update_tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     session_id: &str,
     user_message: &str,
 ) -> AgentRunResult {
+    let default_model = resolve_default_model();
+
+    // Load full config to populate provider/base_url/api_key if available
+    let (provider, base_url, api_key) = if let Ok(config) = HermesConfig::load() {
+        (
+            config.model.provider,
+            config.model.base_url,
+            config.model.api_key,
+        )
+    } else {
+        (None, None, None)
+    };
+
     let config = AgentConfig {
-        model: String::new(),
-        provider: None,
-        base_url: None,
-        api_key: None,
+        model: default_model,
+        provider,
+        base_url,
+        api_key,
         api_mode: None,
         max_iterations: 20,
         skip_context_files: false,

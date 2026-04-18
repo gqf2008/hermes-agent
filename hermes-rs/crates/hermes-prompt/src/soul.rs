@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! SOUL.md loader — agent identity.
 //!
 //! Mirrors the Python `load_soul_md()` in `agent/prompt_builder.py`.

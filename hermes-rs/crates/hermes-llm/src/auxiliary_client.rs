@@ -240,14 +240,10 @@ fn try_anthropic() -> Option<String> {
         }
     }
     // Fall back to env vars
-    if std::env::var("ANTHROPIC_API_KEY")
+    std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .or_else(|| std::env::var("ANTHROPIC_TOKEN").ok())
-        .filter(|k| !k.is_empty())
-        .is_none()
-    {
-        return None;
-    }
+        .filter(|k| !k.is_empty())?;
     Some("anthropic".to_string())
 }
 
@@ -259,10 +255,12 @@ fn try_api_key_provider() -> Option<String> {
     // Try Gemini
     {
         let selection = select_pool_entry("gemini");
-        if selection.pool_exists && selection.entry.is_some() {
-            let key = pool_runtime_api_key(selection.entry.as_ref().unwrap());
-            if !key.is_empty() {
-                return Some("gemini".to_string());
+        if selection.pool_exists {
+            if let Some(ref entry) = selection.entry {
+                let key = pool_runtime_api_key(entry);
+                if !key.is_empty() {
+                    return Some("gemini".to_string());
+                }
             }
         }
     }
@@ -273,10 +271,12 @@ fn try_api_key_provider() -> Option<String> {
     // Try ZAI/GLM
     {
         let selection = select_pool_entry("zai");
-        if selection.pool_exists && selection.entry.is_some() {
-            let key = pool_runtime_api_key(selection.entry.as_ref().unwrap());
-            if !key.is_empty() {
-                return Some("zai".to_string());
+        if selection.pool_exists {
+            if let Some(ref entry) = selection.entry {
+                let key = pool_runtime_api_key(entry);
+                if !key.is_empty() {
+                    return Some("zai".to_string());
+                }
             }
         }
     }
@@ -292,10 +292,12 @@ fn try_api_key_provider() -> Option<String> {
     // Try Kimi
     {
         let selection = select_pool_entry("kimi");
-        if selection.pool_exists && selection.entry.is_some() {
-            let key = pool_runtime_api_key(selection.entry.as_ref().unwrap());
-            if !key.is_empty() {
-                return Some("kimi".to_string());
+        if selection.pool_exists {
+            if let Some(ref entry) = selection.entry {
+                let key = pool_runtime_api_key(entry);
+                if !key.is_empty() {
+                    return Some("kimi".to_string());
+                }
             }
         }
     }
@@ -306,10 +308,12 @@ fn try_api_key_provider() -> Option<String> {
     // Try Minimax
     {
         let selection = select_pool_entry("minimax");
-        if selection.pool_exists && selection.entry.is_some() {
-            let key = pool_runtime_api_key(selection.entry.as_ref().unwrap());
-            if !key.is_empty() {
-                return Some("minimax".to_string());
+        if selection.pool_exists {
+            if let Some(ref entry) = selection.entry {
+                let key = pool_runtime_api_key(entry);
+                if !key.is_empty() {
+                    return Some("minimax".to_string());
+                }
             }
         }
     }
@@ -334,7 +338,7 @@ fn try_api_key_provider() -> Option<String> {
 pub(crate) fn to_openai_base_url(base_url: &str) -> String {
     let url = base_url.trim().trim_end_matches('/');
     if url.ends_with("/anthropic") {
-        let rewritten = format!("{}/v1", &url[..url.len() - "/anthropic".len()]);
+        let rewritten = format!("{}/v1", url.strip_suffix("/anthropic").unwrap_or(url));
         tracing::debug!("Auxiliary client: rewrote base URL {} -> {}", url, rewritten);
         rewritten
     } else {
@@ -785,7 +789,7 @@ async fn do_openai_compat_request(
     // First attempt with max_tokens (if present)
     let result = send_json_request(http_client, url, headers, body, provider, model).await;
     match result {
-        Ok(resp) => return Ok(resp),
+        Ok(resp) => Ok(resp),
         Err(ref e) => {
             let err_str = format!("{e}");
             if err_str.contains("max_tokens") || err_str.contains("unsupported_parameter") {
@@ -798,7 +802,7 @@ async fn do_openai_compat_request(
                 tracing::debug!("Auxiliary client: max_tokens rejected, retrying with max_completion_tokens");
                 return send_json_request(http_client, url, headers, &retry_body, provider, model).await;
             }
-            return Err(e.clone());
+            Err(e.clone())
         }
     }
 }
@@ -853,14 +857,14 @@ fn parse_openai_response(
 ) -> Result<AuxiliaryResponse, ClassifiedError> {
     // Validate shape
     let choices = json.get("choices").and_then(|v| v.as_array());
-    if choices.map_or(true, |a| a.is_empty()) {
+    if choices.is_none_or(|a| a.is_empty()) {
         return Err(classify_api_error(provider, model, None, "API returned empty choices array"));
     }
     let choice = &choices.unwrap()[0];
     let message = choice.get("message");
-    if message.map_or(true, |m| {
+    if message.is_none_or(|m| {
         m.get("content").and_then(|v| v.as_str()).unwrap_or("").is_empty()
-            && m.get("tool_calls").map_or(true, |tc| tc.as_array().map_or(true, |a| a.is_empty()))
+            && m.get("tool_calls").is_none_or(|tc| tc.as_array().is_none_or(|a| a.is_empty()))
     }) {
         return Err(classify_api_error(
             provider, model, None,
@@ -1190,7 +1194,7 @@ fn resolve_task_provider_model(
     api_key: Option<&str>,
 ) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
     // Load config for the given task
-    let task_cfg = task.map(|t| load_auxiliary_task_config(t)).unwrap_or_default();
+    let task_cfg = task.map(load_auxiliary_task_config).unwrap_or_default();
 
     // Explicit args always win
     if let Some(url) = base_url {

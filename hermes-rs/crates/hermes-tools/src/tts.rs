@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Text-to-speech tool.
 //!
 //! Mirrors the Python `tools/tts_tool.py`.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Pre-execution command approval and dangerous command detection.
 //!
 //! Mirrors the Python `tools/approval.py`.

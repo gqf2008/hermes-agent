@@ -140,7 +140,7 @@ fn resolve_repo_dir() -> Option<PathBuf> {
 
 fn git_short_hash(repo_dir: &Path, rev: &str) -> Option<String> {
     let out = Command::new("git")
-        .args([&"rev-parse", &"--short=8", rev])
+        .args(["rev-parse", "--short=8", rev])
         .current_dir(repo_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -271,7 +271,7 @@ pub fn print_welcome_banner(
     // Model + context
     let model_short = model.split('/').next_back().unwrap_or(model);
     let model_short = if model_short.ends_with(".gguf") {
-        &model_short[..model_short.len() - 5]
+        model_short.strip_suffix(".gguf").unwrap_or(model_short)
     } else {
         model_short
     };

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Session search tool.
 //!
 //! Mirrors the Python `tools/session_search_tool.py`.

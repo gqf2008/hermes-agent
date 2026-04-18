@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Device pairing management.
 //!
 //! Mirrors Python: hermes pairing (list/approve/revoke/clear-pending)

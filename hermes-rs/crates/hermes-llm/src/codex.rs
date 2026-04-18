@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OpenAI Codex Responses API adapter.
 //!
 //! Mirrors the Python Codex Responses API support in `run_agent.py:3709-4627`.
@@ -117,8 +118,8 @@ impl CodexResponseStream {
                     pending_event = Some(rest.to_string());
                 } else if let Some(rest) = line.strip_prefix("data: ") {
                     pending_data = Some(rest.to_string());
-                } else if line.starts_with("data:") {
-                    pending_data = Some(line["data:".len()..].to_string());
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    pending_data = Some(rest.to_string());
                 }
             }
 
@@ -513,8 +514,7 @@ fn normalize_tool_arguments(arguments: Option<&Value>) -> String {
 /// Format: `call_<suffix>` -> response_item_id = `fc_<suffix>`
 fn split_responses_tool_id(tool_id: &str) -> (String, String) {
     let trimmed = tool_id.trim();
-    if trimmed.starts_with("call_") {
-        let suffix = &trimmed["call_".len()..];
+    if let Some(suffix) = trimmed.strip_prefix("call_") {
         let response_item_id = format!("fc_{suffix}");
         return (trimmed.to_string(), response_item_id);
     }
@@ -737,7 +737,7 @@ pub fn preflight_codex_kwargs(
 
     // Optional passthrough fields
     let reasoning = obj.get("reasoning").filter(|v| v.is_object()).cloned();
-    let include = obj.get("include").and_then(Value::as_array).map(|arr| arr.clone());
+    let include = obj.get("include").and_then(Value::as_array).cloned();
     let service_tier = obj
         .get("service_tier")
         .and_then(Value::as_str)

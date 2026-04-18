@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["docker", "mcp", "browser", "image"]
+docker = []
+mcp = []
+image = []
+browser = []
+
 [dependencies]
 hermes-core.workspace = true
 hermes-llm.workspace = true

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Budget configuration for tool result persistence.
 //!
 //! Three-layer defense against context-window overflow:

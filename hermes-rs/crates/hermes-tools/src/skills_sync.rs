@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Skills sync — manifest-based seeding of bundled skills.
 //!
 //! Copies bundled skills from the repo's `skills/` directory into
@@ -179,7 +180,7 @@ fn discover_bundled_skills(bundled_dir: &Path) -> Vec<(String, PathBuf)> {
         if exclude_prefixes.iter().any(|p| path_str.contains(p)) {
             continue;
         }
-        let skill_dir = path.parent().unwrap();
+        let skill_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let skill_name = read_skill_name(path, skill_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"));
         skills.push((skill_name, skill_dir.to_path_buf()));
     }

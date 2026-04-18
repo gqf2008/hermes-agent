@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Context reference parser.
 //!
 //! Handles `@file:path`, `@folder:path`, `@git`, `@url:https://...`,

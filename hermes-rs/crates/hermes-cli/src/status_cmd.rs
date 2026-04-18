@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Status command — show status of all Hermes components.
 
 use console::Style;

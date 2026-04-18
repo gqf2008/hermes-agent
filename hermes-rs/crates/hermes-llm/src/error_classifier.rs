@@ -1,4 +1,5 @@
 //! Error classification for API errors.
+#![allow(clippy::result_large_err)]
 //!
 //! Classifies HTTP and transport errors into actionable categories with
 //! hints for retry, fallback, compression, or credential rotation.
@@ -291,8 +292,8 @@ fn classify_by_status(
 
 /// Disambiguate 402: billing exhaustion vs transient usage limit.
 fn classify_402(msg: &str) -> (FailoverReason, ActionHints) {
-    let has_usage_limit = has_any_pattern(msg, &USAGE_LIMIT_PATTERNS);
-    let has_transient = has_any_pattern(msg, &USAGE_LIMIT_TRANSIENT_SIGNALS);
+    let has_usage_limit = has_any_pattern(msg, USAGE_LIMIT_PATTERNS);
+    let has_transient = has_any_pattern(msg, USAGE_LIMIT_TRANSIENT_SIGNALS);
 
     if has_usage_limit && has_transient {
         // Transient quota -- treat as rate limit
@@ -312,20 +313,20 @@ fn classify_400(
     ctx: &ErrorContextParams,
 ) -> (FailoverReason, ActionHints) {
     // Context overflow from message patterns
-    if has_any_pattern(msg, &CONTEXT_OVERFLOW_PATTERNS) {
+    if has_any_pattern(msg, CONTEXT_OVERFLOW_PATTERNS) {
         return (FailoverReason::ContextOverflow, H_CONTEXT_OVERFLOW);
     }
 
     // Model-not-found as 400 (e.g. OpenRouter)
-    if has_any_pattern(msg, &MODEL_NOT_FOUND_PATTERNS) {
+    if has_any_pattern(msg, MODEL_NOT_FOUND_PATTERNS) {
         return (FailoverReason::ModelNotFound, H_MODEL_NOT_FOUND);
     }
 
     // Rate limit / billing as 400 instead of 429/402
-    if has_any_pattern(msg, &RATE_LIMIT_PATTERNS) {
+    if has_any_pattern(msg, RATE_LIMIT_PATTERNS) {
         return (FailoverReason::RateLimit, H_RATE_LIMIT);
     }
-    if has_any_pattern(msg, &BILLING_PATTERNS) {
+    if has_any_pattern(msg, BILLING_PATTERNS) {
         return (FailoverReason::Billing, H_BILLING);
     }
 
@@ -360,19 +361,19 @@ fn classify_by_message(
     _ctx: &ErrorContextParams,
 ) -> Option<(FailoverReason, ActionHints)> {
     // Payload-too-large patterns (from message text when no status_code)
-    if has_any_pattern(msg, &PAYLOAD_TOO_LARGE_PATTERNS) {
+    if has_any_pattern(msg, PAYLOAD_TOO_LARGE_PATTERNS) {
         return Some((FailoverReason::PayloadTooLarge, H_PAYLOAD_TOO_LARGE));
     }
 
     // Context overflow patterns -- checked before usage-limit to avoid
     // "max input token limit exceeded" matching "limit exceeded" first.
-    if has_any_pattern(msg, &CONTEXT_OVERFLOW_PATTERNS) {
+    if has_any_pattern(msg, CONTEXT_OVERFLOW_PATTERNS) {
         return Some((FailoverReason::ContextOverflow, H_CONTEXT_OVERFLOW));
     }
 
     // Usage-limit patterns with disambiguation (same logic as 402)
-    if has_any_pattern(msg, &USAGE_LIMIT_PATTERNS) {
-        let has_transient = has_any_pattern(msg, &USAGE_LIMIT_TRANSIENT_SIGNALS);
+    if has_any_pattern(msg, USAGE_LIMIT_PATTERNS) {
+        let has_transient = has_any_pattern(msg, USAGE_LIMIT_TRANSIENT_SIGNALS);
         if has_transient {
             return Some((FailoverReason::RateLimit, H_RATE_LIMIT));
         }
@@ -380,22 +381,22 @@ fn classify_by_message(
     }
 
     // Billing patterns
-    if has_any_pattern(msg, &BILLING_PATTERNS) {
+    if has_any_pattern(msg, BILLING_PATTERNS) {
         return Some((FailoverReason::Billing, H_BILLING));
     }
 
     // Rate limit patterns
-    if has_any_pattern(msg, &RATE_LIMIT_PATTERNS) {
+    if has_any_pattern(msg, RATE_LIMIT_PATTERNS) {
         return Some((FailoverReason::RateLimit, H_RATE_LIMIT));
     }
 
     // Auth patterns
-    if has_any_pattern(msg, &AUTH_PATTERNS) {
+    if has_any_pattern(msg, AUTH_PATTERNS) {
         return Some((FailoverReason::Auth, H_AUTH));
     }
 
     // Model not found patterns
-    if has_any_pattern(msg, &MODEL_NOT_FOUND_PATTERNS) {
+    if has_any_pattern(msg, MODEL_NOT_FOUND_PATTERNS) {
         return Some((FailoverReason::ModelNotFound, H_MODEL_NOT_FOUND));
     }
 
@@ -405,7 +406,7 @@ fn classify_by_message(
 // ── Server disconnect check ─────────────────────────────────────────────
 
 fn is_server_disconnect(msg: &str) -> bool {
-    has_any_pattern(msg, &SERVER_DISCONNECT_PATTERNS)
+    has_any_pattern(msg, SERVER_DISCONNECT_PATTERNS)
 }
 
 // ── Pattern matching helper ─────────────────────────────────────────────

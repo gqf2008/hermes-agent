@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Path security validation helpers.
 //!
 //! Ensures user-supplied paths resolve within allowed directories and do not

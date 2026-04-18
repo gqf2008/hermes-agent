@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! System prompt assembly — identity, platform hints, skills index, context files.
 //!
 //! Mirrors the Python `agent/prompt_builder.py`.
@@ -11,7 +12,6 @@ use crate::skills_prompt::build_skills_system_prompt;
 use crate::soul::{load_soul_md, CONTEXT_FILE_MAX_CHARS as SOUL_CONTEXT_FILE_MAX_CHARS};
 
 // Re-export from soul module
-pub use crate::soul::CONTEXT_FILE_MAX_CHARS;
 pub use crate::soul::DEFAULT_AGENT_IDENTITY;
 
 // --- Constants ---
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn test_truncate_long_content() {
         let content = "a".repeat(30_000);
-        let result = truncate_content(&content, "test.md", CONTEXT_FILE_MAX_CHARS);
+        let result = truncate_content(&content, "test.md", SOUL_CONTEXT_FILE_MAX_CHARS);
         assert!(result.len() < 30_000);
         assert!(result.contains("truncated"));
     }

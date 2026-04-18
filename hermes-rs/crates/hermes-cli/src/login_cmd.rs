@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Login / OAuth flow.
 //!
 //! Mirrors Python: hermes login (OAuth login for supported providers)
@@ -163,7 +164,7 @@ async fn cmd_login_async(
             scope: default_scope,
         } => {
             let cid = client_id
-                .or_else(|| {
+                .or({
                     if default_client_id.is_empty() {
                         None
                     } else {

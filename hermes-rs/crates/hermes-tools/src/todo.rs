@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Todo list management tool.
 //!
 //! In-memory task list for planning and task management across a session.

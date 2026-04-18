@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Llama 3.x / 4 tool call parser.
 //!
 //! Format: JSON objects with "name" and "arguments" (or "parameters") keys.

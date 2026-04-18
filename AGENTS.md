@@ -1,100 +1,126 @@
+<!-- Hermes Agent - Development Guide for AI Coding Assistants -->
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
-Hermes Agent is a self-improving AI agent built by Nous Research. It features a synchronous Python core, an async messaging gateway, a Rust rewrite in progress, a React web frontend, a Docusaurus documentation site, and a VS Code / JetBrains / Zed IDE integration via ACP.
-
----
-
 ## Project Overview
 
-Hermes is a personal AI agent with a built-in learning loop. It creates skills from experience, improves them during use, persists knowledge across sessions, searches its own conversation history, and runs on multiple surfaces:
+Hermes Agent is a self-improving AI agent built by Nous Research. It is a Python-first project (Python 3.11+) with a Rust rewrite in progress, a React/Vite web dashboard, and a Docusaurus documentation site. The agent features an interactive CLI, a messaging gateway (Telegram, Discord, Slack, WhatsApp, Signal, Matrix, etc.), a built-in skills system, MCP integration, cron scheduling, and 40+ tools.
 
-- **Interactive CLI** (`hermes`) — TUI with multiline editing, slash commands, and streaming output
-- **Messaging Gateway** (`hermes gateway`) — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, and more
-- **Web Dashboard** (`web/`) — React + Vite frontend for the analytics dashboard
-- **IDE Integration** (`acp_adapter/`, `hermes-rs/crates/hermes-acp`) — Agent Client Protocol server for editor integration
-- **Batch Runner** (`batch_runner.py`) — Parallel trajectory generation on JSONL datasets
-- **RL Training** (`environments/`, `tinker-atropos/`) — Atropos RL environments for training tool-calling models
+Key capabilities:
+- **AI conversation loop** with tool calling via `run_agent.py` (`AIAgent` class)
+- **Interactive CLI** via `hermes_cli/main.py` with prompt_toolkit + Rich
+- **Messaging gateway** in `gateway/run.py` for multi-platform bots
+- **Tool registry** in `tools/registry.py` — auto-discovering, self-registering tools
+- **Skills system** — procedural memory stored in `skills/`, with optional skills in `optional-skills/`
+- **Memory & context compression** — SQLite-backed sessions with FTS5 search, Honcho integration
+- **Batch & RL training** — `batch_runner.py`, `environments/`, and `hermes-rs/` for research workloads
+- **ACP server** — editor integration (VS Code / Zed / JetBrains) via `acp_adapter/`
 
-The project has **two parallel implementations**:
-- **Python** (`run_agent.py`, `cli.py`, `hermes_cli/`, `agent/`, `tools/`, `gateway/`) — the current production system
-- **Rust** (`hermes-rs/`) — a full rewrite with workspace crates for core, state, LLM, tools, CLI, gateway, cron, batch, compression, ACP, and RL
-
-**User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys)
-
----
-
-## Technology Stack
+### Technology Stack
 
 | Layer | Technology |
-|-------|-----------|
-| **Python runtime** | CPython 3.11+ (managed by `uv`) |
-| **Rust runtime** | Rust 1.84+ (`hermes-rs/`) |
-| **Package manager** | `uv` for Python; `cargo` for Rust |
-| **Core deps** | `openai`, `anthropic`, `httpx`, `rich`, `prompt_toolkit`, `pydantic`, `jinja2`, `tenacity`, `pyyaml` |
-| **Gateway deps** | `python-telegram-bot`, `discord.py`, `slack-bolt`, `aiohttp` |
-| **Browser tools** | Playwright (`agent-browser`, `@askjo/camofox-browser`) |
-| **Database** | SQLite with FTS5 full-text search (`hermes_state.py`) |
-| **Web frontend** | React 19, Vite 7, Tailwind CSS 4, TypeScript 5.9 (`web/`) |
-| **Docs site** | Docusaurus 3.9, TypeScript (`website/`) |
-| **Container** | Debian 13 (trixie) base, non-root UID 10000 |
-| **Nix** | `flake.nix` with `flake-parts`, `uv2nix`, `pyproject-nix` |
-| **CI/CD** | GitHub Actions (tests, e2e, Docker publish, supply chain audit, docs checks) |
+|-------|------------|
+| Core runtime | Python 3.11+, OpenAI/Anthropic SDKs, Pydantic, Jinja2 |
+| CLI / TUI | prompt_toolkit, Rich, curses (stdlib) |
+| Web frontend | React 19, Vite, Tailwind CSS 4 (`web/`) |
+| Documentation | Docusaurus 3, TypeScript (`website/`) |
+| Rust rewrite | Cargo workspace with 13 crates (`hermes-rs/`) |
+| Packaging | setuptools (pyproject.toml), uv, Nix (flake.nix), Docker |
+| Database | SQLite (FTS5), optional asyncpg for Matrix encryption |
+| Testing | pytest, pytest-asyncio, pytest-xdist |
+| CI/CD | GitHub Actions (tests, Docker, Nix, docs, supply-chain audit) |
+
+### Entry Points
+
+| Command | Module | Purpose |
+|---------|--------|---------|
+| `hermes` | `hermes_cli.main:main` | Interactive CLI and subcommands |
+| `hermes-agent` | `run_agent:main` | Standalone agent runner (Fire CLI) |
+| `hermes-acp` | `acp_adapter.entry:main` | ACP server for editor integration |
+
+Python top-level modules (registered in `pyproject.toml` `[tool.setuptools.py-modules]`):
+`run_agent`, `model_tools`, `toolsets`, `batch_runner`, `trajectory_compressor`, `toolset_distributions`, `cli`, `hermes_constants`, `hermes_state`, `hermes_time`, `hermes_logging`, `rl_cli`, `utils`
 
 ---
 
-## Key Configuration Files
+## Development Environment
 
-| File | Purpose |
-|------|---------|
-| `pyproject.toml` | Python package metadata, dependencies, optional extras, pytest config, setuptools config |
-| `hermes-rs/Cargo.toml` | Rust workspace definition with 12 crates |
-| `flake.nix` | Nix flake for reproducible builds, dev shell, and NixOS modules |
-| `Dockerfile` | Multi-stage container build (uv + gosu + Debian) |
-| `package.json` | Root Node.js deps for browser automation tools |
-| `web/package.json` | React frontend dependencies (Vite, Tailwind, React Router) |
-| `website/package.json` | Docusaurus documentation site dependencies |
-| `cli-config.yaml.example` | Example user configuration file |
-| `.github/workflows/tests.yml` | CI test runner (pytest + e2e) |
-| `.github/workflows/docker-publish.yml` | Multi-arch Docker image build and push |
-| `.github/workflows/supply-chain-audit.yml` | PR security scanning for supply chain risks |
+### Prerequisites
 
----
+- **Git** with `--recurse-submodules` support
+- **Python 3.11+**
+- **uv** (fast Python package manager)
+- **Node.js 18+** (optional, needed for browser tools and WhatsApp bridge)
+- **Rust 1.84+** (optional, for `hermes-rs/`)
 
-## Build, Test, and Development Commands
-
-### Python Development
+### Setup
 
 ```bash
-# Install uv first: curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create venv and install all extras
+# Clone
+git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
 cd hermes-agent
+
+# Python venv + install
 uv venv venv --python 3.11
-source venv/bin/activate  # ALWAYS activate before running Python
+export VIRTUAL_ENV="$(pwd)/venv"
 uv pip install -e ".[all,dev]"
 
-# Optional: RL training submodule
-git submodule update --init tinker-atropos
-uv pip install -e "./tinker-atropos"
-
-# Optional: browser tools (Node.js 18+ required)
+# Optional: browser tools
 npm install
-npx playwright install --with-deps chromium
+
+# Optional: RL training submodule
+git submodule update --init tinker-atropos && uv pip install -e "./tinker-atropos"
+
+# Optional: Rust rewrite
+cd hermes-rs && cargo build
 ```
 
-### Rust Development
+### Activate before running Python
+
+```bash
+source venv/bin/activate  # ALWAYS activate before running Python
+```
+
+---
+
+## Build and Test Commands
+
+### Python
+
+```bash
+# Full test suite (~3000 tests, ~3 min)
+python -m pytest tests/ -q
+
+# Specific areas
+python -m pytest tests/test_model_tools.py -q        # Toolset resolution
+python -m pytest tests/test_cli_init.py -q           # CLI config loading
+python -m pytest tests/gateway/ -q                   # Gateway tests
+python -m pytest tests/tools/ -q                     # Tool-level tests
+python -m pytest tests/hermes_cli/ -q                # CLI tests
+python -m pytest tests/agent/ -q                     # Agent internals
+
+# E2E tests
+python -m pytest tests/e2e/ -v --tb=short
+
+# With uv (as CI does)
+uv venv .venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[all,dev]"
+python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+```
+
+### Rust (`hermes-rs/`)
 
 ```bash
 cd hermes-rs
-cargo build --release
+cargo build
 cargo test
+cargo build --release
 ```
 
-Bins: `hermes` (CLI), `hermes-agent` (agent engine), `hermes-acp` (ACP server).
-
-### Web Frontend
+### Web (`web/`)
 
 ```bash
 cd web
@@ -104,165 +130,121 @@ npm run build    # Production build
 npm run lint     # ESLint
 ```
 
-### Documentation Site
+### Documentation (`website/`)
 
 ```bash
 cd website
 npm install
-npm run start    # Docusaurus dev server
-npm run build    # Static site build
+npm run build    # Docusaurus build
+npm run lint:diagrams   # ASCII art linting
 ```
-
-### Testing
-
-```bash
-source venv/bin/activate
-
-# Full suite (~3000 tests, ~3 min)
-python -m pytest tests/ -q
-
-# Specific areas
-python -m pytest tests/test_model_tools.py -q        # Toolset resolution
-python -m pytest tests/test_cli_init.py -q           # CLI config loading
-python -m pytest tests/gateway/ -q                   # Gateway tests
-python -m pytest tests/tools/ -q                     # Tool-level tests
-python -m pytest tests/hermes_cli/ -q                # CLI subcommand tests
-python -m pytest tests/agent/ -q                     # Agent internals
-python -m pytest tests/e2e/ -v                       # End-to-end tests
-
-# With integration tests (requires real API keys)
-python -m pytest tests/ -q -m integration
-```
-
-Always run the full suite before pushing changes.
 
 ### Docker
 
 ```bash
-# Build locally
-docker build -t hermes-agent .
+# Build (amd64 smoke test)
+docker build -t hermes-agent:test .
 
-# Run with persistent data volume
-docker run -v /path/to/data:/opt/data hermes-agent
+# Run
+docker run --rm -v /tmp/hermes-data:/opt/data hermes-agent:test --help
+```
+
+### Nix
+
+```bash
+nix flake check --print-build-logs
+nix build --print-build-logs
+nix develop       # Enter dev shell
 ```
 
 ---
 
-## Code Organization and Module Divisions
+## Code Organization
 
 ```
 hermes-agent/
-├── run_agent.py              # AIAgent class — core conversation loop
-├── cli.py                    # HermesCLI class — interactive CLI orchestrator
-├── model_tools.py            # Tool orchestration, discovery, dispatch
-├── toolsets.py               # Toolset definitions and platform presets
-├── batch_runner.py           # Parallel batch processing on JSONL
-├── trajectory_compressor.py  # Trajectory compression for training
-├── hermes_state.py           # SessionDB — SQLite with FTS5 search
-├── hermes_constants.py       # HERMES_HOME, profile helpers
-├── hermes_logging.py         # Structured logging setup
-├── hermes_time.py            # Timezone handling
-├── utils.py                  # Shared utilities
-│
-├── agent/                    # Agent internals
-│   ├── prompt_builder.py         # System prompt assembly
-│   ├── context_compressor.py     # Auto context compression
-│   ├── prompt_caching.py         # Anthropic prompt caching
-│   ├── auxiliary_client.py       # Auxiliary LLM client (vision, summarization)
-│   ├── model_metadata.py         # Model context lengths, token estimation
-│   ├── models_dev.py             # models.dev registry integration
-│   ├── display.py                # KawaiiSpinner, tool preview formatting
-│   ├── skill_commands.py         # Skill slash commands (shared CLI/gateway)
-│   ├── trajectory.py             # Trajectory saving helpers
-│   ├── memory_manager.py         # Persistent memory context building
-│   ├── retry_utils.py            # Jittered backoff, error classification
-│   ├── error_classifier.py       # API error classification for failover
-│   ├── smart_model_routing.py    # Provider routing logic
+├── run_agent.py          # AIAgent class — core conversation loop
+├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
+├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
+├── cli.py                # HermesCLI class — interactive CLI orchestrator
+├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
+├── batch_runner.py       # Parallel batch processing with checkpointing
+├── trajectory_compressor.py # Trajectory compression for RL training
+├── rl_cli.py             # RL training CLI
+├── mcp_serve.py          # MCP server entry point
+├── hermes_constants.py   # HERMES_HOME resolution, path constants
+├── hermes_logging.py     # Structured logging setup
+├── hermes_time.py        # Timezone utilities
+├── agent/                # Agent internals
+│   ├── prompt_builder.py     # System prompt assembly
+│   ├── context_compressor.py # Auto context compression
+│   ├── prompt_caching.py     # Anthropic prompt caching
+│   ├── auxiliary_client.py   # Auxiliary LLM client (vision, summarization)
+│   ├── model_metadata.py     # Model context lengths, token estimation
+│   ├── models_dev.py         # models.dev registry integration
+│   ├── display.py            # KawaiiSpinner, tool preview formatting
+│   ├── skill_commands.py     # Skill slash commands (shared CLI/gateway)
+│   ├── trajectory.py         # Trajectory saving helpers
+│   ├── memory_manager.py     # Memory context assembly
+│   ├── credential_pool.py    # API key rotation and fallback
+│   ├── context_engine.py     # Context file processing
+│   ├── error_classifier.py   # API error classification and failover
 │   └── ...
-│
-├── hermes_cli/               # CLI subcommands and setup
-│   ├── main.py                   # Entry point — argument parsing, dispatch
-│   ├── config.py                 # DEFAULT_CONFIG, OPTIONAL_ENV_VARS, migration
-│   ├── commands.py               # Slash command registry (CommandDef)
-│   ├── callbacks.py              # Terminal callbacks (clarify, sudo, approval)
-│   ├── setup.py                  # Interactive setup wizard
-│   ├── skin_engine.py            # Skin/theme engine
-│   ├── skills_config.py          # `hermes skills` subcommands
-│   ├── tools_config.py           # `hermes tools` subcommands
-│   ├── skills_hub.py             # Skills Hub CLI + /skills slash command
-│   ├── models.py                 # Model catalog and provider lists
-│   ├── model_switch.py           # Shared /model switch pipeline
-│   ├── auth.py                   # Provider credential resolution
-│   ├── doctor.py                 # Diagnostics
-│   ├── banner.py                 # Welcome banner and ASCII art
-│   ├── gateway.py                # Gateway service management
-│   ├── profiles.py               # Profile management
-│   └── ... (50+ files total)
-│
-├── tools/                    # Tool implementations (one file per tool)
-│   ├── registry.py               # Central tool registry (schemas, handlers, dispatch)
-│   ├── approval.py               # Dangerous command detection
-│   ├── terminal_tool.py          # Terminal orchestration
-│   ├── process_registry.py       # Background process management
-│   ├── file_tools.py             # File read/write/search/patch
-│   ├── web_tools.py              # Web search/extract (Parallel + Firecrawl)
-│   ├── browser_tool.py           # Browserbase / Playwright automation
-│   ├── code_execution_tool.py    # execute_code sandbox
-│   ├── delegate_tool.py          # Subagent delegation
-│   ├── mcp_tool.py               # MCP client (~1050 lines)
-│   ├── session_search_tool.py    # FTS5 session search + summarization
-│   ├── cronjob_tools.py          # Scheduled task management
-│   ├── skill_tools.py            # Skill search, load, manage
-│   ├── memory_tool.py            # Persistent memory operations
-│   ├── todo_tool.py              # Todo list management
-│   └── environments/             # Terminal backends
-│       ├── base.py, local.py, docker.py, ssh.py, modal.py, daytona.py, singularity.py
-│
-├── gateway/                  # Messaging platform gateway
-│   ├── run.py                    # Main loop, slash commands, message dispatch
-│   ├── session.py                # SessionStore — conversation persistence
-│   ├── config.py                 # Platform configuration resolution
-│   ├── hooks.py                  # Gateway hook system
-│   ├── pairing.py                # Device pairing and authorization
-│   ├── status.py                 # Gateway status and token locks
-│   └── platforms/                # Adapters
-│       ├── telegram.py, discord.py, slack.py, whatsapp.py, signal.py,
-│       ├── matrix.py, email.py, homeassistant.py, webhook.py, dingtalk.py,
-│       ├── feishu.py, wecom.py, weixin.py, qqbot.py, bluebubbles.py, sms.py,
-│       └── mattermost.py
-│
-├── acp_adapter/              # ACP server (Python implementation)
-│   ├── server.py, session.py, tools.py, auth.py, events.py, permissions.py
-│
-├── cron/                     # Scheduler
-│   ├── jobs.py, scheduler.py
-│
-├── skills/                   # Bundled skills (copied to ~/.hermes/skills/ on install)
-├── optional-skills/          # Official optional skills (discoverable, not activated by default)
-│
-├── environments/             # RL training environments (Atropos integration)
-│   ├── agent_loop.py, hermes_base_env.py, agentic_opd_env.py, hermes_swe_env/
-│
-├── hermes-rs/                # Rust rewrite
-│   ├── crates/
-│   │   ├── hermes-core, hermes-state, hermes-llm, hermes-tools,
-│   │   ├── hermes-prompt, hermes-agent-engine, hermes-cli,
-│   │   ├── hermes-gateway, hermes-cron, hermes-batch, hermes-compress,
-│   │   ├── hermes-acp, hermes-rl
-│   │   └── ...
-│   └── src/main.rs             # CLI entry point
-│
-├── web/                      # React frontend (analytics dashboard)
-├── website/                  # Docusaurus documentation site
-├── tests/                    # Pytest suite (~3000 tests)
-├── scripts/                  # Installers (install.sh, install.ps1, install.cmd)
-├── docker/                   # Docker entrypoint and SOUL.md
-└── nix/                      # Nix packages, devShell, checks, NixOS modules
+├── hermes_cli/           # CLI subcommands and setup
+│   ├── main.py           # Entry point — all `hermes` subcommands
+│   ├── config.py         # DEFAULT_CONFIG, OPTIONAL_ENV_VARS, migration
+│   ├── commands.py       # Slash command definitions + SlashCommandCompleter
+│   ├── callbacks.py      # Terminal callbacks (clarify, sudo, approval)
+│   ├── setup.py          # Interactive setup wizard
+│   ├── skin_engine.py    # Skin/theme engine
+│   ├── skills_config.py  # `hermes skills` — enable/disable skills per platform
+│   ├── tools_config.py   # `hermes tools` — enable/disable tools per platform
+│   ├── skills_hub.py     # `/skills` slash command (search, browse, install)
+│   ├── models.py         # Model catalog, provider model lists
+│   ├── model_switch.py   # Shared /model switch pipeline (CLI + gateway)
+│   ├── auth.py           # Provider credential resolution
+│   ├── gateway.py        # Gateway service management
+│   ├── web_server.py     # Built-in FastAPI web server
+│   └── ...
+├── tools/                # Tool implementations (one file per tool)
+│   ├── registry.py       # Central tool registry (schemas, handlers, dispatch)
+│   ├── approval.py       # Dangerous command detection
+│   ├── terminal_tool.py  # Terminal orchestration (6 backends)
+│   ├── process_registry.py # Background process management
+│   ├── file_tools.py     # File read/write/search/patch
+│   ├── web_tools.py      # Web search/extract (Parallel + Firecrawl)
+│   ├── browser_tool.py   # Browserbase browser automation
+│   ├── code_execution_tool.py # execute_code sandbox
+│   ├── delegate_tool.py  # Subagent delegation
+│   ├── mcp_tool.py       # MCP client (~1050 lines)
+│   ├── skills_tool.py    # Skills execution
+│   ├── skills_guard.py   # Skills security audit
+│   ├── skills_hub.py     # Skills Hub network client
+│   ├── skills_sync.py    # Bundled skills sync
+│   └── environments/     # Terminal backends (local, docker, ssh, modal, daytona, singularity)
+├── gateway/              # Messaging platform gateway
+│   ├── run.py            # Main loop, slash commands, message dispatch
+│   ├── session.py        # SessionStore — conversation persistence
+│   ├── config.py         # Gateway configuration
+│   ├── delivery.py       # Cross-platform message delivery
+│   ├── stream_consumer.py # Streaming response consumer
+│   └── platforms/        # Adapters: telegram, discord, slack, whatsapp, homeassistant, signal, qqbot, matrix, mattermost, dingtalk, feishu
+├── acp_adapter/          # ACP server (VS Code / Zed / JetBrains integration)
+├── cron/                 # Scheduler (jobs.py, scheduler.py)
+├── environments/         # RL training environments (Atropos)
+├── skills/               # Bundled skills (broadly useful, ship with install)
+├── optional-skills/      # Official but not universally needed skills
+├── plugins/              # Plugin system (context_engine, memory)
+├── web/                  # React/Vite dashboard
+├── website/              # Docusaurus documentation site
+├── hermes-rs/            # Rust rewrite (Cargo workspace, 13 crates)
+├── tests/                # Pytest suite (~3000 tests)
+├── nix/                  # Nix flake modules
+├── docker/               # Docker entrypoint and SOUL.md
+└── scripts/              # Release, install, skills index builder
 ```
 
----
-
-## File Dependency Chain
+### File Dependency Chain
 
 ```
 tools/registry.py  (no deps — imported by all tool files)
@@ -276,9 +258,7 @@ run_agent.py, cli.py, batch_runner.py, environments/
 
 ---
 
-## Core Architecture
-
-### AIAgent Class (`run_agent.py`)
+## AIAgent Class (run_agent.py)
 
 ```python
 class AIAgent:
@@ -324,9 +304,7 @@ Messages follow OpenAI format: `{"role": "system/user/assistant/tool", ...}`. Re
 
 ---
 
-## CLI and Gateway Architecture
-
-### CLI (`cli.py` + `hermes_cli/`)
+## CLI Architecture (cli.py)
 
 - **Rich** for banner/panels, **prompt_toolkit** for input with autocomplete
 - **KawaiiSpinner** (`agent/display.py`) — animated faces during API calls, `┊` activity feed for tool results
@@ -419,43 +397,6 @@ The registry handles schema collection, dispatch, availability checking, and err
 
 ---
 
-## Adding Skills
-
-Skills live in `skills/` (bundled) or `optional-skills/` (official but not activated by default). Each skill is a directory with a `SKILL.md` file and optional `scripts/` or `references/`.
-
-### SKILL.md frontmatter
-
-```yaml
----
-name: my-skill
-description: Brief description
-version: 1.0.0
-author: Your Name
-license: MIT
-platforms: [macos, linux]          # Optional OS restriction
-required_environment_variables:
-  - name: MY_API_KEY
-    prompt: API key
-    help: Where to get it
-    required_for: full functionality
-metadata:
-  hermes:
-    tags: [Category, Subcategory]
-    fallback_for_toolsets: [web]       # Show only when toolset unavailable
-    requires_toolsets: [terminal]      # Show only when toolset available
----
-```
-
-Skills self-register at agent startup via `agent/skill_commands.py`. They are injected into the system prompt, not executed as code.
-
-**When to add a skill vs. a tool:**
-- **Skill** — capability expressible as instructions + shell commands + existing tools (most cases)
-- **Tool** — requires end-to-end API integration, custom binary processing, streaming, or real-time events
-
-See `CONTRIBUTING.md` for the full skill authoring guide.
-
----
-
 ## Adding Configuration
 
 ### config.yaml options:
@@ -524,7 +465,7 @@ hermes_cli/skin_engine.py    # SkinConfig dataclass, built-in skins, YAML loader
 
 ### Built-in skins
 
-- `default` — Classic Hermes gold/kawaii (the current look)
+- `default` — Classic Hermes gold/kawaii
 - `ares` — Crimson/bronze war-god theme with custom spinner wings
 - `mono` — Clean grayscale monochrome
 - `slate` — Cool blue developer-focused theme
@@ -573,147 +514,120 @@ Activate with `/skin cyberpunk` or `display.skin: cyberpunk` in config.yaml.
 
 ---
 
-## Development Conventions
-
-### Code Style
-
-- **PEP 8** with practical exceptions (we don't enforce strict line length)
-- **Comments**: Only when explaining non-obvious intent, trade-offs, or API quirks. Don't narrate what the code does
-- **Error handling**: Catch specific exceptions. Log with `logger.warning()`/`logger.error()` — use `exc_info=True` for unexpected errors so stack traces appear in logs
-- **Cross-platform**: Never assume Unix. See Known Pitfalls below for specific rules
-
-### Commit Messages
-
-We use [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-<type>(<scope>): <description>
-```
-
-| Type | Use for |
-|------|---------|
-| `fix` | Bug fixes |
-| `feat` | New features |
-| `docs` | Documentation |
-| `test` | Tests |
-| `refactor` | Code restructuring (no behavior change) |
-| `chore` | Build, CI, dependency updates |
-
-Scopes: `cli`, `gateway`, `tools`, `skills`, `agent`, `install`, `whatsapp`, `security`, etc.
-
-Examples:
-```
-fix(cli): prevent crash in save_config_value when model is a string
-feat(gateway): add WhatsApp multi-user session isolation
-fix(security): prevent shell injection in sudo password piping
-test(tools): add unit tests for file_operations
-```
-
-### Branch Naming
-
-```
-fix/description        # Bug fixes
-feat/description       # New features
-docs/description       # Documentation
-test/description       # Tests
-refactor/description   # Code restructuring
-```
-
-### Pull Request Process
-
-1. **Run tests**: `pytest tests/ -v`
-2. **Test manually**: Run `hermes` and exercise the code path you changed
-3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider Windows and macOS
-4. **Keep PRs focused**: One logical change per PR
-
----
-
 ## Testing Strategy
 
-The test suite uses **pytest** with the following characteristics:
-
-- **~3000 tests** across unit, integration, and e2e layers
-- **pytest-xdist** runs tests in parallel (`-n auto`)
-- **pytest-asyncio** for async gateway tests
-- **Integration tests** are marked with `@pytest.mark.integration` and skipped by default (require real API keys)
-- **Test isolation** via `_isolate_hermes_home` autouse fixture in `tests/conftest.py` — redirects `HERMES_HOME` to a temp dir so tests never write to `~/.hermes/`
-- **30-second timeout** per test on Unix (SIGALRM) to prevent hangs
-- **Event loop fixture** ensures synchronous tests that call `asyncio.get_event_loop()` have a usable loop
-
-### Test organization
+### Test Organization
 
 | Directory | Contents |
 |-----------|----------|
-| `tests/agent/` | Agent internals (prompt builder, compression, memory, routing) |
-| `tests/cli/` | CLI interaction tests |
-| `tests/gateway/` | Platform adapters and gateway core |
+| `tests/agent/` | Agent internals (prompt builder, context compressor, memory, etc.) |
 | `tests/tools/` | Individual tool tests |
-| `tests/hermes_cli/` | CLI subcommand tests |
+| `tests/gateway/` | Platform adapters and gateway logic |
+| `tests/hermes_cli/` | CLI commands, config, skins, models |
+| `tests/cron/` | Scheduler tests |
+| `tests/acp/` | ACP adapter tests |
 | `tests/e2e/` | End-to-end tests |
-| `tests/integration/` | Tests requiring external services |
-| `tests/fakes/` | Fake/stub implementations for tests |
+| `tests/integration/` | External service integration tests (skipped by default) |
+| `tests/fakes/` | Mock fixtures and fake implementations |
 
----
+### Key Fixtures (`tests/conftest.py`)
 
-## Deployment and Packaging
+- `_isolate_hermes_home` (autouse) — redirects `HERMES_HOME` to a temp dir so tests never write to `~/.hermes/`
+- `_enforce_test_timeout` (autouse) — kills any test hanging longer than 30 seconds via SIGALRM (Unix only)
+- `_ensure_current_event_loop` (autouse) — provides a default event loop for sync tests that call `get_event_loop()`
+- `mock_config` — minimal config dict for unit tests
 
-### Docker
+### Running Tests
 
-- Multi-arch builds (`linux/amd64`, `linux/arm64`) published to `nousresearch/hermes-agent`
-- Tags: `latest` on main branch pushes, release tags on GitHub releases
-- Non-root runtime user (UID 10000) with `gosu`
-- Playwright browsers pre-installed at build time
-- Volume mount at `/opt/data` for persistent state
+- Default pytest invocation skips integration tests (`-m 'not integration'`)
+- Use `pytest-xdist` (`-n auto`) for parallel execution
+- CI runs unit tests with `-n auto` and E2E tests separately with empty API keys to prevent accidental real calls
 
-### Nix
+### Test Markers
 
-- `flake.nix` supports `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`
-- Imports: `nix/packages.nix`, `nix/nixosModules.nix`, `nix/checks.nix`, `nix/devShell.nix`
-- Uses `uv2nix` + `pyproject-nix` for Python dependency locking
-
-### Homebrew
-
-- Formula maintained in `packaging/homebrew/`
-
-### Scripts
-
-- `scripts/install.sh` — Linux/macOS/WSL2 installer
-- `scripts/install.ps1` — Windows PowerShell installer (WSL2 recommended)
-- `scripts/install.cmd` — Windows CMD wrapper
-- `scripts/release.py` — Release automation
+```python
+pytest.mark.integration   # Requires external services (API keys, Modal, etc.)
+```
 
 ---
 
 ## Security Considerations
 
-### Existing Protections
-
-| Layer | Implementation |
-|-------|---------------|
-| **Sudo password piping** | Uses `shlex.quote()` to prevent shell injection |
-| **Dangerous command detection** | Regex patterns in `tools/approval.py` with user approval flow |
-| **Cron prompt injection** | Scanner in `tools/cronjob_tools.py` blocks instruction-override patterns |
-| **Write deny list** | Protected paths (`~/.ssh/authorized_keys`, `/etc/shadow`) resolved via `os.path.realpath()` to prevent symlink bypass |
-| **Skills guard** | Security scanner for hub-installed skills (`tools/skills_guard.py`) |
-| **Code execution sandbox** | `execute_code` child process runs with API keys stripped from environment |
-| **MCP safety** | OSV malware checking for `npx`/`uvx` packages before spawning |
-| **Container hardening** | Docker: all capabilities dropped, no privilege escalation, PID limits, size-limited tmpfs |
-| **Output redaction** | `agent/redact.py` strips secrets from display output before it reaches terminal or gateway |
-| **Supply chain audit** | CI workflow blocks `.pth` files, `base64`+`exec` combos, and mutable Action tags |
-
-### When Contributing Security-Sensitive Code
-
-- **Always use `shlex.quote()`** when interpolating user input into shell commands
-- **Resolve symlinks** with `os.path.realpath()` before path-based access control checks
-- **Don't log secrets.** API keys, tokens, and passwords should never appear in log output
-- **Catch broad exceptions** around tool execution so a single failure doesn't crash the agent loop
-- **Test on all platforms** if your change touches file paths, process management, or shell commands
-
-If your PR affects security, note it explicitly in the description.
-
 ### Trust Model
 
-Hermes is designed as a **single-tenant personal agent**. The operator is trusted. Gateway platforms (Telegram, Discord, etc.) receive equal trust once authorized. Multi-user isolation must happen at the OS/host level. See `SECURITY.md` for the full trust model, vulnerability reporting process, and out-of-scope scenarios.
+Hermes is a **personal agent** with one trusted operator. Multi-user isolation must happen at the OS/host level.
+
+### Key Security Boundaries
+
+1. **Dangerous Command Approval** (`tools/approval.py`)
+   - Terminal commands, file operations, and destructive actions require explicit user confirmation
+   - Configurable via `approvals.mode`: `"on"` (default), `"auto"`, `"off"`
+
+2. **Output Redaction** (`agent/redact.py`)
+   - Strips secret-like patterns (API keys, tokens) from display output before it reaches terminal or gateway
+   - Operates on the display layer only; internal values remain intact
+
+3. **Code Execution Sandbox** (`tools/code_execution_tool.py`)
+   - Runs LLM-generated Python in a child process with host credentials stripped
+   - Only `env_passthrough` variables are passed through
+   - Child accesses Hermes tools via RPC, not direct API calls
+
+4. **MCP Server Isolation** (`tools/mcp_tool.py`)
+   - MCP subprocesses receive a filtered environment (`_build_safe_env()`)
+   - Only safe baseline variables + explicitly declared `env` config variables are passed
+   - `npx`/`uvx` packages are checked against the OSV malware database before spawning
+
+5. **Subagent Restrictions** (`tools/delegate_tool.py`)
+   - `delegate_task` is disabled for child agents (no recursive delegation)
+   - Max depth = 2 (parent → child; grandchildren rejected)
+   - Child agents run with `skip_memory=True` (no parent memory access)
+
+6. **Skills Guard** (`tools/skills_guard.py`)
+   - Audits third-party skills before installation
+   - Audit log at `~/.hermes/skills/.hub/audit.log`
+
+7. **SSRF Protection**
+   - Enabled by default across all gateway platform adapters
+   - Redirect validation on outbound requests
+
+### CI/CD Supply Chain Hardening
+
+- `.github/workflows/supply-chain-audit.yml` scans PRs for:
+  - `.pth` files (auto-execute on Python startup)
+  - `base64` + `exec`/`eval` combos
+  - `subprocess` with encoded commands
+  - Unpinned GitHub Actions (mutable tags)
+- All GitHub Actions are pinned to full commit SHAs
+- Dependencies in `pyproject.toml` are pinned to known-good ranges
+
+### Reporting Vulnerabilities
+
+- Do not open public issues for security vulnerabilities
+- Report via [GitHub Security Advisories](https://github.com/NousResearch/hermes-agent/security/advisories/new) or email **security@nousresearch.com**
+- Coordinated disclosure: 90-day window or until fix released
+
+---
+
+## Deployment
+
+### Docker
+
+Multi-arch builds (`linux/amd64`, `linux/arm64`) are published to Docker Hub on push to `main` and on releases. The Dockerfile:
+- Uses Debian 13 (trixie) base
+- Runs as non-root user `hermes` (UID 10000)
+- Installs Node.js, Playwright, and Python deps in a virtualenv
+- Volume-mounts `/opt/data` for persistent state
+- Entrypoint bootstraps config files into the volume at first run
+
+### GitHub Pages
+
+Documentation site (landing page + Docusaurus) is deployed automatically on pushes affecting `website/`, `landingpage/`, or `skills/`.
+
+### Nix
+
+- `flake.nix` defines packages, dev shell, NixOS modules, and checks
+- CI validates `nix flake check` on Linux and `nix flake show` on macOS
+- Supports `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`
 
 ---
 
@@ -734,7 +648,7 @@ Cache-breaking forces dramatically higher costs. The ONLY time we alter context 
 
 ### Background Process Notifications (Gateway)
 
-When `terminal(background=true, notify_on_complete=true)` is used, the gateway runs a watcher that detects process completion and triggers a new agent turn. Control verbosity with `display.background_process_notifications` in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
+When `terminal(background=true, notify_on_complete=true)` is used, the gateway runs a watcher that detects process completion and triggers a new agent turn. Control verbosity with `display.background_process_notifications` in config.yaml:
 
 - `all` — running-output updates + final message (default)
 - `result` — only the final completion message
@@ -751,8 +665,7 @@ The core mechanism: `_apply_profile_override()` in `hermes_cli/main.py` sets `HE
 
 ### Rules for profile-safe code
 
-1. **Use `get_hermes_home()` for all HERMES_HOME paths.** Import from `hermes_constants`.
-   NEVER hardcode `~/.hermes` or `Path.home() / ".hermes"` in code that reads/writes state.
+1. **Use `get_hermes_home()` for all HERMES_HOME paths.** Import from `hermes_constants`. NEVER hardcode `~/.hermes` or `Path.home() / ".hermes"` in code that reads/writes state.
    ```python
    # GOOD
    from hermes_constants import get_hermes_home
@@ -763,7 +676,6 @@ The core mechanism: `_apply_profile_override()` in `hermes_cli/main.py` sets `HE
    ```
 
 2. **Use `display_hermes_home()` for user-facing messages.** Import from `hermes_constants`.
-   This returns `~/.hermes` for default or `~/.hermes/profiles/<name>` for profiles.
    ```python
    # GOOD
    from hermes_constants import display_hermes_home
@@ -818,11 +730,3 @@ def profile_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     return home
 ```
-
-### Cross-Platform Rules
-
-1. **`termios` and `fcntl` are Unix-only.** Always catch both `ImportError` and `NotImplementedError`.
-2. **File encoding.** Windows may save `.env` files in `cp1252`. Always handle encoding errors with fallback to `latin-1`.
-3. **Process management.** `os.setsid()`, `os.killpg()`, and signal handling differ on Windows. Use `platform.system() != "Windows"` checks.
-4. **Path separators.** Use `pathlib.Path` instead of string concatenation with `/`.
-5. **Shell commands in installers.** If you change `scripts/install.sh`, check if the equivalent change is needed in `scripts/install.ps1`.

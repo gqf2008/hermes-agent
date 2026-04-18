@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Token estimation utilities.
 //!
 //! Character-based rough token estimation (chars/4 heuristic).

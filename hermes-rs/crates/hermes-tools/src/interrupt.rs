@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shared interrupt signaling.
 //!
 //! Global `AtomicBool` that any tool can poll during long-running operations.

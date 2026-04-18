@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Longcat tool call parser.
 //!
 //! Same as Hermes but with <longcat_tool_call> tags.

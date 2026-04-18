@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! GLM 4.7 tool call parser.
 //!
 //! Same as GLM 4.5 but with slightly different regex patterns.

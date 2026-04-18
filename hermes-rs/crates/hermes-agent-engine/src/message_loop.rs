@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use tokio::sync::Mutex as AsyncMutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,7 +61,7 @@ pub struct MessageMetadata {
 /// Manages a conversation session across multiple platform messages.
 pub struct MessageLoop {
     /// The AI agent running the conversation.
-    agent: Arc<std::sync::Mutex<AIAgent>>,
+    agent: Arc<AsyncMutex<AIAgent>>,
     /// Conversation history.
     messages: Vec<Value>,
     /// Session ID for persistence.
@@ -82,7 +83,7 @@ impl MessageLoop {
         interrupt: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            agent: Arc::new(std::sync::Mutex::new(agent)),
+            agent: Arc::new(AsyncMutex::new(agent)),
             messages: Vec::new(),
             session_id,
             session_db,
@@ -92,7 +93,6 @@ impl MessageLoop {
     }
 
     /// Process a single incoming message and return the response.
-    #[allow(clippy::await_holding_lock)]
     pub async fn process_message(&mut self, msg: PlatformMessage) -> Result<MessageResult> {
         // Check for interrupt
         if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) {
@@ -113,7 +113,7 @@ impl MessageLoop {
 
         // Run the conversation through the agent
         let turn_result = {
-            let mut agent = self.agent.lock().unwrap();
+            let mut agent = self.agent.lock().await;
             agent.run_conversation(&msg.content, system_msg, Some(&self.messages)).await
         };
 
@@ -138,7 +138,7 @@ impl MessageLoop {
         }
 
         let budget_remaining = {
-            let agent = self.agent.lock().unwrap();
+            let agent = self.agent.lock().await;
             agent.budget.remaining()
         };
 

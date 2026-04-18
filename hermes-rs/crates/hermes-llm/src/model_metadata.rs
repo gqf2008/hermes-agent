@@ -892,12 +892,7 @@ pub fn lookup_default_context_length(model: &str) -> Option<usize> {
 
 /// Return the next lower probe tier, or None if already at minimum.
 pub fn get_next_probe_tier(current_length: usize) -> Option<usize> {
-    for &tier in CONTEXT_PROBE_TIERS {
-        if tier < current_length {
-            return Some(tier);
-        }
-    }
-    None
+    CONTEXT_PROBE_TIERS.iter().find(|&&tier| tier < current_length).copied()
 }
 
 /// Check if a model requires the Responses API (OpenAI GPT-5.x family).
@@ -918,7 +913,7 @@ pub fn add_model_aliases(
 ) {
     cache.insert(model_id.to_string(), entry.clone());
     if model_id.contains('/') {
-        let bare = model_id.splitn(2, '/').nth(1).unwrap_or(model_id);
+        let bare = model_id.split_once('/').map(|x| x.1).unwrap_or(model_id);
         cache.entry(bare.to_string()).or_insert_with(|| entry.clone());
     }
 }
@@ -1115,13 +1110,13 @@ pub fn estimate_tokens_rough(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Rough token estimate for a message list.
 pub fn estimate_messages_tokens_rough(messages: &[serde_json::Value]) -> usize {
     let total_chars: usize = messages.iter().map(|msg| msg.to_string().len()).sum();
-    (total_chars + 3) / 4
+    total_chars.div_ceil(4)
 }
 
 /// Rough token estimate for a full request (system + messages + tools).
@@ -1138,7 +1133,7 @@ pub fn estimate_request_tokens_rough(
     if let Some(tool_list) = tools {
         total_chars += tool_list.iter().map(|t| t.to_string().len()).sum::<usize>();
     }
-    (total_chars + 3) / 4
+    total_chars.div_ceil(4)
 }
 
 // =========================================================================

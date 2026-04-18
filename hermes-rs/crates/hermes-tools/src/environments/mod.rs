@@ -6,6 +6,7 @@
 //! SingularityEnvironment.
 
 pub mod daytona;
+#[cfg(feature = "docker")]
 pub mod docker_env;
 pub mod file_sync;
 pub mod modal;
@@ -48,7 +49,7 @@ pub trait Environment: Send + Sync {
 /// Environment factory — creates environments from configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnvConfig {
-    /// Environment type: "local", "docker", "ssh", "modal", "singularity", "daytona".
+    /// Environment type: "local", "docker", "ssh", "singularity".
     pub env_type: String,
     /// Working directory.
     pub cwd: Option<String>,
@@ -85,6 +86,7 @@ pub fn create_environment(config: &EnvConfig) -> Arc<dyn Environment> {
             };
             Arc::new(env)
         }
+        #[cfg(feature = "docker")]
         "docker" => {
             let docker_config = docker_env::DockerConfig {
                 image: config.image.clone().unwrap_or_else(|| "ubuntu:22.04".into()),
@@ -94,23 +96,9 @@ pub fn create_environment(config: &EnvConfig) -> Arc<dyn Environment> {
             let env = docker_env::DockerEnvironment::new(docker_config);
             Arc::new(env)
         }
-        "daytona" => {
-            let daytona_config = daytona::DaytonaConfig {
-                image: config.image.clone().unwrap_or_else(|| "ubuntu:22.04".into()),
-                cwd: config.cwd.clone().unwrap_or_else(|| "/home/daytona".into()),
-                ..Default::default()
-            };
-            let env = daytona::DaytonaEnvironment::new(daytona_config);
-            Arc::new(env)
-        }
-        "modal" => {
-            let modal_config = modal::ModalConfig {
-                image: config.image.clone().unwrap_or_else(|| "ubuntu:22.04".into()),
-                cwd: config.cwd.clone().unwrap_or_else(|| "/root".into()),
-                ..Default::default()
-            };
-            let env = modal::ModalEnvironment::new(modal_config);
-            Arc::new(env)
+        #[cfg(not(feature = "docker"))]
+        "docker" => {
+            return Err("Docker support not compiled in. Enable the `docker` feature.".to_string());
         }
         "singularity" => {
             let singularity_config = singularity::SingularityConfig {

@@ -15,9 +15,14 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::{Environment, ProcessResult};
+use crate::credential_files::get_credential_file_mounts;
+use crate::credentials::get_skills_directory_mount;
 
 /// Default timeout (seconds).
 const DEFAULT_TIMEOUT: u64 = 60;
+
+/// Global lock to prevent concurrent SIF builds of the same image.
+static SIF_BUILD_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Snapshot store path: `{HERMES_HOME}/singularity_snapshots.json`.
 fn snapshot_store_path() -> PathBuf {
@@ -259,12 +264,20 @@ impl SingularityEnvironment {
             cmd.arg("--writable-tmpfs");
         }
 
-        // TODO: Add credential and skills bind mounts.
-        // Python equivalent:
-        //   for mount_entry in get_credential_file_mounts():
-        //       cmd.extend(["--bind", f"{host}:{container}:ro"])
-        //   for skills_mount in get_skills_directory_mount():
-        //       cmd.extend(["--bind", f"{host}:{container}:ro"])
+        // Add credential and skills bind mounts (read-only).
+        for mount in get_credential_file_mounts() {
+            cmd.args([
+                "--bind",
+                &format!("{}:{}:ro", mount.host_path, mount.container_path),
+            ]);
+        }
+        if let Some(skills) = get_skills_directory_mount() {
+            if let (Some(host), Some(container)) =
+                (skills.get("host_path"), skills.get("container_path"))
+            {
+                cmd.args(["--bind", &format!("{}:{}:ro", host, container)]);
+            }
+        }
 
         if memory > 0 {
             cmd.args(["--memory", &memory.to_string()]);
@@ -432,6 +445,14 @@ impl SingularityEnvironment {
             }
         };
 
+        // Acquire global lock to prevent concurrent builds of the same image.
+        let _lock = SIF_BUILD_LOCK.lock();
+
+        // Double-check after acquiring the lock (another thread may have built it).
+        if sif_path.exists() {
+            return sif_path.to_string_lossy().to_string();
+        }
+
         tracing::info!("Building SIF image (one-time setup)...");
         tracing::info!("  Source: {}", image);
         tracing::info!("  Target: {}", sif_path.display());
@@ -462,7 +483,11 @@ impl SingularityEnvironment {
                 }
             }
             Err(e) => {
-                tracing::warn!("SIF build error: {}, falling back to docker:// URL", e);
+                // Clean up partial SIF to avoid corrupt cache hits on retry.
+                if sif_path.exists() {
+                    let _ = std::fs::remove_file(&sif_path);
+                }
+                tracing::warn!("SIF build error: {e}, falling back to docker:// URL");
                 image.to_string()
             }
         }

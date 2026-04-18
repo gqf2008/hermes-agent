@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Checkpoint Manager — Transparent filesystem snapshots via shadow git repos.
 //!
 //! Creates automatic snapshots of working directories before file-mutating

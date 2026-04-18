@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Tirith security scanner integration.
 //!
 //! Mirrors the Python `tools/tirith_security.py`.

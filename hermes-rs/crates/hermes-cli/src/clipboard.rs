@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Clipboard image extraction for macOS, Windows, Linux, and WSL2.
 //!
 //! Mirrors Python `hermes_cli/clipboard.py`.
@@ -68,10 +69,7 @@ fn macos_has_image() -> bool {
 fn macos_pngpaste(dest: &Path) -> bool {
     match Command::new("pngpaste").arg(dest).output() {
         Ok(output) if output.status.success() && dest.exists() => {
-            match std::fs::metadata(dest) {
-                Ok(m) if m.len() > 0 => true,
-                _ => false,
-            }
+            matches!(std::fs::metadata(dest), Ok(m) if m.len() > 0)
         }
         _ => false,
     }
@@ -374,7 +372,7 @@ fn convert_bmp_to_png(path: &Path) -> bool {
     }
     match Command::new("convert")
         .arg(bmp.as_os_str())
-        .arg(&format!("png:{}", path.display()))
+        .arg(format!("png:{}", path.display()))
         .output()
     {
         Ok(output) if output.status.success() && path.exists() && file_size(path) > 0 => {

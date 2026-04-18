@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Long-term memory tool.
 //!
 //! Mirrors the Python `tools/memory_tool.py`.

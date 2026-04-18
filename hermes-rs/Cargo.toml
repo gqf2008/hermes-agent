@@ -46,7 +46,6 @@ members = [
     "crates/hermes-batch",
     "crates/hermes-compress",
     "crates/hermes-gateway",
-    "crates/hermes-acp",
     "crates/hermes-rl",
 ]
 default-members = [
@@ -80,7 +79,6 @@ hermes-cron = { path = "crates/hermes-cron" }
 hermes-batch = { path = "crates/hermes-batch" }
 hermes-compress = { path = "crates/hermes-compress" }
 hermes-gateway = { path = "crates/hermes-gateway" }
-hermes-acp = { path = "crates/hermes-acp" }
 hermes-rl = { path = "crates/hermes-rl" }
 
 # Async

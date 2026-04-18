@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OpenRouter API client helper for Hermes tools.
 //!
 //! Provides a single lazy-initialized HTTP client that all tool modules can

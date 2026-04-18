@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Authentication subcommands.
 //!
 //! Mirrors Python: hermes auth add/list/remove/reset, hermes login/logout
@@ -116,7 +117,7 @@ pub fn cmd_auth_list(provider_filter: Option<&str>) -> anyhow::Result<()> {
     // Collect legacy credentials.json entries
     let mut all_entries: Vec<(String, String, String, bool)> = Vec::new();
     for cred in &creds {
-        if provider_filter.map_or(true, |p| cred.provider == p) {
+        if provider_filter.is_none_or(|p| cred.provider == p) {
             all_entries.push((
                 cred.provider.clone(),
                 cred.label.clone(),
@@ -129,7 +130,7 @@ pub fn cmd_auth_list(provider_filter: Option<&str>) -> anyhow::Result<()> {
     // Collect auth.json credential_pool entries
     if let Some(pool_obj) = auth_store.credential_pool.as_ref().and_then(|v| v.as_object()) {
         for (provider_id, entries_val) in pool_obj {
-            if provider_filter.map_or(true, |p| provider_id == p) {
+            if provider_filter.is_none_or(|p| provider_id == p) {
                 if let Ok(entries_arr) = serde_json::from_value::<Vec<serde_json::Value>>(entries_val.clone()) {
                     for entry in entries_arr {
                         if let Some(obj) = entry.as_object() {

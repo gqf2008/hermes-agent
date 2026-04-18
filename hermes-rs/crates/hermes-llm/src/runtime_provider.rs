@@ -273,8 +273,8 @@ fn _resolve_named_custom_runtime(
 
     // Check providers: dict (new-style)
     for (ep_name, entry) in &config.providers {
-            let name_norm = normalize_custom_provider_name(&ep_name);
-            let display_name = entry.name.as_deref().unwrap_or(&ep_name);
+            let name_norm = normalize_custom_provider_name(ep_name);
+            let display_name = entry.name.as_deref().unwrap_or(ep_name);
             let display_norm = normalize_custom_provider_name(display_name);
 
             let matches = norm == *ep_name
@@ -625,14 +625,14 @@ fn _resolve_openrouter_runtime(
 
     let base_url = explicit_base_url
         .map(|s| s.trim().trim_end_matches('/').to_string())
-        .or_else(|| {
+        .or({
             if use_config_base_url {
                 Some(cfg_base_url)
             } else {
                 None
             }
         })
-        .or_else(|| {
+        .or({
             if !env_openrouter_base_url.is_empty() {
                 Some(env_openrouter_base_url)
             } else {
@@ -664,7 +664,7 @@ fn _resolve_openrouter_runtime(
         explicit_api_key
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
-            .or_else(|| {
+            .or({
                 if !cfg_api_key.is_empty() {
                     Some(cfg_api_key)
                 } else {

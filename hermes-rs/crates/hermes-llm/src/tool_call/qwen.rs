@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Hermes / Qwen tool call parser.
 //!
 //! Based on VLLM's Hermes2ProToolParser.

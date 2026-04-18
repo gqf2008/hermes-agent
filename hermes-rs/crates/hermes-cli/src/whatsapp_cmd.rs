@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! WhatsApp integration command.
 //!
 //! Mirrors Python: hermes whatsapp (configure WhatsApp Cloud API)

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Version command — show detailed version information.
 
 use console::Style;

@@ -705,9 +705,8 @@ impl SkillSource for GitHubSource {
             cache_dir,
         };
 
-        // We need to run async in a blocking context — use tokio runtime
-        let results: Vec<SkillMeta> = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+        let results: Vec<SkillMeta> = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(async {
                 let mut results = Vec::new();
                 for (repo, path_prefix) in &source.taps {
                     let tap_results = source
@@ -716,8 +715,9 @@ impl SkillSource for GitHubSource {
                     results.extend(tap_results);
                 }
                 results
-            })
-        });
+            }),
+            Err(_) => Vec::new(),
+        };
 
         // Deduplicate by name, preferring higher trust levels
         let trust_score = |t: &str| match t {
@@ -755,11 +755,10 @@ impl SkillSource for GitHubSource {
         let repo = parts[1];
         let skill_path = parts[2];
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                self.download_skill(owner, repo, skill_path, identifier)
-            )
-        })
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(self.download_skill(owner, repo, skill_path, identifier)),
+            Err(_) => None,
+        }
     }
 
     fn inspect(&self, identifier: &str) -> Option<SkillMeta> {
@@ -771,8 +770,8 @@ impl SkillSource for GitHubSource {
         let repo_full = format!("{}/{}", parts[0], parts[1]);
         let skill_path = parts[2];
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(async {
                 let skill_md_path = format!("{skill_path}/SKILL.md");
                 let content = self.fetch_raw_file(&repo_full, &skill_md_path).await?;
                 let (fm, _body) = parse_frontmatter(&content);
@@ -795,8 +794,9 @@ impl SkillSource for GitHubSource {
                     tags: extract_tags_from_frontmatter(&fm),
                     extra: None,
                 })
-            })
-        })
+            }),
+            Err(_) => None,
+        }
     }
 }
 

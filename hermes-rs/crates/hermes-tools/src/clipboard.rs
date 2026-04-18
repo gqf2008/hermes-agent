@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Clipboard image extraction for macOS, Windows, Linux, and WSL2.
 //!
 //! Mirrors Python `hermes_cli/clipboard.py`.

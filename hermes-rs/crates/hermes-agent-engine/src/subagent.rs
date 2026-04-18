@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Subagent delegation — spawn child agents with isolated context.
 //!
 //! Mirrors the Python subagent delegation in `run_agent.py`.

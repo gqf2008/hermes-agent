@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! SSRF (Server-Side Request Forgery) prevention.
 //!
 //! Blocks requests to private/internal network addresses.

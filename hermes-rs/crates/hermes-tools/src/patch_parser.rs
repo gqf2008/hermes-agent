@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! V4A Patch Format Parser.
 //!
 //! Parses the V4A patch format used by codex, cline, and other coding agents.

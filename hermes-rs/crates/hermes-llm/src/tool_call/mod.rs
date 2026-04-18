@@ -7,16 +7,16 @@
 //! Used when the model is served via a VLLM server that returns raw text
 //! without pre-parsing tool calls.
 
-pub mod deepseek_v3;
-pub mod deepseek_v3_1;
-pub mod glm45;
-pub mod glm47;
-pub mod kimi_k2;
-pub mod llama;
-pub mod longcat;
-pub mod mistral;
-pub mod qwen;
-pub mod qwen3_coder;
+pub(crate) mod deepseek_v3;
+pub(crate) mod deepseek_v3_1;
+pub(crate) mod glm45;
+pub(crate) mod glm47;
+pub(crate) mod kimi_k2;
+pub(crate) mod llama;
+pub(crate) mod longcat;
+pub(crate) mod mistral;
+pub(crate) mod qwen;
+pub(crate) mod qwen3_coder;
 
 use std::collections::HashMap;
 

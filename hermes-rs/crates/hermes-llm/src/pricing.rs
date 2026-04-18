@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Pricing extraction from API responses.
 //!
 //! Parses nested JSON for prompt/completion/request/cache pricing fields

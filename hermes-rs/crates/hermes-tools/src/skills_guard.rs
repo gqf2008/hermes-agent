@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Skills security scanner.
 //!
 //! Mirrors the Python `tools/skills_guard.py`.

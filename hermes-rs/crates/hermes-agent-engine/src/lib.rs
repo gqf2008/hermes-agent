@@ -1,23 +1,24 @@
 //! # Hermes Agent Engine
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! Core agent conversation loop (AIAgent class).
 //! Mirrors the Python `run_agent.py`.
 
 pub mod agent;
-pub mod budget;
-pub mod failover;
-pub mod memory_manager;
-pub mod memory_provider;
-pub mod message_loop;
-pub mod review_agent;
-pub mod self_evolution;
-pub mod skill_commands;
-pub mod skill_utils;
-pub mod smart_model_routing;
-pub mod subagent;
-pub mod title_generator;
-pub mod trajectory;
-pub mod usage_pricing;
+pub(crate) mod budget;
+pub(crate) mod failover;
+pub(crate) mod memory_manager;
+pub(crate) mod memory_provider;
+pub(crate) mod message_loop;
+pub(crate) mod review_agent;
+pub(crate) mod self_evolution;
+pub(crate) mod skill_commands;
+pub(crate) mod skill_utils;
+pub(crate) mod smart_model_routing;
+pub(crate) mod subagent;
+pub(crate) mod title_generator;
+pub(crate) mod trajectory;
+pub(crate) mod usage_pricing;
 
 pub use agent::AIAgent;
 pub use agent::types::{

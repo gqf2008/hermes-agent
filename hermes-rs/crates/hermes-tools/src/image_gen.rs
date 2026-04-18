@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Image generation tool.
 //!
 //! Mirrors the Python `tools/image_generation_tool.py`.
@@ -100,7 +101,9 @@ async fn call_fal_generate(
     };
 
     // Remove null fields
-    body.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+    if let Some(obj) = body.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))

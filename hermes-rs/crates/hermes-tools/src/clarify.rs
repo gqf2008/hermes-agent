@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Clarify tool — structured multiple-choice or open-ended questions.
 //!
 //! Presents questions to the user. The actual UI interaction is delegated

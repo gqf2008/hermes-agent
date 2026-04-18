@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Voice mode / speech-to-text tool.
 //!
 //! Mirrors the Python `tools/voice_mode.py` and `tools/transcription_tools.py`.
@@ -370,10 +371,14 @@ mod tests {
     #[test]
     fn test_validate_audio_too_large() {
         let tmp = std::env::temp_dir().join("test_audio_large.mp3");
-        // Create a sparse file larger than 25MB
-        use std::os::windows::fs::FileExt;
-        let file = std::fs::File::create(&tmp).unwrap();
-        let _ = file.seek_write(&[0], 30 * 1024 * 1024);
+        // Create a sparse file larger than 25MB (cross-platform via set_len).
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .unwrap();
+        file.set_len(30 * 1024 * 1024).unwrap();
         drop(file);
 
         let result = validate_audio_file(tmp.to_str().unwrap());

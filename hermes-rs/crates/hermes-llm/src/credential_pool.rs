@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use parking_lot::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -409,8 +410,8 @@ impl CredentialPool {
 
         let selected = match self.strategy {
             PoolStrategy::Random => {
-                use rand::seq::SliceRandom;
-                available.choose(&mut rand::thread_rng()).map(|(_, c)| c.clone())
+                let idx = fastrand::usize(..available.len());
+                Some(available[idx].1.clone())
             }
             PoolStrategy::LeastUsed if available.len() > 1 => {
                 available.iter().min_by_key(|(_, e)| e.request_count).map(|(_, c)| c.clone())
@@ -724,24 +725,28 @@ fn parse_absolute_timestamp(value: &serde_json::Value) -> Option<f64> {
     None
 }
 
+static RETRY_DELAY_RE_QUOTA: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"quotaResetDelay[:\s""]+(\d+(?:\.\d+)?)(ms|s)"#)
+        .expect("static retry delay regex is valid")
+});
+
+static RETRY_DELAY_RE_AFTER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)")
+        .expect("static retry delay regex is valid")
+});
+
 /// Extract retry delay from error message patterns.
 ///
 /// Mirrors Python `_extract_retry_delay_seconds` (credential_pool.py:229).
 fn extract_retry_delay_seconds(message: &str) -> Option<f64> {
     // Pattern: quotaResetDelay: 5000ms or "quotaResetDelay": 5s
-    if let Some(caps) = regex::Regex::new(r#"quotaResetDelay[:\s""]+(\d+(?:\.\d+)?)(ms|s)"#)
-        .ok()
-        .and_then(|re| re.captures(message))
-    {
+    if let Some(caps) = RETRY_DELAY_RE_QUOTA.captures(message) {
         let value: f64 = caps[1].parse().ok()?;
         return Some(if &caps[2].to_lowercase() == "ms" { value / 1000.0 } else { value });
     }
     // Pattern: retry after 30 sec
-    if let Some(caps) = regex::Regex::new(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)")
-        .ok()
-        .and_then(|re| re.captures(message))
-    {
-        return Some(caps[1].parse().ok()?);
+    if let Some(caps) = RETRY_DELAY_RE_AFTER.captures(message) {
+        return caps[1].parse().ok();
     }
     None
 }

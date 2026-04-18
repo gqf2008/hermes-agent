@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Managed tool gateway helpers for Nous-hosted vendor passthroughs.
 //!
 //! Resolves shared managed-tool gateway config for vendors, reading the

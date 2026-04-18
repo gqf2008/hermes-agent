@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Helper utilities shared across tool backend implementations.
 //!
 //! Provides common patterns like managed Nous tools detection and OpenAI

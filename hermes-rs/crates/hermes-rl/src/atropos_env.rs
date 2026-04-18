@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! AtroposEnv — Code Generation RL Environment with Test Verification
 //!
 //! Trains models to write correct code that passes test suites.
@@ -227,6 +228,7 @@ impl Default for AtroposEnvConfig {
 ///
 /// The model is given a coding task and must write a Python function that
 /// passes the provided test suite.
+#[derive(Default)]
 pub struct AtroposEnv {
     config: AtroposEnvConfig,
     tasks: Vec<CodingTask>,
@@ -330,7 +332,7 @@ impl AtroposEnv {
 
         // Reasonable length (not too short, not too long)
         let line_count = code.lines().count();
-        if line_count >= 3 && line_count <= 100 {
+        if (3..=100).contains(&line_count) {
             score += 0.2;
         }
 

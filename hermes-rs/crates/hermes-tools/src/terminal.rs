@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Terminal tool — command execution with foreground and background modes.
 //!
 //! Mirrors the Python `tools/terminal_tool.py`.
@@ -342,11 +343,25 @@ fn execute_foreground_via_env(
     Ok(output)
 }
 
-fn execute_foreground_local(command: &str, timeout: u64, workdir: Option<&str>) -> Result<String, String> {
-    let start = Instant::now();
+/// Build a shell command appropriate for the platform.
+#[cfg(unix)]
+fn build_shell_cmd(command: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", command]);
+    cmd
+}
 
+#[cfg(windows)]
+fn build_shell_cmd(command: &str) -> Command {
     let mut cmd = Command::new("cmd.exe");
     cmd.args(["/C", command]);
+    cmd
+}
+
+fn execute_foreground_local_blocking(command: &str, timeout: u64, workdir: Option<&str>) -> Result<String, String> {
+    let start = Instant::now();
+
+    let mut cmd = build_shell_cmd(command);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -389,13 +404,31 @@ fn execute_foreground_local(command: &str, timeout: u64, workdir: Option<&str>) 
     Ok(redact_secrets(&truncated))
 }
 
+fn execute_foreground_local(command: &str, timeout: u64, workdir: Option<&str>) -> Result<String, String> {
+    // If we're inside a tokio runtime, offload the blocking work to spawn_blocking
+    // so the async executor thread remains responsive.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let command = command.to_string();
+        let workdir = workdir.map(|s| s.to_string());
+        return handle.block_on(async {
+            tokio::task::spawn_blocking(move || {
+                execute_foreground_local_blocking(&command, timeout, workdir.as_deref())
+            })
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?
+        });
+    }
+
+    // Not in a tokio runtime — run directly (e.g., synchronous test or non-async caller)
+    execute_foreground_local_blocking(command, timeout, workdir)
+}
+
 // ---------------------------------------------------------------------------
 // Background execution
 // ---------------------------------------------------------------------------
 
 fn execute_background(command: &str, workdir: Option<&str>) -> String {
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/C", command]);
+    let mut cmd = build_shell_cmd(command);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -655,9 +688,21 @@ mod tests {
 
     #[test]
     fn test_foreground_echo() {
+        // Force local backend so the test works regardless of user config.
+        let saved = std::env::var("HERMES_TERMINAL_BACKEND").ok();
+        std::env::set_var("HERMES_TERMINAL_BACKEND", "local");
+
         let result = handle_terminal(serde_json::json!({
             "command": "echo hello"
         }));
+
+        // Restore env
+        if let Some(v) = saved {
+            std::env::set_var("HERMES_TERMINAL_BACKEND", v);
+        } else {
+            std::env::remove_var("HERMES_TERMINAL_BACKEND");
+        }
+
         let json: Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert!(json.get("success").is_some());
         let output = json.get("output").and_then(Value::as_str).unwrap_or("");

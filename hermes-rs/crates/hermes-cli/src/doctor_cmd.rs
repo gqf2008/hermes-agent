@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Doctor command — diagnose common configuration issues.
 //!
 //! Mirrors the Python `hermes_cli/doctor.py`.
@@ -721,7 +722,7 @@ pub fn cmd_doctor_fix() -> anyhow::Result<()> {
             let stale_keys: Vec<String> = ["provider", "base_url"]
                 .iter()
                 .filter(|&&k| {
-                    map.get(&serde_yaml::Value::String(k.to_string()))
+                    map.get(serde_yaml::Value::String(k.to_string()))
                         .and_then(|v| v.as_str())
                         .is_some()
                 })
@@ -753,7 +754,7 @@ pub fn cmd_doctor_fix() -> anyhow::Result<()> {
                 }
                 // Write back
                 let yaml = serde_yaml::to_string(&config).unwrap_or_default();
-                match std::fs::write(&config_path(), yaml) {
+                match std::fs::write(config_path(), yaml) {
                     Ok(()) => { println!("{}", green().apply_to("✓")); fixed_count += 1; }
                     Err(e) => { println!("{} {e}", red().apply_to("✗")); failed.push("migrate stale config keys".to_string()); }
                 }

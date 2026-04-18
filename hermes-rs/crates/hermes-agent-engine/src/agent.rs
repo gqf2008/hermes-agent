@@ -31,6 +31,7 @@ pub use types::{
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use parking_lot::Mutex;
 
 use serde_json::Value;
 
@@ -71,14 +72,14 @@ pub struct AIAgent {
     interrupt: Arc<AtomicBool>,
     /// Message accompanying the interrupt request (from Python: `_interrupt_message`).
     #[allow(dead_code)]
-    interrupt_message: std::sync::Mutex<Option<String>>,
+    interrupt_message: Mutex<Option<String>>,
     /// Delegation depth (0 = top-level agent).
     #[allow(dead_code)]
     delegate_depth: u32,
     /// Pending subagent results to inject as tool messages.
-    delegate_results: std::sync::Mutex<Vec<SubagentResult>>,
+    delegate_results: Mutex<Vec<SubagentResult>>,
     /// Token usage from the last LLM call (for API response propagation).
-    last_usage: std::sync::Mutex<Option<TurnUsage>>,
+    last_usage: Mutex<Option<TurnUsage>>,
     /// Activity callback to prevent gateway inactivity timeout.
     activity_callback: Option<ActivityCallback>,
     /// Turns since last memory tool use (starts at 0).
@@ -107,10 +108,10 @@ pub struct AIAgent {
     interim_assistant_callback: Option<InterimAssistantCallback>,
     /// Accumulated assistant text emitted through stream callbacks.
     /// Mirrors Python `_current_streamed_assistant_text`.
-    current_streamed_assistant_text: std::sync::Mutex<String>,
+    current_streamed_assistant_text: Mutex<String>,
     /// Whether a paragraph break is needed before the next stream delta.
     /// Mirrors Python `_stream_needs_break`.
-    stream_needs_break: std::sync::Mutex<bool>,
+    stream_needs_break: Mutex<bool>,
     /// Whether a fallback provider was activated this turn.
     /// Restored to primary at the start of the next turn.
     fallback_activated: bool,
@@ -119,19 +120,19 @@ pub struct AIAgent {
     /// Rate limit state captured from provider response headers (x-ratelimit-*).
     /// Mirrors Python: `_rate_limit_state` in `run_agent.py`.
     #[allow(dead_code)]
-    rate_limit_state: std::sync::Mutex<Option<Value>>,
+    rate_limit_state: Mutex<Option<Value>>,
     /// Last activity timestamp (epoch seconds) for gateway diagnostics.
     /// Mirrors Python: `_last_activity_ts` in `run_agent.py`.
     #[allow(dead_code)]
-    last_activity_ts: std::sync::Mutex<f64>,
+    last_activity_ts: Mutex<f64>,
     /// Last activity description for gateway diagnostics.
     /// Mirrors Python: `_last_activity_desc` in `run_agent.py`.
     #[allow(dead_code)]
-    last_activity_desc: std::sync::Mutex<String>,
+    last_activity_desc: Mutex<String>,
     /// Current tool being executed (for activity summary).
     /// Mirrors Python: `_current_tool` in `run_agent.py`.
     #[allow(dead_code)]
-    current_tool: std::sync::Mutex<Option<String>>,
+    current_tool: Mutex<Option<String>>,
     /// Pre-LLM hook for plugin interception.
     /// Mirrors Python plugin system.
     #[allow(dead_code)]
@@ -202,28 +203,28 @@ impl AIAgent {
             budget: Arc::new(IterationBudget::new(max_iterations)),
             subagent_mgr,
             interrupt,
-            interrupt_message: std::sync::Mutex::new(None),
+            interrupt_message: Mutex::new(None),
             delegate_depth: depth,
-            delegate_results: std::sync::Mutex::new(Vec::new()),
+            delegate_results: Mutex::new(Vec::new()),
             activity_callback: None,
             turns_since_memory: 0,
             iters_since_skill: 0,
             disable_streaming: false,
             force_ascii_payload: false,
-            last_usage: std::sync::Mutex::new(None),
+            last_usage: Mutex::new(None),
             stream_callback: None,
             status_callback: None,
             reasoning_callback: None,
             tool_gen_callback: None,
             interim_assistant_callback: None,
-            current_streamed_assistant_text: std::sync::Mutex::new(String::new()),
-            stream_needs_break: std::sync::Mutex::new(false),
+            current_streamed_assistant_text: Mutex::new(String::new()),
+            stream_needs_break: Mutex::new(false),
             fallback_activated: false,
             primary_runtime: None,
-            rate_limit_state: std::sync::Mutex::new(None),
-            last_activity_ts: std::sync::Mutex::new(0.0),
-            last_activity_desc: std::sync::Mutex::new(String::new()),
-            current_tool: std::sync::Mutex::new(None),
+            rate_limit_state: Mutex::new(None),
+            last_activity_ts: Mutex::new(0.0),
+            last_activity_desc: Mutex::new(String::new()),
+            current_tool: Mutex::new(None),
             pre_llm_hook: None,
             turn_number: 0,
             session_db,
@@ -389,8 +390,7 @@ impl AIAgent {
             // a new message arrives (gateway) or user presses Ctrl-C.
             if self.is_interrupted() {
                 let msg = self.interrupt_message.lock()
-                    .ok()
-                    .and_then(|g| g.clone())
+                    .clone()
                     .unwrap_or_else(|| "Interrupted by user".to_string());
                 tracing::info!(
                     "Interrupt requested — breaking conversation loop: {}",
@@ -821,7 +821,7 @@ impl AIAgent {
                                 "Failover: retrying with backoff {}ms (auth refresh failed)",
                                 backoff_ms
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms as u64)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                             continue;
                         }
                         FailoverAction::StripThinkingSignature => {
@@ -899,7 +899,7 @@ impl AIAgent {
                                 "Failover: retrying with backoff {}ms ({})",
                                 backoff_ms, failure_hint
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms as u64)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                             continue;
                         }
                         FailoverAction::TryFallback => {
@@ -1284,19 +1284,20 @@ impl AIAgent {
 
     /// Store usage from the last LLM call (interior mutability via Mutex).
     fn set_last_usage(&self, usage: TurnUsage) {
-        if let Ok(mut guard) = self.last_usage.lock() {
+        {
+            let mut guard = self.last_usage.lock();
             *guard = Some(usage);
         }
     }
 
     /// Extract and clear the last LLM usage.
     fn take_last_usage(&self) -> Option<TurnUsage> {
-        self.last_usage.lock().ok().and_then(|mut g| g.take())
+        self.last_usage.lock().take()
     }
 
     /// Extract and clear pending delegate results.
     fn take_delegate_results(&self) -> Option<Vec<SubagentResult>> {
-        let mut guard = self.delegate_results.lock().ok()?;
+        let mut guard = self.delegate_results.lock();
         if guard.is_empty() {
             None
         } else {
@@ -1306,7 +1307,7 @@ impl AIAgent {
 
     /// Store delegate results for injection into the conversation.
     fn store_delegate_results(&self, results: Vec<SubagentResult>) {
-        let mut guard = self.delegate_results.lock().unwrap();
+        let mut guard = self.delegate_results.lock();
         guard.extend(results);
     }
 
@@ -1422,7 +1423,7 @@ impl AIAgent {
         // If a tool iteration set the break flag, prepend a paragraph
         // break before the first real text delta.
         // Mirrors Python: `_stream_needs_break` handling.
-        let mut needs_break = self.stream_needs_break.lock().unwrap();
+        let mut needs_break = self.stream_needs_break.lock();
         let text = if *needs_break && !text.trim().is_empty() {
             *needs_break = false;
             format!("\n\n{text}")
@@ -1473,9 +1474,9 @@ impl AIAgent {
     ///
     /// Mirrors Python `_reset_stream_delivery_tracking()` (run_agent.py:5100).
     fn reset_stream_delivery_tracking(&self) {
-        let mut tracked = self.current_streamed_assistant_text.lock().unwrap();
+        let mut tracked = self.current_streamed_assistant_text.lock();
         tracked.clear();
-        let mut needs_break = self.stream_needs_break.lock().unwrap();
+        let mut needs_break = self.stream_needs_break.lock();
         *needs_break = false;
     }
 
@@ -1484,7 +1485,7 @@ impl AIAgent {
     /// Mirrors Python `_record_streamed_assistant_text()` (run_agent.py:5104).
     fn record_streamed_assistant_text(&self, text: &str) {
         if !text.is_empty() {
-            let mut tracked = self.current_streamed_assistant_text.lock().unwrap();
+            let mut tracked = self.current_streamed_assistant_text.lock();
             tracked.push_str(text);
         }
     }
@@ -1686,7 +1687,7 @@ impl AIAgent {
             return false;
         }
         let streamed = {
-            let tracked = self.current_streamed_assistant_text.lock().unwrap();
+            let tracked = self.current_streamed_assistant_text.lock();
             Self::normalize_interim_visible_text(&Self::strip_think_blocks(&tracked))
         };
         !streamed.is_empty() && streamed == visible
@@ -1720,7 +1721,7 @@ impl AIAgent {
     /// Mirrors Python `_stream_needs_break = True`.
     #[allow(dead_code)]
     fn mark_stream_break_needed(&self) {
-        let mut needs_break = self.stream_needs_break.lock().unwrap();
+        let mut needs_break = self.stream_needs_break.lock();
         *needs_break = true;
     }
 
@@ -1788,7 +1789,8 @@ impl AIAgent {
         self.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // 2. Clear pending delegate results (mirrors Python: close active child agents)
-        if let Ok(mut guard) = self.delegate_results.lock() {
+        {
+            let mut guard = self.delegate_results.lock();
             guard.clear();
         }
 
@@ -1840,13 +1842,13 @@ impl AIAgent {
     fn repair_tool_call(tool_name: &str, valid_names: &[String]) -> Option<String> {
         // 1. Lowercase
         let lowered = tool_name.to_lowercase();
-        if valid_names.iter().any(|n| *n == lowered) {
+        if valid_names.contains(&lowered) {
             return Some(lowered);
         }
 
         // 2. Normalized
-        let normalized = lowered.replace('-', "_").replace(' ', "_");
-        if valid_names.iter().any(|n| *n == normalized) {
+        let normalized = lowered.replace(['-', ' '], "_");
+        if valid_names.contains(&normalized) {
             return Some(normalized);
         }
 
@@ -1886,7 +1888,9 @@ impl AIAgent {
         if n == 0 { return m; }
 
         let mut dp = vec![vec![0usize; n + 1]; m + 1];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..=m { dp[i][0] = i; }
+        #[allow(clippy::needless_range_loop)]
         for j in 0..=n { dp[0][j] = j; }
 
         for i in 1..=m {

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! MCP OAuth 2.1 Client Support (stub).
 //!
 //! Implements the browser-based OAuth 2.1 authorization code flow with PKCE

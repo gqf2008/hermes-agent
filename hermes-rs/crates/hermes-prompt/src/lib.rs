@@ -1,18 +1,19 @@
 //! # Hermes Prompt
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! System prompt construction, context compression, and Anthropic prompt caching.
 //! Mirrors the Python `agent/prompt_builder.py`, `agent/context_compressor.py`,
 //! and `agent/prompt_caching.py`.
 
-pub mod builder;
-pub mod cache_control;
-pub mod context_compressor;
-pub mod context_references;
-pub mod injection_scan;
-pub mod skills_prompt;
-pub mod manual_compression_feedback;
-pub mod soul;
-pub mod subdirectory_hints;
+pub(crate) mod builder;
+pub(crate) mod cache_control;
+pub(crate) mod context_compressor;
+pub(crate) mod context_references;
+pub(crate) mod injection_scan;
+pub(crate) mod skills_prompt;
+pub(crate) mod manual_compression_feedback;
+pub(crate) mod soul;
+pub(crate) mod subdirectory_hints;
 
 // Re-export main public types for convenience.
 pub use builder::{

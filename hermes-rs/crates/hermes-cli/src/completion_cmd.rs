@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shell completion generation command.
 
 use clap::Command;

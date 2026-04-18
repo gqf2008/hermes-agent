@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! MathEnv — RL Environment for Math Problem Solving
 //!
 //! Trains models to solve math problems correctly.
@@ -151,6 +152,7 @@ impl Default for MathEnvConfig {
 // ---------------------------------------------------------------------------
 
 /// Math problem solving RL environment.
+#[derive(Default)]
 pub struct MathEnv {
     config: MathEnvConfig,
     problems: Vec<MathProblem>,

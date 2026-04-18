@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Self-update command.
 //!
 //! Mirrors Python: hermes update (self-update from PyPI or Git)

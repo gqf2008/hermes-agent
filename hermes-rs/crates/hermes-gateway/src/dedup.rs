@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! TTL-based message deduplication cache.
 //!
 //! Used by gateway platform adapters (Feishu, WeCom, Dingtalk) to prevent

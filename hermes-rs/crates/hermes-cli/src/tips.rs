@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Random tips shown at CLI session start to help users discover features.
 //!
 //! Mirrors Python `hermes_cli/tips.py`.

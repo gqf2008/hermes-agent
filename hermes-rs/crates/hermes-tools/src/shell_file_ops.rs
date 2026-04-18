@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shell-based file operations via terminal environment backend.
 //!
 //! Mirrors the Python `tools/file_operations.py` ShellFileOperations class.
@@ -817,7 +818,12 @@ mod tests {
 
         let result = ops.search("fn hello", &dir.path().to_string_lossy(), Some("*.rs"), 10, "content");
         assert!(result["success"].as_bool().unwrap());
-        assert!(result["total_matches"].as_u64().unwrap() >= 1);
+        // ripgrep returns total_matches; grep fallback returns total_files
+        if ops.has_command("rg") {
+            assert!(result["total_matches"].as_u64().unwrap() >= 1);
+        } else {
+            assert!(result["total_files"].as_u64().unwrap() >= 1);
+        }
     }
 
     #[cfg(unix)]

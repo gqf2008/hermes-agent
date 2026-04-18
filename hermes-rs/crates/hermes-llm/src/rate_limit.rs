@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Rate limit tracking and Nous subscription quota guard.
 //!
 //! Supports:
@@ -995,8 +996,6 @@ fn now_epoch() -> f64 {
 pub fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 10_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
     } else if n >= 1_000 {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {

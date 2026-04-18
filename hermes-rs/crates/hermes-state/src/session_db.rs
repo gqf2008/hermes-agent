@@ -102,7 +102,7 @@ impl SessionDB {
                         let msg = se.to_string().to_lowercase();
                         if (msg.contains("locked") || msg.contains("busy")) && attempt < WRITE_MAX_RETRIES - 1 {
                             last_err = Some(e);
-                            let jitter = rand::thread_rng().gen_range(WRITE_RETRY_MIN_MS..=WRITE_RETRY_MAX_MS);
+                            let jitter = rand::rng().random_range(WRITE_RETRY_MIN_MS..=WRITE_RETRY_MAX_MS);
                             std::thread::sleep(std::time::Duration::from_millis(jitter));
                             continue;
                         }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Cross-process advisory lock for `auth.json`.
 //!
 //! Prevents concurrent writes from multiple Hermes processes (or threads)

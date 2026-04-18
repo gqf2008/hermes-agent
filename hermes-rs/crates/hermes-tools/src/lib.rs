@@ -1,4 +1,5 @@
 //! # Hermes Tools
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! Tool registry and all ~60 tool implementations.
 //! Mirrors the Python `tools/` directory and `model_tools.py`.
@@ -8,64 +9,67 @@ pub mod tool_result;
 pub mod toolsets_def;
 
 // Simple tools
-pub mod budget_config;
-pub mod interrupt;
-pub mod url_safety;
-pub mod website_policy;
-pub mod ansi_strip;
-pub mod binary_extensions;
-pub mod debug_helpers;
-pub mod fuzzy_match;
-pub mod patch_parser;
-pub mod osv_check;
-pub mod clipboard;
-pub mod credential_files;
-pub mod tool_result_storage;
-pub mod openrouter_client;
-pub mod transcription;
+pub(crate) mod budget_config;
+pub(crate) mod interrupt;
+pub(crate) mod url_safety;
+pub(crate) mod website_policy;
+pub(crate) mod ansi_strip;
+pub(crate) mod binary_extensions;
+pub(crate) mod debug_helpers;
+pub(crate) mod fuzzy_match;
+pub(crate) mod patch_parser;
+pub(crate) mod osv_check;
+pub(crate) mod clipboard;
+pub(crate) mod credential_files;
+pub(crate) mod tool_result_storage;
+pub(crate) mod openrouter_client;
+pub(crate) mod transcription;
 
 // Complex tools (stub modules — implementations added progressively)
-pub mod approval;
-pub mod file_ops;
-pub mod terminal;
-pub mod process_reg;
-pub mod web;
-pub mod browser;
-pub mod code_exec;
-pub mod delegate;
-pub mod mcp_client;
-pub mod memory;
-pub mod todo;
+pub(crate) mod approval;
+pub(crate) mod file_ops;
+pub(crate) mod terminal;
+pub(crate) mod process_reg;
+pub(crate) mod web;
+#[cfg(feature = "browser")]
+pub(crate) mod browser;
+pub(crate) mod code_exec;
+pub(crate) mod delegate;
+#[cfg(feature = "mcp")]
+pub(crate) mod mcp_client;
+pub(crate) mod memory;
+pub(crate) mod todo;
 pub mod skills;
-pub mod skills_hub;
-pub mod skills_sync;
-pub mod tts;
-pub mod voice;
-pub mod vision;
-pub mod image_gen;
-pub mod clarify;
-pub mod session_search;
-pub mod homeassistant;
-pub mod send_message;
-pub mod checkpoint;
-pub mod shell_file_ops;
-pub mod credentials;
-pub mod rl_training;
-pub mod skills_guard;
-pub mod tirith;
-pub mod cron_tools;
-pub mod moa;
+pub(crate) mod skills_hub;
+pub(crate) mod skills_sync;
+pub(crate) mod tts;
+pub(crate) mod voice;
+pub(crate) mod vision;
+#[cfg(feature = "image")]
+pub(crate) mod image_gen;
+pub(crate) mod clarify;
+pub(crate) mod session_search;
+pub(crate) mod homeassistant;
+pub(crate) mod send_message;
+pub(crate) mod checkpoint;
+pub(crate) mod shell_file_ops;
+pub(crate) mod credentials;
+pub(crate) mod rl_training;
+pub(crate) mod skills_guard;
+pub(crate) mod tirith;
+pub(crate) mod cron_tools;
+pub(crate) mod moa;
 
 // Backend helpers
-pub mod env_passthrough;
+pub(crate) mod env_passthrough;
 pub mod managed_tool_gateway;
-pub mod mcp_oauth;
-pub mod neutts_synth;
-pub mod path_security;
+pub(crate) mod mcp_oauth;
+pub(crate) mod neutts_synth;
+pub(crate) mod path_security;
 pub mod tool_backend_helpers;
 
 // Environment backends
-pub mod environments;
+pub(crate) mod environments;
 
 use std::sync::Arc;
 
@@ -86,6 +90,7 @@ pub fn register_all_tools(registry: &mut crate::registry::ToolRegistry) {
     skills::register_skills_tools(registry);
     skills_hub::register(registry);
     file_ops::register_file_tools(registry);
+    #[cfg(feature = "image")]
     image_gen::register_image_tool(registry);
     cron_tools::register_cron_tools(registry);
     session_search::register_session_search_tool(registry);
@@ -95,8 +100,10 @@ pub fn register_all_tools(registry: &mut crate::registry::ToolRegistry) {
     process_reg::register_process_tool(registry);
     terminal::register_terminal_tool(registry);
     delegate::register_delegate_tool(registry);
+    #[cfg(feature = "mcp")]
     mcp_client::register_mcp_client_tool(registry);
     rl_training::register_rl_tools(registry);
+    #[cfg(feature = "browser")]
     browser::register_browser_tools(registry);
     // code_exec registered last — it needs a snapshot of the full registry
     // so the Python sandbox can RPC-dispatch to any registered tool.

@@ -37,6 +37,27 @@ fn get_task_id(args: &Value) -> String {
         .to_string()
 }
 
+/// Run an async closure on the current tokio runtime.
+/// Returns an error instead of panicking if the runtime cannot be created.
+fn block_on_browser<F>(f: F) -> Result<String, hermes_core::HermesError>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
+            return Err(hermes_core::HermesError::new(
+                hermes_core::ErrorCategory::ToolError,
+                "browser tool: no tokio runtime available".to_string(),
+            ));
+        }
+    };
+    match handle.block_on(f) {
+        Ok(result) => Ok(result),
+        Err(e) => Ok(tool_error(&e)),
+    }
+}
+
 /// Handle browser tool call (dispatcher).
 pub fn handle_browser_tool(args: Value) -> Result<String, hermes_core::HermesError> {
     let action = args
@@ -175,15 +196,7 @@ fn browser_navigate_camofox(url: &str, task_id: &str) -> Result<String, hermes_c
     // Camofox requires async I/O; use a blocking runtime for simplicity
     let url = url.to_string();
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_navigate_async(url, task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_navigate_async(url, task_id))
 }
 
 /// Cloud navigate: create session + run agent-browser with --cdp.
@@ -234,15 +247,7 @@ fn browser_navigate_cloud(
     let task_id = task_id.to_string();
     let provider = provider.clone();
 
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(cloud_navigate_async(url, task_id, provider))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(cloud_navigate_async(url, task_id, provider))
 }
 
 fn browser_snapshot(args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -306,15 +311,7 @@ async fn camofox_snapshot_async(task_id: String, _full: bool) -> Result<String, 
 
 fn browser_snapshot_camofox(task_id: &str) -> Result<String, hermes_core::HermesError> {
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_snapshot_async(task_id, false))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_snapshot_async(task_id, false))
 }
 
 fn browser_click(args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -369,15 +366,7 @@ async fn camofox_click_async(ref_id: String, task_id: String) -> Result<String, 
 fn browser_click_camofox(ref_id: &str, task_id: &str) -> Result<String, hermes_core::HermesError> {
     let ref_id = ref_id.to_string();
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_click_async(ref_id, task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_click_async(ref_id, task_id))
 }
 
 fn browser_type(args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -439,15 +428,7 @@ fn browser_type_camofox(ref_id: &str, text: &str, task_id: &str) -> Result<Strin
     let ref_id = ref_id.to_string();
     let text = text.to_string();
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_type_async(ref_id, text, task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_type_async(ref_id, text, task_id))
 }
 
 fn browser_scroll(args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -499,15 +480,7 @@ async fn camofox_scroll_async(direction: String, task_id: String) -> Result<Stri
 fn browser_scroll_camofox(direction: &str, task_id: &str) -> Result<String, hermes_core::HermesError> {
     let direction = direction.to_string();
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_scroll_async(direction, task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_scroll_async(direction, task_id))
 }
 
 fn browser_back(_args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -554,15 +527,7 @@ async fn camofox_back_async(task_id: String) -> Result<String, String> {
 
 fn browser_back_camofox(task_id: &str) -> Result<String, hermes_core::HermesError> {
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_back_async(task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_back_async(task_id))
 }
 
 fn browser_press(args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -617,15 +582,7 @@ async fn camofox_press_async(key: String, task_id: String) -> Result<String, Str
 fn browser_press_camofox(key: &str, task_id: &str) -> Result<String, hermes_core::HermesError> {
     let key = key.to_string();
     let task_id = task_id.to_string();
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_press_async(key, task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_press_async(key, task_id))
 }
 
 fn browser_get_images(_args: &Value) -> Result<String, hermes_core::HermesError> {
@@ -716,15 +673,7 @@ async fn camofox_vision_async(question: String, task_id: String) -> Result<Strin
 fn browser_vision_camofox(question: &str, _temp_path: &str) -> Result<String, hermes_core::HermesError> {
     let question = question.to_string();
     let task_id = get_task_id(&serde_json::json!({}));
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime")
-        .block_on(camofox_vision_async(question, task_id))
-    {
-        Ok(result) => Ok(result),
-        Err(e) => Ok(tool_error(&e)),
-    }
+    block_on_browser(camofox_vision_async(question, task_id))
 }
 
 fn browser_console(args: &Value) -> Result<String, hermes_core::HermesError> {

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Iteration budget for agent turns.
 //!
 //! Mirrors the Python `IterationBudget` in `run_agent.py`.

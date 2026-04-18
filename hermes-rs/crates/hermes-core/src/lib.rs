@@ -1,4 +1,5 @@
 //! # Hermes Core
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! Shared types, constants, error definitions, and configuration for the Hermes Agent system.
 //!
@@ -9,17 +10,17 @@
 //! - Logging setup via `tracing`
 //! - Time utilities
 
-pub mod auth_lock;
+pub(crate) mod auth_lock;
 pub mod config;
-pub mod constants;
-pub mod env_loader;
+pub(crate) mod constants;
+pub(crate) mod env_loader;
 pub mod errors;
 pub mod hermes_home;
-pub mod logging;
-pub mod platforms;
-pub mod proxy_validation;
-pub mod redact;
-pub mod time;
+pub(crate) mod logging;
+pub(crate) mod platforms;
+pub(crate) mod proxy_validation;
+pub(crate) mod redact;
+pub(crate) mod time;
 
 pub use auth_lock::{with_auth_json_read_lock, with_auth_json_write_lock};
 pub use config::{HermesConfig, ProviderPreferencesConfig};

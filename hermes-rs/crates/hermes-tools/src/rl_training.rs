@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! RL training tools — reinforcement learning on Tinker-Atropos.
 //!
 //! Mirrors the Python `tools/rl_training_tool.py`.

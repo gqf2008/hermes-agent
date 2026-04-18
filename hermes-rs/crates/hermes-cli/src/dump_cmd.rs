@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Dump command for Hermes CLI.
 //!
 //! Outputs a compact, plain-text summary of the user's Hermes setup

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Vision analysis tool.
 //!
 //! Mirrors the Python `tools/vision_tools.py`.

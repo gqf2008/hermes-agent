@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Credential file registry.
 //!
 //! Mirrors the Python `tools/credential_files.py`.

@@ -222,7 +222,10 @@ impl WeixinAdapter {
             client: Client::builder()
                 .timeout(std::time::Duration::from_millis(API_TIMEOUT_MS))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    Client::new()
+                }),
             offset: AtomicU64::new(0),
             context_token: RwLock::new(default_token),
             token_store: tokio::sync::Mutex::new(token_store),
@@ -607,7 +610,7 @@ impl WeixinAdapter {
         let block_size = 16;
         let pad_len = block_size - (plaintext.len() % block_size);
         let mut padded = plaintext.to_vec();
-        padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
 
         let mut result = Vec::with_capacity(padded.len());
         for chunk in padded.chunks_exact(block_size) {

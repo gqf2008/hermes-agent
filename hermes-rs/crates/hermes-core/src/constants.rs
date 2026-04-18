@@ -1,6 +1,7 @@
 //! Constants and defaults shared across the Hermes system.
 //!
 //! Mirrors the constant values scattered across the Python codebase.
+#![allow(dead_code)]
 
 /// Default agent identity / system prompt text.
 pub const DEFAULT_AGENT_IDENTITY: &str =

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! ACP (Agent Client Protocol) command.
 //!
 //! Mirrors Python: hermes acp (IDE integration for VS Code, Zed, JetBrains)

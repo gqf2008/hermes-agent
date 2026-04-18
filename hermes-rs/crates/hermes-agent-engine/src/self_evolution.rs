@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Self-evolution: review prompt constants.
 //!
 //! These prompts are used by the background review agent to self-improve

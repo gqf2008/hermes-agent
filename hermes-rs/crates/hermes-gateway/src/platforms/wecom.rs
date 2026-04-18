@@ -115,7 +115,10 @@ impl WeComAdapter {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    Client::new()
+                }),
             dedup: MessageDeduplicator::new(),
             config,
             ws_state: Mutex::new(None),

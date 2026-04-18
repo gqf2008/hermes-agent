@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Slack platform adapter.
 //!
 //! Mirrors the Python `gateway/platforms/slack.py`.
@@ -24,10 +25,8 @@ use axum::{
     response::Json,
     routing::post,
 };
-use hmac::Hmac;
 use reqwest::Client;
 use serde::Deserialize;
-use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -116,11 +115,13 @@ pub struct SlackMessageEvent {
     pub attachments: Vec<SlackAttachment>,
 }
 
+type SlackMessageHandler = Arc<dyn Fn(SlackMessageEvent) + Send + Sync>;
+
 /// Webhook state shared between route handlers.
 struct WebhookState {
     _config: SlackConfig,
     _dedup: Arc<MessageDeduplicator>,
-    on_message: Arc<Mutex<Option<Arc<dyn Fn(SlackMessageEvent) + Send + Sync>>>>,
+    on_message: Arc<Mutex<Option<SlackMessageHandler>>>,
 }
 
 /// Slack platform adapter.
@@ -140,7 +141,10 @@ impl SlackAdapter {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    Client::new()
+                }),
             dedup: Arc::new(MessageDeduplicator::with_params(300, 2000)),
             _bot_user_id: Arc::new(Mutex::new(None)),
             _user_name_cache: Arc::new(std::sync::Mutex::new(

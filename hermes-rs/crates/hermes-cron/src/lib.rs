@@ -1,4 +1,5 @@
 //! # Hermes Cron
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! Scheduled job execution with cron expressions.
 //! Mirrors the Python `cron/` directory.

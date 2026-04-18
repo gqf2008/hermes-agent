@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! WebResearchEnv — RL Environment for Multi-Step Web Research
 //!
 //! Trains models to do accurate, efficient, multi-source web research.
@@ -169,6 +170,7 @@ impl Default for WebResearchEnvConfig {
 ///
 /// The model is given a factual question requiring 2-3 hops of web research
 /// and must use web_search / web_extract tools to find and synthesize the answer.
+#[derive(Default)]
 pub struct WebResearchEnv {
     config: WebResearchEnvConfig,
     questions: Vec<ResearchQuestion>,

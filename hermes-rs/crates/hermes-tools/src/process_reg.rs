@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Process registry tool.
 //!
 //! Mirrors the Python `tools/process_registry.py`.
@@ -152,7 +153,7 @@ fn handle_log(args: &Value) -> Result<String, hermes_core::HermesError> {
     .to_string())
 }
 
-fn handle_wait(args: &Value) -> Result<String, hermes_core::HermesError> {
+fn handle_wait_blocking(args: &Value) -> Result<String, hermes_core::HermesError> {
     let session_id = match args.get("session_id").and_then(Value::as_str) {
         Some(s) => s.to_string(),
         None => return Ok(tool_error("wait requires 'session_id' parameter")),
@@ -204,6 +205,25 @@ fn handle_wait(args: &Value) -> Result<String, hermes_core::HermesError> {
     }
 }
 
+fn handle_wait(args: &Value) -> Result<String, hermes_core::HermesError> {
+    // If inside a tokio runtime, offload the blocking polling loop to spawn_blocking
+    // so the async executor thread remains responsive.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let args = args.clone();
+        return handle.block_on(async {
+            tokio::task::spawn_blocking(move || handle_wait_blocking(&args))
+                .await
+                .map_err(|e| hermes_core::HermesError::new(
+                    hermes_core::ErrorCategory::TerminalError,
+                    format!("wait task join error: {e}"),
+                ))?
+        });
+    }
+
+    // Not in a tokio runtime — run directly
+    handle_wait_blocking(args)
+}
+
 fn handle_kill(args: &Value) -> Result<String, hermes_core::HermesError> {
     let session_id = match args.get("session_id").and_then(Value::as_str) {
         Some(s) => s.to_string(),
@@ -253,7 +273,8 @@ fn kill_process_by_pid(pid: u32) -> bool {
     if result == 0 {
         true
     } else {
-        tracing::warn!("Failed to send SIGTERM to PID {pid}: errno {}", unsafe { libc::errno() });
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        tracing::warn!("Failed to send SIGTERM to PID {pid}: errno {errno}");
         false
     }
 }

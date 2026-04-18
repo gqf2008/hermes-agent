@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! OSV malware check for MCP extension packages.
 //!
 //! Before launching an MCP server via npx/uvx, queries the OSV (Open Source

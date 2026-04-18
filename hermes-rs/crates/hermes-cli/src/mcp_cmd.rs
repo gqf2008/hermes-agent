@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! MCP (Model Context Protocol) server management.
 
 use console::Style;

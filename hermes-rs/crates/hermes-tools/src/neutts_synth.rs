@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! NeuTTS synthesis helper.
 //!
 //! Spawns `neutts_synth.py` as a subprocess to keep the TTS model (~500MB)

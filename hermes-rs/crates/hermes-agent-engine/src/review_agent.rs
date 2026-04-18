@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Background review agent for self-evolution.
 //!
 //! A lightweight AIAgent that reviews the just-completed conversation

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Plugin management command.
 
 use console::Style;

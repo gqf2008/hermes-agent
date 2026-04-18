@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Anthropic prompt caching — `system_and_3` strategy.
 //!
 //! Mirrors the Python `agent/prompt_caching.py`.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Log viewer command — view, filter, and follow log files.
 
 use console::Style;

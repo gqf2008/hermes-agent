@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Gateway session management.
 //!
 //! Mirrors Python `gateway/session.py` and `gateway/session_context.py`:
@@ -11,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use chrono::{DateTime, Local, Timelike};
 use serde::{Deserialize, Serialize};
@@ -393,7 +393,7 @@ pub struct SessionStore {
     config: GatewayConfig,
     entries: parking_lot::Mutex<HashMap<String, SessionEntry>>,
     loaded: parking_lot::Mutex<bool>,
-    db: Mutex<Option<hermes_state::SessionDB>>,
+    db: parking_lot::Mutex<Option<hermes_state::SessionDB>>,
 }
 
 impl SessionStore {
@@ -404,7 +404,7 @@ impl SessionStore {
             config,
             entries: parking_lot::Mutex::new(HashMap::new()),
             loaded: parking_lot::Mutex::new(false),
-            db: Mutex::new(db),
+            db: parking_lot::Mutex::new(db),
         }
     }
 
@@ -711,11 +711,10 @@ impl SessionStore {
         drop(entries);
 
         // Also check SQLite (for sessions created by other processes)
-        if let Ok(db_lock) = self.db.lock() {
-            if let Some(db) = db_lock.as_ref() {
-                if let Ok(count) = db.session_count(None) {
-                    return count > 0;
-                }
+        let db_lock = self.db.lock();
+        if let Some(db) = db_lock.as_ref() {
+            if let Ok(count) = db.session_count(None) {
+                return count > 0;
             }
         }
 
@@ -730,13 +729,12 @@ impl SessionStore {
     /// Append a message to a session's transcript (SQLite + legacy JSONL).
     pub fn append_to_transcript(&self, session_id: &str, message: &serde_json::Value) {
         // Write to SQLite
-        if let Ok(db_lock) = self.db.lock() {
-            if let Some(db) = db_lock.as_ref() {
-                let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let content = message.get("content").and_then(|v| v.as_str());
-                db.append_message(session_id, role, content, None, None, None, None, None, None, None, None)
-                    .ok();
-            }
+        let db_lock = self.db.lock();
+        if let Some(db) = db_lock.as_ref() {
+            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let content = message.get("content").and_then(|v| v.as_str());
+            db.append_message(session_id, role, content, None, None, None, None, None, None, None, None)
+                .ok();
         }
 
         // Also write legacy JSONL
@@ -757,15 +755,14 @@ impl SessionStore {
     /// Replace the entire transcript for a session with new messages.
     pub fn rewrite_transcript(&self, session_id: &str, messages: &[serde_json::Value]) {
         // SQLite: clear and re-insert
-        if let Ok(db_lock) = self.db.lock() {
-            if let Some(db) = db_lock.as_ref() {
-                db.clear_messages(session_id).ok();
-                for msg in messages {
-                    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let content = msg.get("content").and_then(|v| v.as_str());
-                    db.append_message(session_id, role, content, None, None, None, None, None, None, None, None)
-                        .ok();
-                }
+        let db_lock = self.db.lock();
+        if let Some(db) = db_lock.as_ref() {
+            db.clear_messages(session_id).ok();
+            for msg in messages {
+                let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let content = msg.get("content").and_then(|v| v.as_str());
+                db.append_message(session_id, role, content, None, None, None, None, None, None, None, None)
+                    .ok();
             }
         }
 
@@ -787,11 +784,10 @@ impl SessionStore {
         let mut db_messages = Vec::new();
 
         // Try SQLite first
-        if let Ok(db_lock) = self.db.lock() {
-            if let Some(db) = db_lock.as_ref() {
-                if let Ok(msgs) = db.get_messages_as_conversation(session_id) {
-                    db_messages = msgs;
-                }
+        let db_lock = self.db.lock();
+        if let Some(db) = db_lock.as_ref() {
+            if let Ok(msgs) = db.get_messages_as_conversation(session_id) {
+                db_messages = msgs;
             }
         }
 

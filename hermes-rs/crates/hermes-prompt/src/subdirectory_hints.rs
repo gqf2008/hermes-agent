@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Subdirectory hint discovery.
 //!
 //! As the agent navigates into subdirectories via tool calls (read_file, terminal,

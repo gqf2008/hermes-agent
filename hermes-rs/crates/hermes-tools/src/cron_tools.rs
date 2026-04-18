@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Cron job management tools.
 //!
 //! Mirrors the Python `tools/cronjob_tools.py`.

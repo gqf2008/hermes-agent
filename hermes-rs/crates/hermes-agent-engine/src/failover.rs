@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Chat loop failover chain.
 //!
 //! Mirrors the Python failover sequence in `run_agent.py:9350-10127`.

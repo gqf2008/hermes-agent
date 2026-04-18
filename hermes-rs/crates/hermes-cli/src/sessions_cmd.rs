@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Session management commands for the Hermes CLI.
 //!
 //! Mirrors the Python `hermes sessions` subcommand.

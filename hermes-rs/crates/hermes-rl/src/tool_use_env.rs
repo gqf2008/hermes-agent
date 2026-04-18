@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! ToolUseEnv — RL Environment for Tool Calling Tasks
 //!
 //! Trains models to select and use the correct tools with proper arguments.
@@ -263,6 +264,7 @@ impl Default for ToolUseEnvConfig {
 // ---------------------------------------------------------------------------
 
 /// Tool calling RL environment.
+#[derive(Default)]
 pub struct ToolUseEnv {
     config: ToolUseEnvConfig,
     tasks: Vec<ToolUseTask>,

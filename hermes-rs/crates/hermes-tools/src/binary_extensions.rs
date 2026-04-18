@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Binary file extensions detection.
 //!
 //! Mirrors the Python `tools/binary_extensions.py`.

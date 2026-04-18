@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! External memory provider configuration.
 
 use console::Style;

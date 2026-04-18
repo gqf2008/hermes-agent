@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Telegram platform adapter.
 //!
 //! Mirrors the Python `gateway/platforms/telegram.py`.
@@ -116,7 +117,10 @@ impl TelegramAdapter {
             client: Client::builder()
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    Client::new()
+                }),
             offset: AtomicU64::new(0),
             dedup: MessageDeduplicator::with_params(300, 2000),
             api_url,
@@ -268,7 +272,7 @@ impl TelegramAdapter {
         // Caption (for media messages)
         if let Some(caption) = msg.get("caption").and_then(|v| v.as_str()) {
             if !content.is_empty() {
-                content.push_str("\n");
+                content.push('\n');
             }
             content.push_str(caption);
         }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! DeepSeek V3 tool call parser.
 //!
 //! Uses special Unicode tokens:

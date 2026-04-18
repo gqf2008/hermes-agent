@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Backup and restore commands for Hermes Agent.
 //!
 //! Mirrors the Python `hermes_cli/backup.py`.

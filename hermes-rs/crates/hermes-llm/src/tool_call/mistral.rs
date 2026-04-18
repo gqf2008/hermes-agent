@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Mistral tool call parser.
 //!
 //! Supports two formats depending on tokenizer version:

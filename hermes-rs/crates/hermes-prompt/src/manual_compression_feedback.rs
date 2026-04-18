@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! User-facing summaries for manual compression commands.
 //!
 //! Mirrors the Python `agent/manual_compression_feedback.py`.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Debug and diagnostics commands for Hermes Agent.
 //!
 //! Mirrors the Python `hermes_cli/debug.py` and `hermes_cli/dump.py`.

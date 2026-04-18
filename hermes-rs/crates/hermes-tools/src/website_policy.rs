@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Website access policy / blocklist.
 //!
 //! Lightweight URL policy checker for web/browser tools.

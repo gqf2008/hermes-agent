@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! MCP Server Management.
 //!
 //! Mirrors the Python `hermes_cli/mcp_config.py`.

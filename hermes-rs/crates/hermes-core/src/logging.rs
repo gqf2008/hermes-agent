@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Logging setup using the `tracing` crate.
 //!
 //! Creates rotating file handlers for `agent.log` (INFO+) and

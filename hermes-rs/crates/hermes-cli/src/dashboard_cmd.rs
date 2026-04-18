@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Dashboard TUI.
 //!
 //! Mirrors Python: hermes dashboard (interactive analytics dashboard)

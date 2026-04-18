@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Prompt injection scanner for context files.
 //!
 //! Mirrors the Python `_scan_context_content()` in `agent/prompt_builder.py`.

@@ -132,6 +132,19 @@ pub struct FeishuMessageEvent {
 /// Callback type for inbound Feishu messages.
 pub type FeishuInboundCallback = Arc<dyn Fn(FeishuMessageEvent) + Send + Sync>;
 
+/// Feishu card action event.
+#[derive(Debug, Clone)]
+pub struct FeishuCardActionEvent {
+    pub action_tag: String,
+    pub action_value: Value,
+    pub open_id: String,
+    pub open_message_id: String,
+    pub tenant_key: Option<String>,
+}
+
+/// Callback for card action triggers.
+pub type FeishuCardActionCallback = Arc<dyn Fn(FeishuCardActionEvent) + Send + Sync>;
+
 /// Feishu platform adapter.
 pub struct FeishuAdapter {
     pub config: FeishuConfig,
@@ -141,6 +154,8 @@ pub struct FeishuAdapter {
     /// Called when a webhook message is received.
     /// Set before starting the webhook server.
     pub on_message: Arc<RwLock<Option<FeishuInboundCallback>>>,
+    /// Called when a card action is triggered.
+    pub on_card_action: Arc<RwLock<Option<FeishuCardActionCallback>>>,
 }
 
 impl FeishuAdapter {
@@ -149,10 +164,14 @@ impl FeishuAdapter {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    Client::new()
+                }),
             dedup: Arc::new(MessageDeduplicator::new()),
             access_token: Arc::new(RwLock::new(None)),
             on_message: Arc::new(RwLock::new(None)),
+            on_card_action: Arc::new(RwLock::new(None)),
             config,
         }
     }
@@ -288,7 +307,7 @@ impl FeishuAdapter {
                 .map_err(|e| format!("Failed to read image body: {e}"))?
                 .to_vec()
         } else {
-            std::fs::read(image_path).map_err(|e| format!("Failed to read image: {e}"))?
+            tokio::fs::read(image_path).await.map_err(|e| format!("Failed to read image: {e}"))?
         };
 
         let ext = std::path::Path::new(image_path)
@@ -354,7 +373,7 @@ impl FeishuAdapter {
                 .map_err(|e| format!("Failed to read file body: {e}"))?
                 .to_vec()
         } else {
-            std::fs::read(file_path).map_err(|e| format!("Failed to read file: {e}"))?
+            tokio::fs::read(file_path).await.map_err(|e| format!("Failed to read file: {e}"))?
         };
 
         let file_name = std::path::Path::new(file_path)
@@ -555,7 +574,7 @@ impl FeishuAdapter {
             .ok()?;
 
         let cache_dir = hermes_core::get_hermes_home().join("feishu").join("media");
-        std::fs::create_dir_all(&cache_dir).ok()?;
+        tokio::fs::create_dir_all(&cache_dir).await.ok()?;
 
         let ext = match media_key.media_type.as_str() {
             "image" => "jpg",
@@ -570,7 +589,7 @@ impl FeishuAdapter {
 
         // Skip write if already cached (dedup)
         if !path.exists() {
-            std::fs::write(&path, bytes).ok()?;
+            tokio::fs::write(&path, bytes).await.ok()?;
         }
         Some(path.to_string_lossy().to_string())
     }
@@ -767,6 +786,7 @@ impl FeishuAdapter {
             dedup: self.dedup.clone(),
             access_token: self.access_token.clone(),
             on_message: self.on_message.clone(),
+            on_card_action: self.on_card_action.clone(),
         }
     }
 
@@ -867,11 +887,33 @@ impl FeishuAdapter {
                     let action_tag = action
                         .get("tag")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
+                        .unwrap_or("unknown")
+                        .to_string();
                     info!(
                         "[Feishu] Card action triggered: tag={action_tag}, value={action_value}"
                     );
-                    // TODO: route to registered card action handler if available
+                    // Route to registered card action handler if available
+                    let event = FeishuCardActionEvent {
+                        action_tag,
+                        action_value,
+                        open_id: payload
+                            .get("open_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        open_message_id: payload
+                            .get("open_message_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        tenant_key: payload
+                            .get("tenant_key")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    };
+                    if let Some(ref cb) = *self.on_card_action.read().await {
+                        cb(event);
+                    }
                 }
             }
             "im.chat.member.bot.added_v1" => {

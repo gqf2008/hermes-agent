@@ -101,11 +101,7 @@ mod proto {
     pub fn encode_int32(tag: u32, value: i32, buf: &mut Vec<u8>) {
         encode_tag(tag, 0, buf);
         // Zigzag encode for negative values
-        let unsigned = if value < 0 {
-            value as u64 // Two's complement
-        } else {
-            value as u64
-        };
+        let unsigned = value as u64; // Two's complement for negative, identity for positive
         encode_varint(unsigned, buf);
     }
 
@@ -358,7 +354,10 @@ impl FeishuWsClient {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .expect("failed to build HTTP client"),
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to build HTTP client: {e}");
+                    reqwest::Client::new()
+                }),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             service_id: Arc::new(std::sync::atomic::AtomicI32::new(0)),
             fragment_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -453,11 +452,13 @@ impl FeishuWsClient {
 
     /// Send a CONTROL ping frame.
     async fn send_ping(ws: &mut WsWriteHalf, service_id: i32) -> Result<(), String> {
-        let mut frame = Frame::default();
-        frame.method = METHOD_CONTROL;
-        frame.service = service_id;
-        frame.seq_id = 0;
-        frame.log_id = 0;
+        let mut frame = Frame {
+            method: METHOD_CONTROL,
+            service: service_id,
+            seq_id: 0,
+            log_id: 0,
+            ..Default::default()
+        };
         frame.add_header("type", "ping");
         Self::send_frame(ws, &frame).await
     }
@@ -468,12 +469,14 @@ impl FeishuWsClient {
         original: &Frame,
         biz_rt_ms: u64,
     ) -> Result<(), String> {
-        let mut frame = Frame::default();
-        frame.seq_id = original.seq_id;
-        frame.log_id = original.log_id;
-        frame.service = original.service;
-        frame.method = original.method;
-        frame.headers = original.headers.clone();
+        let mut frame = Frame {
+            seq_id: original.seq_id,
+            log_id: original.log_id,
+            service: original.service,
+            method: original.method,
+            headers: original.headers.clone(),
+            ..Default::default()
+        };
         frame.add_header("biz_rt", &biz_rt_ms.to_string());
 
         // Response payload

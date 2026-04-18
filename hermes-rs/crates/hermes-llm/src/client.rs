@@ -156,9 +156,7 @@ pub async fn call_llm(request: LlmRequest) -> Result<LlmResponse, ClassifiedErro
 /// Currently supports:
 /// - OpenAI-compatible Chat Completions (`stream=true`)
 /// - Codex Responses API
-///
-/// Anthropic streaming is TODO — falls back to non-streaming with a single
-/// `TextDelta` containing the full response.
+/// - Anthropic Messages API streaming (SSE with full text/thinking/tool delta support)
 pub async fn call_llm_stream(
     request: LlmRequest,
 ) -> Result<Box<dyn futures::Stream<Item = LlmStreamEvent> + Send + Unpin>, ClassifiedError> {
@@ -771,7 +769,7 @@ async fn send_openrouter_with_provider_prefs(
 
     let tool_calls = choice.and_then(|c| c.get("message"))
         .and_then(|m| m.get("tool_calls")).and_then(Value::as_array)
-        .map(|tc| tc.iter().map(|t| t.clone()).collect::<Vec<_>>());
+        .map(|tc| tc.to_vec());
 
     let usage = json.get("usage").map(|u| UsageInfo {
         prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
@@ -982,13 +980,12 @@ async fn call_anthropic_stream(
                         found = true;
                         break;
                     }
-                    if end + 1 < buffer.len() && &buffer[end..end + 2] == "\r\n" {
-                        if end + 3 < buffer.len() && &buffer[end + 2..end + 4] == "\r\n" {
+                    if end + 1 < buffer.len() && &buffer[end..end + 2] == "\r\n"
+                        && end + 3 < buffer.len() && &buffer[end + 2..end + 4] == "\r\n" {
                             end += 4;
                             found = true;
                             break;
                         }
-                    }
                     end += 1;
                 }
 
@@ -1395,7 +1392,7 @@ fn resolve_base_url_from_pool(provider: &str) -> Option<String> {
         return None;
     }
     let entry = pool.select()?;
-    entry.runtime_base_url().map(|u| crate::auxiliary_client::to_openai_base_url(u))
+    entry.runtime_base_url().map(crate::auxiliary_client::to_openai_base_url)
 }
 
 fn extract_openai_status(err: &async_openai::error::OpenAIError) -> Option<u16> {

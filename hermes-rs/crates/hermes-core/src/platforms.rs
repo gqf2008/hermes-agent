@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shared platform registry for Hermes Agent.
 //!
 //! Mirrors Python `hermes_cli/platforms.py`.

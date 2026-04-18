@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! File operation tools: read_file, write_file, patch, search_files.
 //!
 //! Mirrors the Python `tools/file_tools.py` with local filesystem operations.

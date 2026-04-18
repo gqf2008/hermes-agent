@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Retry logic with exponential backoff.
 //!
 //! Mirrors the Python retry patterns in `run_agent.py` with

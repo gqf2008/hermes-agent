@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Debug share command — generate and optionally upload debug report.
 
 use console::Style;

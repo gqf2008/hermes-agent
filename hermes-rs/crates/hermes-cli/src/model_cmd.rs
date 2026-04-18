@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Model management TUI.
 //!
 //! Mirrors Python: hermes model (interactive TUI for selecting/viewing models)

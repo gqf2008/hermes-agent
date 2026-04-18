@@ -39,6 +39,12 @@ fn default_port() -> u16 {
     22
 }
 
+/// Escape a string for safe use inside a POSIX shell single-quoted context.
+/// Wraps the string in single quotes and replaces embedded `'` with `'"'"'`.
+fn sh_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
 impl Default for SshConfig {
     fn default() -> Self {
         Self {
@@ -97,13 +103,18 @@ impl Environment for SshEnvironment {
         let default_cwd = self.cwd.to_string_lossy().to_string();
         let effective_cwd = cwd.unwrap_or(&default_cwd);
 
+        // Shell-escape user-controlled inputs to prevent command injection
+        let escaped_cwd = sh_escape(effective_cwd);
+        let escaped_command = sh_escape(command);
+        let escaped_snapshot = self.env_snapshot.lock().as_ref().map(|s| sh_escape(s));
+
         // Build the command with snapshot sourcing and CWD change
-        let full_command = if let Some(snapshot) = self.env_snapshot.lock().as_ref() {
+        let full_command = if let Some(snapshot) = escaped_snapshot {
             format!(
-                "cd {effective_cwd} && source {snapshot} 2>/dev/null; {command}"
+                "cd {escaped_cwd} && source {snapshot} 2>/dev/null; {escaped_command}"
             )
         } else {
-            format!("cd {effective_cwd} && {command}")
+            format!("cd {escaped_cwd} && {escaped_command}")
         };
 
         // Execute via SSH

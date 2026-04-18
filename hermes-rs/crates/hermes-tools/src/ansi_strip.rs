@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Strip ANSI escape sequences from subprocess output.
 //!
 //! Mirrors the Python `tools/ansi_strip.py`.
@@ -13,7 +14,7 @@ fn has_escape_byte(text: &str) -> bool {
 
 /// Full ANSI escape sequence regex.
 static ANSI_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\x1b(?:\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\][^\x07]*(?:\x07|\x1b\\)|[PX^_][^\x1b]*(?:\x1b\\)|[\x20-\x2f][\x30-\x7e]|[\x30-\x7e])|\x9b[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x9d[^\x07]*(?:\x07|\x9c)|[\x80-\x9f]").unwrap()
+    Regex::new(r"\x1b(?:\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\][^\x07]*(?:\x07|\x1b\\)|[PX^_][^\x1b]*(?:\x1b\\)|[\x20-\x2f][\x30-\x7e]|[\x30-\x7e])|\x9b[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x9d[^\x07]*(?:\x07|\x9c)|[\x80-\x9f]").expect("static ANSI regex is valid")
 });
 
 /// Strip all ANSI escape sequences from the given text.

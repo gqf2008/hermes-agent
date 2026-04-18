@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Kimi K2 tool call parser.
 //!
 //! Format:

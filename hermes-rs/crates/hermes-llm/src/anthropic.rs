@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Anthropic Messages API adapter.
 //!
 //! Mirrors Python `agent/anthropic_adapter.py`: Auth routing, extended thinking,
@@ -1491,8 +1492,10 @@ pub struct AnthropicErrorContext {
 impl AnthropicErrorContext {
     /// Parse an Anthropic error message into structured context.
     pub fn from_error(status_code: u16, error_message: &str) -> Self {
-        let mut ctx = AnthropicErrorContext::default();
-        ctx.raw_message = Some(error_message.to_string());
+        let mut ctx = AnthropicErrorContext {
+            raw_message: Some(error_message.to_string()),
+            ..Default::default()
+        };
 
         // Context overflow — retry with smaller max_tokens
         if error_message.contains("max_tokens")

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Environment variable passthrough registry.
 //!
 //! Skills that declare `required_environment_variables` in their frontmatter

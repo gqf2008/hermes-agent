@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! GLM 4.5 tool call parser.
 //!
 //! Uses ＜＜function_name

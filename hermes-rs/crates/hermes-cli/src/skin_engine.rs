@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Hermes CLI skin/theme engine.
 //!
 //! Mirrors Python `hermes_cli/skin_engine.py`.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Web search and URL extraction tools.
 //!
 //! Mirrors the Python `tools/web_tools.py`.

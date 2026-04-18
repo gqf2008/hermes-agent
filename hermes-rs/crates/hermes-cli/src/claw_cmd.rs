@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Claw migration command — migrate from OpenClaw (or Claude Code) to Hermes.
 //!
 //! Mirrors Python: `hermes claw` in `hermes_cli/claw.py`.

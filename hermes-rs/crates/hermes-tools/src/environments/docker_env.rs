@@ -12,7 +12,7 @@ use bollard::exec::CreateExecOptions;
 use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use futures_util::StreamExt;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 use super::{Environment, ProcessResult};
 
@@ -96,13 +96,20 @@ impl DockerEnvironment {
         &self.config
     }
 
-    /// Bridge: run an async closure synchronously via a fresh tokio runtime.
+    /// Bridge: run an async closure synchronously using the current tokio runtime
+    /// or creating a new one if none exists.
     fn block_on<F, T>(f: F) -> Result<T, String>
     where
         F: std::future::Future<Output = Result<T, String>>,
     {
-        let rt = Runtime::new().map_err(|e| format!("Failed to create runtime: {e}"))?;
-        rt.block_on(f)
+        match Handle::try_current() {
+            Ok(handle) => handle.block_on(f),
+            Err(_) => {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| format!("Failed to create runtime: {e}"))?;
+                rt.block_on(f)
+            }
+        }
     }
 
     /// Get or create the container.

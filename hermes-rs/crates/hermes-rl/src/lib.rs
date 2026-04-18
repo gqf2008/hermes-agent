@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //! # Hermes RL
 //!
 //! Reinforcement learning environments for training hermes-agent models.

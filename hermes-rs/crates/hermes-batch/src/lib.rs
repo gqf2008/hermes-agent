@@ -1,4 +1,5 @@
 //! # Hermes Batch
+#![allow(clippy::too_many_arguments, clippy::result_large_err, dead_code)]
 //!
 //! Parallel batch processing with checkpoint/resume.
 //! Mirrors the Python `batch_runner.py`.

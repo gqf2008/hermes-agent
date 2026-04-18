@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Tool configuration commands for the Hermes CLI.
 //!
 //! Mirrors the Python `hermes tools` subcommands:
@@ -131,7 +132,7 @@ fn get_disabled_toolsets(config: &serde_yaml::Value, platform: &str) -> HashSet<
                 for entry in seq {
                     if let Some(s) = entry.as_str() {
                         if s.starts_with('!') {
-                            disabled.insert(s[1..].to_string());
+                            disabled.insert(s.strip_prefix('!').unwrap_or(s).to_string());
                         }
                     }
                 }
@@ -206,7 +207,7 @@ pub fn cmd_tools_list(platform: &str) -> anyhow::Result<()> {
 
     println!("{}", style("Built-in Toolsets:").bold());
     println!();
-    println!("  {:<4} {:<20} {:<30} {}", "Status", "Key", "Label", "Description");
+    println!("  {:<4} {:<20} {:<30} Description", "Status", "Key", "Label");
     println!("  {}", "-".repeat(90));
 
     for ts in BUILTIN_TOOLSETS {
@@ -301,7 +302,7 @@ pub fn cmd_tools_disable(names: &[String], platform: &str) -> anyhow::Result<()>
         // Remove any existing bare entry for this toolset
         seq.retain(|v| {
             if let Some(s) = v.as_str() {
-                s != name && s != &format!("!{}", name)
+                s != name && s != format!("!{}", name)
             } else {
                 true
             }
@@ -395,7 +396,7 @@ pub fn cmd_tools_disable_all(platform: &str) -> anyhow::Result<()> {
 
     // Collect existing MCP entries
     let mcp_entries: Vec<_> = seq.iter()
-        .filter(|v| v.as_str().map_or(false, |s| s.starts_with("mcp:")))
+        .filter(|v| v.as_str().is_some_and(|s| s.starts_with("mcp:")))
         .cloned()
         .collect();
 
@@ -426,7 +427,7 @@ pub fn cmd_tools_enable_all(platform: &str) -> anyhow::Result<()> {
 
     // Collect existing MCP entries
     let mcp_entries: Vec<_> = seq.iter()
-        .filter(|v| v.as_str().map_or(false, |s| s.starts_with("mcp:")))
+        .filter(|v| v.as_str().is_some_and(|s| s.starts_with("mcp:")))
         .cloned()
         .collect();
 
