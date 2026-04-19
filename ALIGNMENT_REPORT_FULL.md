@@ -3,7 +3,7 @@
 > 生成时间：2026-04-17
 > 范围：Hermes Agent 全模块（不含 Gateway 国内平台以外的适配器）
 > Python 基准：`E:\Users\gxh\Documents\GitHub\hermes-agent`
-> Rust 目标：`E:\Users\gxh\Documents\GitHub\hermes-agent\hermes-rs`
+> Rust 目标：`E:\Users\gxh\Documents\GitHub\hermez-ai`
 
 ---
 

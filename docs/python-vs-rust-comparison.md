@@ -3,7 +3,7 @@
 > 分析日期: 2026-04-13  
 > 更新日期: 2026-04-13 (自我进化机制 + Fuzzy Match + 可靠性改进已补齐)  
 > Python 版本: `run_agent.py` (530KB, ~10524 行) + 工具目录 (~60 个文件)  
-> Rust 版本: `hermes-rs/` (11 个 crate, ~50 个源文件, Cargo.toml workspace)
+> Rust 版本: `../hermez-ai` (11 个 crate, ~50 个源文件, Cargo.toml workspace)
 
 ---
 

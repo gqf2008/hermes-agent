@@ -15,7 +15,7 @@ Key capabilities:
 - **Tool registry** in `tools/registry.py` — auto-discovering, self-registering tools
 - **Skills system** — procedural memory stored in `skills/`, with optional skills in `optional-skills/`
 - **Memory & context compression** — SQLite-backed sessions with FTS5 search, Honcho integration
-- **Batch & RL training** — `batch_runner.py`, `environments/`, and `hermes-rs/` for research workloads
+- **Batch & RL training** — `batch_runner.py`, `environments/`, and `../hermez-ai` (Rust rewrite) for research workloads
 - **ACP server** — editor integration (VS Code / Zed / JetBrains) via `acp_adapter/`
 
 ### Technology Stack
@@ -26,7 +26,7 @@ Key capabilities:
 | CLI / TUI | prompt_toolkit, Rich, curses (stdlib) |
 | Web frontend | React 19, Vite, Tailwind CSS 4 (`web/`) |
 | Documentation | Docusaurus 3, TypeScript (`website/`) |
-| Rust rewrite | Cargo workspace with 13 crates (`hermes-rs/`) |
+| Rust rewrite | Cargo workspace with 13 crates (`../hermez-ai`) |
 | Packaging | setuptools (pyproject.toml), uv, Nix (flake.nix), Docker |
 | Database | SQLite (FTS5), optional asyncpg for Matrix encryption |
 | Testing | pytest, pytest-asyncio, pytest-xdist |
@@ -53,7 +53,7 @@ Python top-level modules (registered in `pyproject.toml` `[tool.setuptools.py-mo
 - **Python 3.11+**
 - **uv** (fast Python package manager)
 - **Node.js 18+** (optional, needed for browser tools and WhatsApp bridge)
-- **Rust 1.84+** (optional, for `hermes-rs/`)
+- **Rust 1.84+** (optional, for `../hermez-ai`)
 
 ### Setup
 
