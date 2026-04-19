@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use super::AIAgent;
+use crate::agent::types::Message;
 use crate::memory_provider::MemoryProvider;
 
 impl AIAgent {
@@ -35,7 +36,7 @@ impl AIAgent {
     /// Mirrors Python `_persist_session()` (run_agent.py:2436).
     /// Ensures conversations are never lost, even on errors or early returns.
     /// Skipped when `persist_session=false` (ephemeral helper flows).
-    pub fn persist_session(&mut self, messages: &[Value], _user_query: &str, completed: bool) {
+    pub fn persist_session(&mut self, messages: &[Message], _user_query: &str, completed: bool) {
         if !self.persist_session {
             return;
         }
@@ -53,7 +54,7 @@ impl AIAgent {
     /// Mirrors Python `_flush_messages_to_session_db()` (run_agent.py:2449).
     /// Uses `last_flushed_db_idx` to track which messages have already been
     /// written, so repeated calls only write truly new messages.
-    pub fn flush_messages_to_session_db(&mut self, messages: &[Value]) {
+    pub fn flush_messages_to_session_db(&mut self, messages: &[Message]) {
         let db = match &self.session_db {
             Some(db) => db,
             None => return,
@@ -126,7 +127,7 @@ impl AIAgent {
     /// Saves to `~/.hermes/trajectories/` directory.
     pub fn save_trajectory(
         &self,
-        messages: &[Value],
+        messages: &[Message],
         _user_query: &str,
         completed: bool,
         session_id: &str,

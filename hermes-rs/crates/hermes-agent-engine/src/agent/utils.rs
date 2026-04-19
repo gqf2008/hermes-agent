@@ -3,9 +3,12 @@
 //! Message sanitization, normalization, token estimation, backoff,
 //! stale-call timeout, failure hints, rollback, and thinking budget detection.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+
+use crate::agent::types::Message;
 
 /// Check if any tool call has truncated JSON arguments.
 ///
@@ -45,7 +48,7 @@ pub(crate) fn is_local_endpoint(base_url: &str) -> bool {
 /// Mirrors Python: `sum(len(str(v)) for v in messages) // 4` — counts all
 /// string fields in each message, not just `content`, so tool calls and
 /// metadata are included in the estimate.
-pub(crate) fn estimate_tokens(messages: &[Value]) -> usize {
+pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
     let mut total = 0;
     for msg in messages {
         if let Some(obj) = msg.as_object() {
@@ -69,7 +72,7 @@ pub(crate) fn estimate_tokens(messages: &[Value]) -> usize {
 ///
 /// Mirrors Python: default 300s, scales up for large contexts
 /// (>100K tokens → 600s, >50K → 450s), disabled for local endpoints.
-pub(crate) fn stale_call_timeout(base_url: Option<&str>, messages: &[Value]) -> Duration {
+pub(crate) fn stale_call_timeout(base_url: Option<&str>, messages: &[Message]) -> Duration {
     const DEFAULT: f64 = 300.0;
 
     if let Ok(val) = std::env::var("HERMES_API_CALL_STALE_TIMEOUT") {
@@ -150,7 +153,7 @@ pub(crate) fn build_failure_hint(classification: &hermes_llm::error_classifier::
 /// discard the last incomplete assistant message and return to the
 /// state before it was added.
 #[allow(dead_code)]
-pub(crate) fn rollback_to_last_assistant(messages: &[Value]) -> Vec<Value> {
+pub(crate) fn rollback_to_last_assistant(messages: &[Message]) -> Vec<Message> {
     let mut last_assistant_idx: Option<usize> = None;
 
     for (i, msg) in messages.iter().enumerate() {
@@ -188,10 +191,10 @@ pub(crate) fn has_think_tags(content: &str) -> bool {
 /// 1. Orphaned tool results — tool messages without a preceding assistant
 ///    message with matching tool_calls cause API errors.
 /// 2. Role sequence violations — two consecutive user/assistant messages.
-pub(crate) fn sanitize_api_messages(messages: &[Value]) -> Vec<Value> {
+pub(crate) fn sanitize_api_messages(messages: &[Message]) -> Vec<Message> {
     use std::collections::HashSet;
 
-    let mut result: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut result: Vec<Message> = Vec::with_capacity(messages.len());
 
     let mut valid_tool_call_ids: HashSet<String> = HashSet::new();
     for msg in messages {
@@ -232,7 +235,7 @@ pub(crate) fn sanitize_api_messages(messages: &[Value]) -> Vec<Value> {
                         msg.get("content").and_then(Value::as_str).unwrap_or(""),
                     );
                     if let Some(last_msg) = result.last_mut() {
-                        last_msg["content"] = Value::String(new_content);
+                        Arc::make_mut(last_msg)["content"] = Value::String(new_content);
                     }
                     continue;
                 } else if role == "assistant" {
@@ -248,14 +251,15 @@ pub(crate) fn sanitize_api_messages(messages: &[Value]) -> Vec<Value> {
                         })
                         .filter(|arr: &Vec<Value>| !arr.is_empty());
                     if let Some(last_msg) = result.last_mut() {
-                        last_msg["content"] = Value::String(new_content);
+                        let value = Arc::make_mut(last_msg);
+                        value["content"] = Value::String(new_content);
                         if let Some(tool_calls) = msg_tool_calls {
-                            if let Some(existing) = last_msg.get_mut("tool_calls") {
+                            if let Some(existing) = value.get_mut("tool_calls") {
                                 if let Some(existing_arr) = existing.as_array_mut() {
                                     existing_arr.extend(tool_calls);
                                 }
                             } else {
-                                last_msg["tool_calls"] = serde_json::Value::Array(tool_calls);
+                                value["tool_calls"] = serde_json::Value::Array(tool_calls);
                             }
                         }
                     }
@@ -264,7 +268,7 @@ pub(crate) fn sanitize_api_messages(messages: &[Value]) -> Vec<Value> {
             }
         }
 
-        result.push(msg.clone());
+        result.push(Arc::new((**msg).clone()));
     }
 
     result
@@ -279,11 +283,11 @@ pub(crate) fn sanitize_api_messages(messages: &[Value]) -> Vec<Value> {
 /// 2. Canonicalize tool-call JSON arguments (sort keys, compact) for
 ///    consistent cache prefix matching.
 /// 3. Normalize empty content to empty string.
-pub(crate) fn normalize_messages(messages: &[Value]) -> Vec<Value> {
+pub(crate) fn normalize_messages(messages: &[Message]) -> Vec<Message> {
     let mut result = Vec::with_capacity(messages.len());
 
     for msg in messages {
-        let mut msg = msg.clone();
+        let mut msg = (**msg).clone();
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("").to_string();
 
         if role == "assistant" {
@@ -317,7 +321,7 @@ pub(crate) fn normalize_messages(messages: &[Value]) -> Vec<Value> {
             }
         }
 
-        result.push(msg);
+        result.push(Arc::new(msg));
     }
 
     result

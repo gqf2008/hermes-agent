@@ -24,6 +24,7 @@ parking_lot.workspace = true
 regex.workspace = true
 futures = "0.3"
 async-stream = "0.3"
+base64.workspace = true
 
 # API Server adapter
 axum = "0.7"
@@ -36,6 +37,8 @@ tokio-tungstenite = "0.26"
 
 # Weixin AES-128-ECB media decryption
 aes = "0.8"
+cbc = { version = "0.1.2", features = ["alloc"] }
+md5 = "0.8.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

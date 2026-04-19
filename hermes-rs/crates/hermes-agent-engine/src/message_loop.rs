@@ -15,12 +15,12 @@ use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex as AsyncMutex;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use hermes_core::Result;
 use hermes_state::SessionDB;
 
 use crate::agent::AIAgent;
+use crate::agent::types::Message;
 
 /// A message from a platform/user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +63,7 @@ pub struct MessageLoop {
     /// The AI agent running the conversation.
     agent: Arc<AsyncMutex<AIAgent>>,
     /// Conversation history.
-    messages: Vec<Value>,
+    messages: Vec<Message>,
     /// Session ID for persistence.
     session_id: String,
     /// Session database.
@@ -156,7 +156,7 @@ impl MessageLoop {
     }
 
     /// Get the current conversation history.
-    pub fn history(&self) -> &[Value] {
+    pub fn history(&self) -> &[Message] {
         &self.messages
     }
 
@@ -227,7 +227,7 @@ mod tests {
         let mut loop_ = MessageLoop::new(agent, "test".to_string(), None, interrupt);
 
         assert!(loop_.history().is_empty());
-        loop_.messages.push(serde_json::json!({"role": "user", "content": "hello"}));
+        loop_.messages.push(Arc::new(serde_json::json!({"role": "user", "content": "hello"})));
         assert_eq!(loop_.history().len(), 1);
         loop_.clear_history();
         assert!(loop_.history().is_empty());

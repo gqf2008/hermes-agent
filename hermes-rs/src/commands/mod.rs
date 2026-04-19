@@ -419,7 +419,7 @@ pub enum Commands {
 
 /// Subcommands for model management.
 #[derive(Subcommand)]
-enum ModelAction {
+pub(crate) enum ModelAction {
     /// Interactive model selection
     Browse,
     /// List available models
@@ -439,7 +439,7 @@ enum ModelAction {
 
 /// Subcommands for skin management.
 #[derive(Subcommand)]
-enum SkinAction {
+pub(crate) enum SkinAction {
     /// List available skins
     #[command(alias = "ls")]
     List,
@@ -457,7 +457,7 @@ enum SkinAction {
 
 /// Subcommands for device pairing.
 #[derive(Subcommand)]
-enum PairingAction {
+pub(crate) enum PairingAction {
     /// Show pending + approved pairings
     #[command(alias = "ls")]
     List,
@@ -480,7 +480,7 @@ enum PairingAction {
 }
 
 #[derive(Subcommand)]
-enum WebhookAction {
+pub(crate) enum WebhookAction {
     /// Create a webhook subscription
     #[command(alias = "add")]
     Subscribe {
@@ -528,7 +528,7 @@ enum WebhookAction {
 }
 
 #[derive(Subcommand)]
-enum PluginAction {
+pub(crate) enum PluginAction {
     /// Install a plugin from Git
     Install {
         /// Git URL or owner/repo shorthand
@@ -564,7 +564,7 @@ enum PluginAction {
 }
 
 #[derive(Subcommand)]
-enum MemoryAction {
+pub(crate) enum MemoryAction {
     /// Interactive provider selection and configuration
     Setup,
     /// Show current memory provider config
@@ -574,7 +574,7 @@ enum MemoryAction {
 }
 
 #[derive(Subcommand)]
-enum McpAction {
+pub(crate) enum McpAction {
     /// List configured MCP servers
     #[command(alias = "ls")]
     List,
@@ -627,7 +627,7 @@ enum McpAction {
 }
 
 #[derive(Subcommand)]
-enum ToolAction {
+pub(crate) enum ToolAction {
     /// List all available toolsets with enabled/disabled status
     #[command(alias = "ls")]
     List {
@@ -690,7 +690,7 @@ enum ToolAction {
 }
 
 #[derive(Subcommand)]
-enum SkillAction {
+pub(crate) enum SkillAction {
     /// List installed skills
     #[command(alias = "ls")]
     List {
@@ -807,7 +807,7 @@ enum SkillAction {
 
 /// Subcommands for skill snapshots.
 #[derive(Subcommand)]
-enum SnapshotAction {
+pub(crate) enum SnapshotAction {
     /// Export installed skills to a file
     Export {
         /// Output file path
@@ -826,7 +826,7 @@ enum SnapshotAction {
 
 /// Subcommands for skill taps.
 #[derive(Subcommand)]
-enum TapAction {
+pub(crate) enum TapAction {
     /// List configured taps
     #[command(alias = "ls")]
     List,
@@ -844,7 +844,7 @@ enum TapAction {
 }
 
 #[derive(Subcommand)]
-enum ProfileAction {
+pub(crate) enum ProfileAction {
     /// List all profiles
     #[command(alias = "ls")]
     List,
@@ -922,7 +922,7 @@ enum ProfileAction {
 }
 
 #[derive(Subcommand)]
-enum SessionAction {
+pub(crate) enum SessionAction {
     /// List recent sessions
     #[command(alias = "ls")]
     List {
@@ -999,7 +999,7 @@ enum SessionAction {
 }
 
 #[derive(Subcommand)]
-enum ConfigAction {
+pub(crate) enum ConfigAction {
     /// Show current configuration
     Show {
         /// Show full YAML config
@@ -1026,7 +1026,7 @@ enum ConfigAction {
 }
 
 #[derive(Subcommand)]
-enum BatchAction {
+pub(crate) enum BatchAction {
     /// Run batch processing on a JSONL dataset
     Run {
         /// Path to the JSONL dataset file
@@ -1066,7 +1066,7 @@ enum BatchAction {
 }
 
 #[derive(Subcommand)]
-enum GatewayAction {
+pub(crate) enum GatewayAction {
     /// Run gateway in foreground
     Run {
         /// Enable verbose logging
@@ -1138,7 +1138,7 @@ enum GatewayAction {
 }
 
 #[derive(Subcommand)]
-enum CronAction {
+pub(crate) enum CronAction {
     /// List scheduled jobs
     #[command(alias = "ls")]
     List {
@@ -1242,7 +1242,7 @@ enum CronAction {
 }
 
 #[derive(Subcommand)]
-enum AuthAction {
+pub(crate) enum AuthAction {
     /// Add a pooled credential
     Add {
         /// Provider name (e.g., openai, anthropic)

@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use super::AIAgent;
-use super::types::PreLlmHookResult;
+use super::types::{Message, PreLlmHookResult};
 use hermes_core::Result;
 
 impl AIAgent {
@@ -155,7 +155,7 @@ impl AIAgent {
     #[allow(dead_code)]
     pub fn set_pre_llm_hook<F>(&mut self, hook: F)
     where
-        F: Fn(&str, &[Value], usize) -> PreLlmHookResult + Send + Sync + 'static,
+        F: Fn(&str, &[Message], usize) -> PreLlmHookResult + Send + Sync + 'static,
     {
         self.pre_llm_hook = Some(std::sync::Arc::new(hook));
     }

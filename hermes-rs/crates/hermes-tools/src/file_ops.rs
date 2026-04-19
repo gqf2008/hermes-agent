@@ -902,10 +902,8 @@ fn get_context_lines(content: &str, line_idx: usize, count: usize, before: bool)
 
 /// Register file operation tools.
 pub fn register_file_tools(registry: &mut ToolRegistry) {
-    use crate::registry::ToolSchema;
-
     // read_file
-    let read_schema: ToolSchema = serde_json::json!({
+    let read_schema = serde_json::json!({
         "name": "read_file",
         "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. NOTE: Cannot read images or binary files — use vision_analyze for images.",
         "parameters": {
@@ -932,7 +930,7 @@ pub fn register_file_tools(registry: &mut ToolRegistry) {
     );
 
     // write_file
-    let write_schema: ToolSchema = serde_json::json!({
+    let write_schema = serde_json::json!({
         "name": "write_file",
         "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits.",
         "parameters": {
@@ -956,7 +954,7 @@ pub fn register_file_tools(registry: &mut ToolRegistry) {
     );
 
     // patch
-    let patch_schema: ToolSchema = serde_json::json!({
+    let patch_schema = serde_json::json!({
         "name": "patch",
         "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing.\n\nReplace mode (default): find a unique string and replace it.\nPatch mode: apply V4A multi-file patches for bulk changes.",
         "parameters": {
@@ -1005,7 +1003,7 @@ pub fn register_file_tools(registry: &mut ToolRegistry) {
     );
 
     // search_files
-    let search_schema: ToolSchema = serde_json::json!({
+    let search_schema = serde_json::json!({
         "name": "search_files",
         "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
         "parameters": {

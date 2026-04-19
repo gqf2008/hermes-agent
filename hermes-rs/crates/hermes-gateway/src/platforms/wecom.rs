@@ -13,8 +13,10 @@
 //! The adapter connects to WeCom's WebSocket endpoint, authenticates
 //! with bot_id + secret, and receives messages as JSON frames.
 
+use base64::{engine::general_purpose, Engine as _};
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +74,12 @@ pub struct WeComMessageEvent {
     pub is_group: bool,
     /// The original req_id from the callback, for reply correlation.
     pub req_id: String,
+    /// Quoted text if this is a reply to another message.
+    pub reply_to_text: Option<String>,
+    /// Message ID of the quoted message.
+    pub reply_to_message_id: Option<String>,
+    /// Cached local paths for inbound media (images, files).
+    pub media_paths: Vec<String>,
 }
 
 /// Internal command to send via WebSocket.
@@ -81,6 +89,12 @@ enum WsCommand {
     SendText { chat_id: String, text: String, reply_tx: oneshot::Sender<Result<String, String>> },
     /// Reply to a specific inbound callback.
     RespondText { req_id: String, text: String, reply_tx: oneshot::Sender<Result<String, String>> },
+    /// Send a generic request and await the correlated response.
+    Request {
+        cmd: String,
+        body: serde_json::Value,
+        reply_tx: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 /// Shared state for the WebSocket connection.
@@ -94,7 +108,13 @@ struct WsState {
     event_tx: mpsc::Sender<WeComMessageEvent>,
     /// Reply_req_id mapping: message_id -> req_id (for aibot_respond_msg).
     reply_req_ids: Arc<parking_lot::Mutex<std::collections::HashMap<String, String>>>,
+    /// Pending request/response correlation: req_id -> oneshot sender.
+    pending_responses: Arc<tokio::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>>>,
 }
+
+/// Delay before flushing a text batch (seconds).
+/// Mirrors Python `HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS`.
+const TEXT_BATCH_DELAY_MS: u64 = 600;
 
 /// WeCom platform adapter.
 pub struct WeComAdapter {
@@ -107,6 +127,12 @@ pub struct WeComAdapter {
     seq: AtomicUsize,
     /// Semaphore to limit concurrent event handler tasks.
     handler_semaphore: Arc<Semaphore>,
+    /// Pending text batches for auto-merging rapid successive messages.
+    /// Mirrors Python `_pending_text_batches`.
+    text_batches: Arc<tokio::sync::Mutex<std::collections::HashMap<String, WeComMessageEvent>>>,
+    /// Abort handles for batch flush timers.
+    /// Mirrors Python `_pending_text_batch_tasks`.
+    batch_timers: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>>,
 }
 
 impl WeComAdapter {
@@ -124,6 +150,8 @@ impl WeComAdapter {
             ws_state: Mutex::new(None),
             seq: AtomicUsize::new(0),
             handler_semaphore: Arc::new(Semaphore::new(100)),
+            text_batches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            batch_timers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -284,7 +312,7 @@ impl WeComAdapter {
     }
 
     /// Process an inbound WebSocket message event.
-    pub fn handle_inbound(&self, event: &serde_json::Value) -> Option<WeComMessageEvent> {
+    pub async fn handle_inbound(&self, event: &serde_json::Value) -> Option<WeComMessageEvent> {
         let body = event.get("body").unwrap_or(event);
 
         let msg_id = body
@@ -304,9 +332,9 @@ impl WeComAdapter {
             return None;
         }
 
-        let content = Self::extract_text(body).unwrap_or_default();
-        if content.is_empty() {
-            return None;
+        let (text, reply_to_text) = Self::extract_text(body);
+        if text.is_empty() && reply_to_text.is_none() {
+            // Allow media-only messages (text empty but may have media)
         }
 
         let chat_type = body
@@ -356,6 +384,31 @@ impl WeComAdapter {
 
         let is_group = chat_type == "group" || chat_type == "2";
 
+        // Extract and cache media references
+        let refs = Self::extract_media_refs(body);
+        let mut media_paths = Vec::new();
+        for (kind, media) in refs {
+            if let Some((path, _ctype)) = self.cache_media(&kind, &media).await {
+                media_paths.push(path);
+            }
+        }
+
+        // Build final content: text + media paths
+        let mut content = text;
+        if !media_paths.is_empty() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&media_paths.iter().map(|p| format!("[media: {p}]")).collect::<Vec<_>>().join("\n"));
+        }
+
+        let reply_to_message_id = body
+            .get("quote")
+            .and_then(|q| q.get("original"))
+            .and_then(|o| o.get("msgid"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         if !msg_id.is_empty() {
             self.dedup.insert(msg_id.to_string());
         }
@@ -368,83 +421,418 @@ impl WeComAdapter {
             msg_type,
             is_group,
             req_id,
+            reply_to_text,
+            reply_to_message_id,
+            media_paths,
         })
     }
 
-    /// Extract text from inbound event body.
+    /// Extract text and quoted reply text from inbound event body.
     ///
+    /// Returns `(text, reply_text)` where `reply_text` is the original quoted message text.
     /// Handles text, mixed (text + images), voice, appmsg, and quoted messages.
-    fn extract_text(body: &serde_json::Value) -> Option<String> {
-        // Try text.content
-        if let Some(text_obj) = body.get("text") {
-            if let Some(content) = text_obj.get("content").and_then(|v| v.as_str()) {
-                if !content.trim().is_empty() {
-                    return Some(content.trim().to_string());
-                }
-            }
-        }
+    fn extract_text(body: &serde_json::Value) -> (String, Option<String>) {
+        let msgtype = body
+            .get("msgtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
 
-        // Try voice.content
-        if let Some(voice) = body.get("voice") {
-            if let Some(content) = voice.get("content").and_then(|v| v.as_str()) {
-                if !content.trim().is_empty() {
-                    return Some(format!("[voice] {content}"));
-                }
-            }
-        }
+        let mut text_parts: Vec<String> = Vec::new();
 
-        // Try appmsg.title
-        if let Some(appmsg) = body.get("appmsg") {
-            if let Some(title) = appmsg.get("title").and_then(|v| v.as_str()) {
-                if !title.trim().is_empty() {
-                    return Some(format!("[appmsg] {title}"));
-                }
-            }
-        }
-
-        // Try mixed content (text + images)
-        if let Some(items) = body.get("mixed").and_then(|v| v.as_array()) {
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|item| {
+        if msgtype == "mixed" {
+            // Mixed messages: array of msg_item under mixed.msg_item
+            let items = body
+                .get("mixed")
+                .and_then(|m| m.get("msg_item"))
+                .and_then(|v| v.as_array())
+                .or_else(|| body.get("mixed").and_then(|v| v.as_array()));
+            if let Some(arr) = items {
+                for item in arr {
                     if item.get("msgtype").and_then(|v| v.as_str()) == Some("text") {
-                        item.get("text")
+                        if let Some(content) = item
+                            .get("text")
                             .and_then(|t| t.get("content"))
                             .and_then(|v| v.as_str())
-                            .map(String::from)
-                    } else {
-                        None
+                        {
+                            let s = content.trim();
+                            if !s.is_empty() {
+                                text_parts.push(s.to_string());
+                            }
+                        }
                     }
-                })
-                .collect();
-            let combined = parts.join("\n");
-            if !combined.is_empty() {
-                return Some(combined);
+                }
+            }
+        } else {
+            // Normal text
+            if let Some(content) = body
+                .get("text")
+                .and_then(|t| t.get("content"))
+                .and_then(|v| v.as_str())
+            {
+                let s = content.trim();
+                if !s.is_empty() {
+                    text_parts.push(s.to_string());
+                }
+            }
+
+            // Voice text
+            if msgtype == "voice" {
+                if let Some(content) = body
+                    .get("voice")
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_str())
+                {
+                    let s = content.trim();
+                    if !s.is_empty() {
+                        text_parts.push(s.to_string());
+                    }
+                }
+            }
+
+            // Appmsg title (filename for attachments)
+            if msgtype == "appmsg" {
+                if let Some(title) = body
+                    .get("appmsg")
+                    .and_then(|a| a.get("title"))
+                    .and_then(|v| v.as_str())
+                {
+                    let s = title.trim();
+                    if !s.is_empty() {
+                        text_parts.push(s.to_string());
+                    }
+                }
             }
         }
 
-        // Try quote (reply with quoted text)
+        let text = text_parts.join("\n");
+
+        // Extract quoted reply text
+        let mut reply_text: Option<String> = None;
+        if let Some(quote) = body.get("quote").and_then(|v| v.as_object()) {
+            let quote_type = quote
+                .get("msgtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if quote_type == "text" {
+                reply_text = quote
+                    .get("text")
+                    .and_then(|t| t.get("content"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            } else if quote_type == "voice" {
+                reply_text = quote
+                    .get("voice")
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            }
+        }
+
+        (text, reply_text)
+    }
+
+    /// Extract media references from an inbound event body.
+    ///
+    /// Returns a list of (kind, media_ref) tuples for images and files.
+    fn extract_media_refs(body: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        let mut refs: Vec<(String, serde_json::Value)> = Vec::new();
+        let msgtype = body
+            .get("msgtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if msgtype == "mixed" {
+            let items = body
+                .get("mixed")
+                .and_then(|m| m.get("msg_item"))
+                .and_then(|v| v.as_array())
+                .or_else(|| body.get("mixed").and_then(|v| v.as_array()));
+            if let Some(arr) = items {
+                for item in arr {
+                    let item_type = item
+                        .get("msgtype")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if item_type == "image" && item.get("image").is_some() {
+                        refs.push(("image".to_string(), item["image"].clone()));
+                    }
+                }
+            }
+        } else {
+            if msgtype == "image" && body.get("image").is_some() {
+                refs.push(("image".to_string(), body["image"].clone()));
+            }
+            if msgtype == "file" && body.get("file").is_some() {
+                refs.push(("file".to_string(), body["file"].clone()));
+            }
+            if msgtype == "appmsg" && body.get("appmsg").is_some() {
+                let appmsg = &body["appmsg"];
+                if appmsg.get("file").is_some() {
+                    refs.push(("file".to_string(), appmsg["file"].clone()));
+                } else if appmsg.get("image").is_some() {
+                    refs.push(("image".to_string(), appmsg["image"].clone()));
+                }
+            }
+        }
+
+        // Quote/reply may also contain media
         if let Some(quote) = body.get("quote") {
-            let reply_text = quote
-                .get("content")
+            let quote_type = quote
+                .get("msgtype")
                 .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default();
-
-            let original_text = quote
-                .get("original")
-                .and_then(|o| o.get("content"))
-                .and_then(|v| v.as_str())
-                .map(|s| format!("\n---\n{s}"))
-                .unwrap_or_default();
-
-            let combined = format!("{reply_text}{original_text}");
-            if !combined.trim().is_empty() {
-                return Some(combined.trim().to_string());
+                .unwrap_or("")
+                .to_lowercase();
+            if quote_type == "image" && quote.get("image").is_some() {
+                refs.push(("image".to_string(), quote["image"].clone()));
+            } else if quote_type == "file" && quote.get("file").is_some() {
+                refs.push(("file".to_string(), quote["file"].clone()));
             }
         }
 
-        None
+        refs
+    }
+
+    /// Cache inbound media to local storage.
+    ///
+    /// Supports base64 inline data, remote URL download, and AES-256-CBC decryption.
+    async fn cache_media(
+        &self,
+        kind: &str,
+        media: &serde_json::Value,
+    ) -> Option<(String, String)> {
+        // 1) Base64 inline data
+        if let Some(b64_str) = media.get("base64").and_then(|v| v.as_str()) {
+            let payload = b64_str.split(',').last().unwrap_or(b64_str).trim();
+            let raw = general_purpose::STANDARD.decode(payload).ok()?;
+
+            if kind == "image" {
+                let ext = Self::detect_image_ext(&raw);
+                let path = Self::cache_image_from_bytes(&raw, &ext).ok()?;
+                let mime = Self::mime_for_ext(&ext);
+                return Some((path, mime));
+            }
+
+            let filename = media
+                .get("filename")
+                .or_else(|| media.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("wecom_file")
+                .to_string();
+            let path = Self::cache_document_from_bytes(&raw, &filename).ok()?;
+            let mime = Self::mime_for_ext(
+                Path::new(&filename)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or(""),
+            );
+            return Some((path, mime));
+        }
+
+        // 2) Remote URL
+        let url = media.get("url").and_then(|v| v.as_str())?.trim();
+        if url.is_empty() {
+            return None;
+        }
+
+        let resp = self.client.get(url).send().await.ok()?;
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .split(';')
+            .next()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let mut raw = resp.bytes().await.ok()?.to_vec();
+
+        // 3) AES-256-CBC decryption
+        if let Some(aes_key) = media.get("aeskey").and_then(|v| v.as_str()) {
+            let aes_key = aes_key.trim();
+            if !aes_key.is_empty() {
+                raw = Self::decrypt_aes_256_cbc(&raw, aes_key).ok()?;
+            }
+        }
+
+        if kind == "image" {
+            let ext = Self::guess_extension(url, &content_type, &Self::detect_image_ext(&raw));
+            let path = Self::cache_image_from_bytes(&raw, &ext).ok()?;
+            let mime = Self::mime_for_ext(&ext);
+            return Some((path, mime));
+        }
+
+        let filename = Self::guess_filename(url, &content_type);
+        let path = Self::cache_document_from_bytes(&raw, &filename).ok()?;
+        Some((path, content_type))
+    }
+
+    /// Decrypt bytes using AES-256-CBC with PKCS#7 padding.
+    fn decrypt_aes_256_cbc(encrypted: &[u8], aes_key_b64: &str) -> Result<Vec<u8>, String> {
+        use aes::Aes256;
+        use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+
+        let key = general_purpose::STANDARD
+            .decode(aes_key_b64)
+            .map_err(|e| format!("Invalid base64 aes_key: {e}"))?;
+        if key.len() != 32 {
+            return Err(format!(
+                "Invalid WeCom AES key length: expected 32, got {}",
+                key.len()
+            ));
+        }
+        if encrypted.is_empty() {
+            return Err("encrypted_data is empty".to_string());
+        }
+
+        type Aes256CbcDec = cbc::Decryptor<Aes256>;
+        let iv: [u8; 16] = key[..16].try_into().unwrap();
+        let dec =
+            Aes256CbcDec::new_from_slices(&key, &iv).map_err(|e| format!("Invalid key/IV: {e}"))?;
+        let mut buf = encrypted.to_vec();
+        let pt = dec
+            .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf)
+            .map_err(|e| format!("Decryption failed: {e}"))?;
+        Ok(pt.to_vec())
+    }
+
+    /// Detect image extension from magic bytes.
+    fn detect_image_ext(data: &[u8]) -> String {
+        if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return ".png".to_string();
+        }
+        if data.starts_with(b"\xff\xd8\xff") {
+            return ".jpg".to_string();
+        }
+        if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+            return ".gif".to_string();
+        }
+        if data.starts_with(b"RIFF") && data.len() >= 12 && &data[8..12] == b"WEBP" {
+            return ".webp".to_string();
+        }
+        ".jpg".to_string()
+    }
+
+    /// Guess MIME type from extension.
+    fn mime_for_ext(ext: &str) -> String {
+        match ext.to_lowercase().as_str() {
+            ".png" => "image/png".to_string(),
+            ".jpg" | ".jpeg" => "image/jpeg".to_string(),
+            ".gif" => "image/gif".to_string(),
+            ".webp" => "image/webp".to_string(),
+            ".pdf" => "application/pdf".to_string(),
+            ".md" => "text/markdown".to_string(),
+            ".txt" => "text/plain".to_string(),
+            ".zip" => "application/zip".to_string(),
+            ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string(),
+            ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+            ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string(),
+            _ => "application/octet-stream".to_string(),
+        }
+    }
+
+    /// Guess file extension from URL or content-type.
+    fn guess_extension(url: &str, content_type: &str, fallback: &str) -> String {
+        let ct_ext = match content_type {
+            "image/png" => ".png",
+            "image/jpeg" => ".jpg",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            "application/pdf" => ".pdf",
+            "text/markdown" => ".md",
+            "text/plain" => ".txt",
+            _ => "",
+        };
+        if !ct_ext.is_empty() {
+            return ct_ext.to_string();
+        }
+        if let Some(path_ext) = Path::new(url)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            return format!(".{path_ext}");
+        }
+        fallback.to_string()
+    }
+
+    /// Guess filename from URL or content-type.
+    fn guess_filename(url: &str, content_type: &str) -> String {
+        let path = Path::new(url);
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if !name.is_empty() && !name.contains('?') {
+                return name.to_string();
+            }
+        }
+        let ext = Self::guess_extension(url, content_type, ".bin");
+        format!("wecom_download{ext}")
+    }
+
+    /// Save image bytes to cache directory.
+    fn cache_image_from_bytes(data: &[u8], ext: &str) -> Result<String, String> {
+        if !Self::looks_like_image(data) {
+            let snippet = String::from_utf8_lossy(&data[..data.len().min(80)]);
+            return Err(format!(
+                "Refusing to cache non-image data as {ext} (starts with: {snippet:?})"
+            ));
+        }
+        let cache_dir = hermes_core::get_hermes_home().join("cache").join("images");
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("Failed to create image cache dir: {e}"))?;
+        let name = format!("img_{}{}", uuid::Uuid::new_v4().simple(), ext);
+        let path = cache_dir.join(&name);
+        std::fs::write(&path, data)
+            .map_err(|e| format!("Failed to write image cache: {e}"))?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    /// Save document bytes to cache directory.
+    fn cache_document_from_bytes(data: &[u8], filename: &str) -> Result<String, String> {
+        let safe_name = Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("document")
+            .replace('\x00', "")
+            .trim()
+            .to_string();
+        if safe_name.is_empty() {
+            return Self::cache_image_from_bytes(data, ".bin");
+        }
+        let cache_dir = hermes_core::get_hermes_home().join("cache").join("documents");
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("Failed to create document cache dir: {e}"))?;
+        let name = format!("doc_{}_{}", uuid::Uuid::new_v4().simple(), safe_name);
+        let path = cache_dir.join(&name);
+        std::fs::write(&path, data)
+            .map_err(|e| format!("Failed to write document cache: {e}"))?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    /// Check if data starts with known image magic bytes.
+    fn looks_like_image(data: &[u8]) -> bool {
+        if data.len() < 4 {
+            return false;
+        }
+        if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return true;
+        }
+        if data.starts_with(b"\xff\xd8\xff") {
+            return true;
+        }
+        if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+            return true;
+        }
+        if data.starts_with(b"BM") {
+            return true;
+        }
+        if data.starts_with(b"RIFF") && data.len() >= 12 && &data[8..12] == b"WEBP" {
+            return true;
+        }
+        false
     }
 
     /// Check if the adapter is properly configured.
@@ -567,6 +955,152 @@ impl WeComAdapter {
 
         debug!("WeCom {msg_type} sent to {chat_id}");
         Ok("ok".to_string())
+    }
+
+    // --- Chunked media upload (mirrors Python _upload_media_bytes) ---
+
+    /// Chunk size for media upload: 512KB.
+    const UPLOAD_CHUNK_SIZE: usize = 512 * 1024;
+    /// Maximum number of chunks (~50MB total).
+    const MAX_UPLOAD_CHUNKS: usize = 100;
+
+    /// Upload media bytes via chunked WebSocket protocol.
+    ///
+    /// Returns the `media_id` assigned by WeCom.
+    pub async fn upload_media_chunked(
+        &self,
+        data: &[u8],
+        media_type: &str,
+        filename: &str,
+    ) -> Result<String, String> {
+        if data.is_empty() {
+            return Err("Cannot upload empty media".to_string());
+        }
+
+        let total_size = data.len();
+        let total_chunks = (total_size + Self::UPLOAD_CHUNK_SIZE - 1) / Self::UPLOAD_CHUNK_SIZE;
+        if total_chunks > Self::MAX_UPLOAD_CHUNKS {
+            return Err(format!(
+                "File too large: {total_chunks} chunks exceeds maximum of {}",
+                Self::MAX_UPLOAD_CHUNKS
+            ));
+        }
+
+        let ws_state = self.ws_state.lock().await.clone()
+            .ok_or("WebSocket not connected".to_string())?;
+
+        // 1) Init
+        let md5_hash = format!("{:x}", md5::compute(data));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        ws_state.cmd_tx.send(WsCommand::Request {
+            cmd: "aibot_upload_media_init".to_string(),
+            body: serde_json::json!({
+                "type": media_type,
+                "filename": filename,
+                "total_size": total_size,
+                "total_chunks": total_chunks,
+                "md5": md5_hash,
+            }),
+            reply_tx,
+        }).await.map_err(|_| "Command channel closed".to_string())?;
+
+        let init_response = tokio::time::timeout(
+            Duration::from_secs(15),
+            reply_rx
+        ).await.map_err(|_| "upload_media_init timeout".to_string())?
+            .map_err(|_| "Response channel closed".to_string())?;
+        let init_response = match init_response {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+
+        let init_body = init_response.get("body").unwrap_or(&init_response);
+        let errcode = init_body.get("errcode").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(-1);
+        if errcode != 0 {
+            return Err(format!(
+                "upload_media_init failed: errcode={errcode}, errmsg={}",
+                init_body.get("errmsg").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("")
+            ));
+        }
+
+        let upload_id = init_body
+            .get("upload_id")
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .ok_or("Missing upload_id in init response")?
+            .to_string();
+
+        // 2) Upload chunks
+        for chunk_index in 0..total_chunks {
+            let start = chunk_index * Self::UPLOAD_CHUNK_SIZE;
+            let end = (start + Self::UPLOAD_CHUNK_SIZE).min(total_size);
+            let chunk = &data[start..end];
+            let b64_data = general_purpose::STANDARD.encode(chunk);
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ws_state.cmd_tx.send(WsCommand::Request {
+                cmd: "aibot_upload_media_chunk".to_string(),
+                body: serde_json::json!({
+                    "upload_id": &upload_id,
+                    "chunk_index": chunk_index,
+                    "base64_data": b64_data,
+                }),
+                reply_tx,
+            }).await.map_err(|_| "Command channel closed".to_string())?;
+
+            let chunk_response = tokio::time::timeout(
+                Duration::from_secs(15),
+                reply_rx
+            ).await.map_err(|_| format!("upload_media_chunk {chunk_index} timeout"))?
+                .map_err(|_| "Response channel closed".to_string())?;
+            let chunk_response = match chunk_response {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+
+            let chunk_body = chunk_response.get("body").unwrap_or(&chunk_response);
+            let errcode = chunk_body.get("errcode").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(-1);
+            if errcode != 0 {
+                return Err(format!(
+                    "upload_media_chunk {chunk_index} failed: errcode={errcode}, errmsg={}",
+                    chunk_body.get("errmsg").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("")
+                ));
+            }
+        }
+
+        // 3) Finish
+        let (reply_tx, reply_rx) = oneshot::channel();
+        ws_state.cmd_tx.send(WsCommand::Request {
+            cmd: "aibot_upload_media_finish".to_string(),
+            body: serde_json::json!({"upload_id": upload_id}),
+            reply_tx,
+        }).await.map_err(|_| "Command channel closed".to_string())?;
+
+        let finish_response = tokio::time::timeout(
+            Duration::from_secs(15),
+            reply_rx
+        ).await.map_err(|_| "upload_media_finish timeout".to_string())?
+            .map_err(|_| "Response channel closed".to_string())?;
+        let finish_response = match finish_response {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+
+        let finish_body = finish_response.get("body").unwrap_or(&finish_response);
+        let errcode = finish_body.get("errcode").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(-1);
+        if errcode != 0 {
+            return Err(format!(
+                "upload_media_finish failed: errcode={errcode}, errmsg={}",
+                finish_body.get("errmsg").and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("")
+            ));
+        }
+
+        let media_id = finish_body
+            .get("media_id")
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .ok_or("Missing media_id in finish response")?
+            .to_string();
+
+        Ok(media_id)
     }
 
     /// Flush a text batch (send multiple messages in sequence).
@@ -805,11 +1339,15 @@ impl WeComAdapter {
         let reply_req_ids: Arc<parking_lot::Mutex<std::collections::HashMap<String, String>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+        let pending_responses: Arc<tokio::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         let ws_state = Arc::new(WsState {
             cmd_tx: cmd_tx.clone(),
             running: running.clone(),
             event_tx: event_tx.clone(),
             reply_req_ids: reply_req_ids.clone(),
+            pending_responses: pending_responses.clone(),
         });
 
         *self.ws_state.lock().await = Some(ws_state.clone());
@@ -831,6 +1369,7 @@ impl WeComAdapter {
                                     &frame,
                                     &event_tx,
                                     &reply_req_ids,
+                                    &pending_responses,
                                 )
                                 .await;
                             }
@@ -910,6 +1449,28 @@ impl WeComAdapter {
                                 }
                                 Err(e) => {
                                     let _ = reply_tx.send(Err(format!("WebSocket respond error: {e}")));
+                                }
+                            }
+                        }
+                        Some(WsCommand::Request { cmd: request_cmd, body: request_body, reply_tx }) => {
+                            let req_id = format!("req-{}", uuid::Uuid::new_v4().simple());
+                            let frame = serde_json::json!({
+                                "cmd": request_cmd,
+                                "headers": {"req_id": &req_id},
+                                "body": request_body,
+                            });
+
+                            // Register pending response before sending
+                            let _ = pending_responses.lock().await.insert(req_id.clone(), reply_tx);
+
+                            match write_half.send(Message::Text(Utf8Bytes::from(frame.to_string()))).await {
+                                Ok(()) => {
+                                    debug!("WeCom request sent: {request_cmd}");
+                                }
+                                Err(e) => {
+                                    if let Some(tx) = pending_responses.lock().await.remove(&req_id) {
+                                        let _ = tx.send(Err(format!("WebSocket send error: {e}")));
+                                    }
                                 }
                             }
                         }
@@ -1028,7 +1589,20 @@ impl WeComAdapter {
         frame: &serde_json::Value,
         event_tx: &mpsc::Sender<WeComMessageEvent>,
         reply_req_ids: &Arc<parking_lot::Mutex<std::collections::HashMap<String, String>>>,
+        pending_responses: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<Result<serde_json::Value, String>>>>>,
     ) {
+        // First: check if this frame is a response to a pending request
+        let frame_req_id = frame
+            .get("headers")
+            .and_then(|h| h.get("req_id"))
+            .and_then(|v| v.as_str());
+        if let Some(req_id) = frame_req_id {
+            if let Some(sender) = pending_responses.lock().await.remove(req_id) {
+                let _ = sender.send(Ok(frame.clone()));
+                return;
+            }
+        }
+
         let cmd = frame
             .get("cmd")
             .and_then(|v| v.as_str())
@@ -1037,7 +1611,7 @@ impl WeComAdapter {
         match cmd {
             "aibot_msg_callback" | "aibot_callback" => {
                 // Reuse handle_inbound for parsing and dedup
-                let Some(event) = self.handle_inbound(frame) else {
+                let Some(event) = self.handle_inbound(frame).await else {
                     return;
                 };
 
@@ -1055,7 +1629,58 @@ impl WeComAdapter {
                     }
                 }
 
-                let _ = event_tx.send(event).await;
+                // Auto-merge rapid successive text messages (batching)
+                if event.msg_type == "text" {
+                    let chat_id = event.chat_id.clone();
+                    let mut batches = self.text_batches.lock().await;
+                    let mut timers = self.batch_timers.lock().await;
+
+                    if let Some(existing) = batches.get_mut(&chat_id) {
+                        // Merge content
+                        existing.content = format!("{}\n{}", existing.content, event.content);
+                        // Merge media paths
+                        existing.media_paths.extend(event.media_paths);
+                        // Merge reply text if present
+                        if existing.reply_to_text.is_none() && event.reply_to_text.is_some() {
+                            existing.reply_to_text = event.reply_to_text;
+                            existing.reply_to_message_id = event.reply_to_message_id;
+                        }
+                        // Abort old timer
+                        if let Some(old) = timers.remove(&chat_id) {
+                            old.abort();
+                        }
+                    } else {
+                        batches.insert(chat_id.clone(), event);
+                    }
+
+                    // Start new timer
+                    let batches_clone = self.text_batches.clone();
+                    let timers_clone = self.batch_timers.clone();
+                    let event_tx_clone = event_tx.clone();
+                    let chat_id_for_timer = chat_id.clone();
+                    let handle = tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(TEXT_BATCH_DELAY_MS)).await;
+                        let mut batches = batches_clone.lock().await;
+                        if let Some(ev) = batches.remove(&chat_id_for_timer) {
+                            let _ = event_tx_clone.send(ev).await;
+                        }
+                        let mut timers = timers_clone.lock().await;
+                        timers.remove(&chat_id_for_timer);
+                    });
+                    timers.insert(chat_id, handle.abort_handle());
+                } else {
+                    // Non-text message: flush any pending batch for this chat first
+                    let chat_id = event.chat_id.clone();
+                    let mut batches = self.text_batches.lock().await;
+                    let mut timers = self.batch_timers.lock().await;
+                    if let Some(old) = timers.remove(&chat_id) {
+                        old.abort();
+                    }
+                    if let Some(batch) = batches.remove(&chat_id) {
+                        let _ = event_tx.send(batch).await;
+                    }
+                    let _ = event_tx.send(event).await;
+                }
             }
             "aibot_event_callback" => {
                 debug!("WeCom event ignored");

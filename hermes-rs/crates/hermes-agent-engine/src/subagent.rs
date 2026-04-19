@@ -304,7 +304,7 @@ fn create_child_registry(parent: &ToolRegistry, allowed_toolsets: &[String]) -> 
             child.register(
                 name,
                 toolset.clone(),
-                entry.schema.clone(),
+                (*entry.schema).clone(),
                 handler,
                 None,
                 vec![toolset],

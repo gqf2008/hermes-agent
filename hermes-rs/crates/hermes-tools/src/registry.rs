@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use hermes_core::Result;
 
-/// JSON Schema for tool parameters.
-pub type ToolSchema = Value;
+/// JSON Schema for tool parameters (wrapped in Arc to avoid deep clones).
+pub type ToolSchema = Arc<Value>;
 
 /// Tool handler function signature.
 ///
@@ -89,7 +89,7 @@ impl ToolRegistry {
         &mut self,
         name: String,
         toolset: String,
-        schema: ToolSchema,
+        schema: Value,
         handler: Arc<ToolHandler>,
         check_fn: Option<Arc<CheckFn>>,
         requires_env: Vec<String>,
@@ -117,7 +117,7 @@ impl ToolRegistry {
         let entry = ToolEntry {
             name: name.clone(),
             toolset,
-            schema,
+            schema: Arc::new(schema),
             handler,
             check_fn,
             requires_env,
@@ -204,15 +204,17 @@ impl ToolRegistry {
             }
 
             // Wrap in OpenAI function-calling format
-            let mut schema = entry.schema.clone();
+            // Clone the inner Value for mutation (schema storage is Arc'd, so this
+            // is cheaper than before when entry.schema was a bare Value).
+            let mut schema = (*entry.schema).clone();
             if let Some(obj) = schema.as_object_mut() {
                 obj.insert("name".to_string(), Value::String(entry.name.clone()));
             }
 
-            defs.push(serde_json::json!({
+            defs.push(Arc::new(serde_json::json!({
                 "type": "function",
                 "function": schema,
-            }));
+            })));
         }
 
         defs

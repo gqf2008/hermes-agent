@@ -730,3 +730,40 @@ def profile_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     return home
 ```
+
+---
+
+## Commit Conventions
+
+### Commit messages must include session ID and agent identifier
+
+Every commit produced by an AI coding assistant must include:
+
+1. **Session ID** — the unique identifier for the conversation/session that produced the change (e.g. `session: abc123`, `s: abc123`, or the full UUID).
+2. **Agent name/identifier** — the name or identifier of the agent that authored the commit (e.g. `agent: Kimi`, `a: claude`, or `hermes-agent`).
+
+**Purpose**: This makes it trivial during code review or `git blame` to trace a change back to the originating conversation and agent, which is essential for:
+- Auditing AI-generated code
+- Reproducing or reverting changes
+- Correlating commits with conversation logs
+- Debugging regressions introduced by specific agent sessions
+
+**Recommended format** (include in commit body or as a trailer):
+```
+feat(gateway): add WeCom chunked media upload
+
+- Implements aibot_upload_media_init/chunk/finish flow
+- Adds request/response correlation over WebSocket
+
+Session: abc123-def456
+Agent: Kimi
+```
+
+**Alternative format** (single-line trailer at end of message body):
+```
+feat(gateway): add WeCom chunked media upload
+
+Session: abc123-def456 | Agent: Kimi
+```
+
+If the session ID is not known at commit time, use `Session: unknown` and update it when available. Never omit the agent identifier.

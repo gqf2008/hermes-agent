@@ -10,6 +10,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::agent::{AIAgent, AgentConfig};
+use crate::agent::types::Message;
 use hermes_core::Result;
 use hermes_tools::registry::ToolRegistry;
 
@@ -21,7 +22,7 @@ use hermes_tools::registry::ToolRegistry;
 pub async fn run_review(
     config: AgentConfig,
     registry: Arc<ToolRegistry>,
-    messages: Vec<Value>,
+    messages: Vec<Message>,
     review_prompt: String,
     review_memory: bool,
     review_skills: bool,
@@ -80,7 +81,7 @@ pub async fn run_review(
 }
 
 /// Extract the first user message from conversation history.
-fn extract_user_message(messages: &[Value]) -> Option<String> {
+fn extract_user_message(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
@@ -89,7 +90,7 @@ fn extract_user_message(messages: &[Value]) -> Option<String> {
 }
 
 /// Count tool calls in conversation history.
-fn count_tool_calls(messages: &[Value]) -> usize {
+fn count_tool_calls(messages: &[Message]) -> usize {
     messages
         .iter()
         .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
@@ -97,7 +98,7 @@ fn count_tool_calls(messages: &[Value]) -> usize {
 }
 
 /// Scan review conversation for memory/skill actions.
-fn scan_review_actions(messages: &[Value]) -> Vec<String> {
+fn scan_review_actions(messages: &[Message]) -> Vec<String> {
     let mut actions = Vec::new();
     for msg in messages {
         if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {

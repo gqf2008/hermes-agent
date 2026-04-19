@@ -98,7 +98,7 @@ pub fn create_environment(config: &EnvConfig) -> Arc<dyn Environment> {
         }
         #[cfg(not(feature = "docker"))]
         "docker" => {
-            return Err("Docker support not compiled in. Enable the `docker` feature.".to_string());
+            panic!("Docker support not compiled in. Enable the `docker` feature.")
         }
         "singularity" => {
             let singularity_config = singularity::SingularityConfig {

@@ -160,6 +160,26 @@ pub async fn call_llm(request: LlmRequest) -> Result<LlmResponse, ClassifiedErro
 pub async fn call_llm_stream(
     request: LlmRequest,
 ) -> Result<Box<dyn futures::Stream<Item = LlmStreamEvent> + Send + Unpin>, ClassifiedError> {
+    let retry_config = RetryConfig {
+        max_retries: 1,
+        base_delay: Duration::from_millis(500),
+        max_delay: Duration::from_secs(5),
+        jitter: true,
+    };
+    retry_with_backoff(&retry_config, |attempt| {
+        let req = request.clone();
+        async move {
+            if attempt > 0 {
+                tracing::warn!(attempt = attempt + 1, "LLM stream retrying");
+            }
+            call_llm_stream_inner(req).await
+        }
+    }).await
+}
+
+async fn call_llm_stream_inner(
+    request: LlmRequest,
+) -> Result<Box<dyn futures::Stream<Item = LlmStreamEvent> + Send + Unpin>, ClassifiedError> {
     // api_mode takes precedence
     if let Some(ref mode) = request.api_mode {
         match mode.as_str() {
@@ -536,6 +556,24 @@ async fn call_openai_compat_stream(
 /// Converts chat messages to Responses API input items, streams the response,
 /// and maps events back to the standard `LlmResponse` shape.
 async fn call_codex(request: &LlmRequest) -> Result<LlmResponse, ClassifiedError> {
+    let retry_config = RetryConfig {
+        max_retries: 2,
+        base_delay: Duration::from_millis(500),
+        max_delay: Duration::from_secs(5),
+        jitter: true,
+    };
+    retry_with_backoff(&retry_config, |attempt| {
+        let req = request.clone();
+        async move {
+            if attempt > 0 {
+                tracing::warn!(provider = "codex", attempt = attempt + 1, "Codex call retrying");
+            }
+            call_codex_inner(&req).await
+        }
+    }).await
+}
+
+async fn call_codex_inner(request: &LlmRequest) -> Result<LlmResponse, ClassifiedError> {
     let api_key = request.api_key.clone()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .unwrap_or_default();
@@ -1359,16 +1397,13 @@ fn build_client(
         return Err(classify_api_error("openai_compat", &request.model, None, e));
     }
 
-    if let Some(secs) = request.timeout_secs {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(secs))
-            .build()
-            .map_err(|e| classify_api_error("openai_compat", &request.model, None,
-                &format!("Failed to build HTTP client: {e}")))?;
-        Ok(async_openai::Client::with_config(config.clone()).with_http_client(http))
-    } else {
-        Ok(async_openai::Client::with_config(config.clone()))
-    }
+    let timeout_secs = request.timeout_secs.unwrap_or(300);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| classify_api_error("openai_compat", &request.model, None,
+            &format!("Failed to build HTTP client: {e}")))?;
+    Ok(async_openai::Client::with_config(config.clone()).with_http_client(http))
 }
 
 /// Resolve API key from credential pool.

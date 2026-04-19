@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use reqwest::Client;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -64,6 +65,14 @@ pub struct WeixinConfig {
     pub session_key: String,
     /// Encryption key for AES-128-ECB.
     pub encrypt_key: String,
+    /// DM policy: `open`, `allowlist`, `disabled`.
+    pub dm_policy: String,
+    /// Group policy: `open`, `allowlist`, `disabled`.
+    pub group_policy: String,
+    /// Allowed users for DM allowlist (comma-separated user IDs).
+    pub allow_from: Vec<String>,
+    /// Allowed groups for group allowlist (comma-separated group IDs).
+    pub group_allow_from: Vec<String>,
 }
 
 impl WeixinConfig {
@@ -73,11 +82,19 @@ impl WeixinConfig {
             return Self {
                 session_key: account.session_key,
                 encrypt_key: account.encrypt_key,
+                dm_policy: std::env::var("WEIXIN_DM_POLICY").unwrap_or_else(|_| "open".into()),
+                group_policy: std::env::var("WEIXIN_GROUP_POLICY").unwrap_or_else(|_| "disabled".into()),
+                allow_from: parse_comma_list(&std::env::var("WEIXIN_ALLOWED_USERS").unwrap_or_default()),
+                group_allow_from: parse_comma_list(&std::env::var("WEIXIN_GROUP_ALLOWED_USERS").unwrap_or_default()),
             };
         }
         Self {
             session_key: std::env::var("WEIXIN_SESSION_KEY").unwrap_or_default(),
             encrypt_key: std::env::var("WEIXIN_ENCRYPT_KEY").unwrap_or_default(),
+            dm_policy: std::env::var("WEIXIN_DM_POLICY").unwrap_or_else(|_| "open".into()),
+            group_policy: std::env::var("WEIXIN_GROUP_POLICY").unwrap_or_else(|_| "disabled".into()),
+            allow_from: parse_comma_list(&std::env::var("WEIXIN_ALLOWED_USERS").unwrap_or_default()),
+            group_allow_from: parse_comma_list(&std::env::var("WEIXIN_GROUP_ALLOWED_USERS").unwrap_or_default()),
         }
     }
 }
@@ -182,6 +199,8 @@ pub struct WeixinMessageEvent {
     pub content: String,
     /// Message type: text, image, voice, video, file.
     pub msg_type: String,
+    /// Whether this is a group message.
+    pub is_group: bool,
     /// Parsed media attachments from item_list.
     pub media_items: Vec<MediaItem>,
 }
@@ -192,12 +211,88 @@ struct DedupEntry {
     timestamp: u64,
 }
 
+/// Parse a comma-separated list, filtering empty items.
+fn parse_comma_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Persistent sync buffer cursor for iLink long-poll.
+///
+/// Mirrors Python `_load_sync_buf` / `_save_sync_buf`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SyncBufStore {
+    get_updates_buf: String,
+}
+
+impl SyncBufStore {
+    fn path() -> PathBuf {
+        hermes_core::get_hermes_home().join("weixin").join("sync_buf.json")
+    }
+
+    fn load() -> Self {
+        let path = Self::path();
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(store) = serde_json::from_slice(&bytes) {
+                return store;
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        let dir = hermes_core::get_hermes_home().join("weixin");
+        std::fs::create_dir_all(&dir)?;
+        let bytes = serde_json::to_vec_pretty(self).unwrap_or_default();
+        std::fs::write(Self::path(), bytes)
+    }
+}
+
+/// Short-lived typing ticket cache from `getconfig`.
+///
+/// Mirrors Python `TypingTicketCache` (weixin.py:280).
+struct TypingTicketCache {
+    ttl_seconds: u64,
+    cache: Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+}
+
+impl TypingTicketCache {
+    fn new(ttl_seconds: u64) -> Self {
+        Self {
+            ttl_seconds,
+            cache: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn get(&self, user_id: &str) -> Option<String> {
+        let mut cache = self.cache.lock();
+        if let Some((ticket, inserted)) = cache.get(user_id) {
+            if inserted.elapsed().as_secs() < self.ttl_seconds {
+                return Some(ticket.clone());
+            }
+            cache.remove(user_id);
+        }
+        None
+    }
+
+    fn set(&self, user_id: &str, ticket: &str) {
+        self.cache
+            .lock()
+            .insert(user_id.to_string(), (ticket.to_string(), std::time::Instant::now()));
+    }
+}
+
 /// Weixin platform adapter.
 pub struct WeixinAdapter {
     config: WeixinConfig,
     client: Client,
-    /// Monotonically increasing offset for long-poll.
+    /// Monotonically increasing offset for long-poll (legacy fallback).
     offset: AtomicU64,
+    /// Persistent sync buffer cursor for iLink long-poll.
+    /// Mirrors Python `sync_buf`.
+    sync_buf: RwLock<String>,
     /// Context token that must be echoed on outbound replies.
     context_token: RwLock<Option<String>>,
     /// Persistent per-peer context token store.
@@ -206,11 +301,14 @@ pub struct WeixinAdapter {
     seen_messages: Mutex<Vec<DedupEntry>>,
     /// Consecutive failure counter.
     consecutive_failures: AtomicU64,
+    /// Typing ticket cache.
+    typing_cache: TypingTicketCache,
 }
 
 impl WeixinAdapter {
     pub fn new(config: WeixinConfig) -> Self {
         let token_store = ContextTokenStore::load();
+        let sync_buf_store = SyncBufStore::load();
         // Restore the most recent in-memory token from the store as a default
         let default_token = token_store
             .tokens
@@ -227,10 +325,12 @@ impl WeixinAdapter {
                     Client::new()
                 }),
             offset: AtomicU64::new(0),
+            sync_buf: RwLock::new(sync_buf_store.get_updates_buf),
             context_token: RwLock::new(default_token),
             token_store: tokio::sync::Mutex::new(token_store),
             seen_messages: Mutex::new(Vec::new()),
             consecutive_failures: AtomicU64::new(0),
+            typing_cache: TypingTicketCache::new(600),
             config,
         }
     }
@@ -293,12 +393,100 @@ impl WeixinAdapter {
         });
     }
 
-    /// Send a text message to a Weixin peer.
+    /// Check if a DM from `sender_id` is allowed by policy.
+    /// Mirrors Python `_is_dm_allowed()`.
+    pub fn is_dm_allowed(&self, sender_id: &str) -> bool {
+        match self.config.dm_policy.as_str() {
+            "disabled" => false,
+            "allowlist" => self.config.allow_from.contains(&sender_id.to_string()),
+            _ => true, // open
+        }
+    }
+
+    /// Check if a group message is allowed by policy.
+    /// Mirrors Python `_is_group_allowed()`.
+    pub fn is_group_allowed(&self, group_id: &str) -> bool {
+        match self.config.group_policy.as_str() {
+            "disabled" => false,
+            "allowlist" => self.config.group_allow_from.contains(&group_id.to_string()),
+            _ => true, // open
+        }
+    }
+
+    /// Fetch typing ticket for a user if not cached.
+    ///
+    /// Mirrors Python `_maybe_fetch_typing_ticket()` (weixin.py:1387).
+    async fn maybe_fetch_typing_ticket(&self, user_id: &str, context_token: Option<&str>) {
+        if self.config.session_key.is_empty() {
+            return;
+        }
+        if self.typing_cache.get(user_id).is_some() {
+            return;
+        }
+        let mut req = self.build_request();
+        req["ilink_user_id"] = serde_json::Value::String(user_id.to_string());
+        if let Some(token) = context_token {
+            req["context_token"] = serde_json::Value::String(token.to_string());
+        }
+        match self
+            .client
+            .post(format!("{ILINK_BASE_URL}/ilink/bot/getconfig"))
+            .json(&req)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(ticket) = body.get("typing_ticket").and_then(|v| v.as_str()) {
+                        self.typing_cache.set(user_id, ticket);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Send a text message to a Weixin peer with per-chunk retry.
+    ///
+    /// Mirrors Python `_send_text_chunk()` retry logic.
     pub async fn send_text(&self, peer_id: &str, text: &str) -> Result<String, String> {
         if self.config.session_key.is_empty() {
             return Err("Weixin session_key not configured".to_string());
         }
+        let text = self.format_message(text);
+        let _ = self.send_typing(peer_id).await;
 
+        const MAX_RETRIES: u32 = 2;
+        const BASE_DELAY_MS: u64 = 500;
+        let mut last_err = String::new();
+
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = std::cmp::min(BASE_DELAY_MS * (1u64 << (attempt - 1)), 5000);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                tracing::warn!(peer_id = peer_id, attempt, "Weixin send retrying");
+            }
+
+            match self.send_text_once(peer_id, &text).await {
+                Ok(result) => {
+                    let _ = self.stop_typing(peer_id).await;
+                    return Ok(result);
+                }
+                Err(e) if e.contains("session expired") => return Err(e),
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            }
+        }
+
+        Err(format!(
+            "Weixin send failed after {MAX_RETRIES} retries: {last_err}"
+        ))
+    }
+
+    /// Single-shot send (no retry).
+    async fn send_text_once(&self, peer_id: &str, text: &str) -> Result<String, String> {
         let mut req = self.build_request();
         req["peer_id"] = serde_json::Value::String(peer_id.to_string());
         req["msg_type"] = serde_json::Value::Number(1.into()); // text
@@ -350,7 +538,13 @@ impl WeixinAdapter {
         }
 
         let mut req = self.build_request();
-        req["offset"] = serde_json::Value::Number(self.offset.load(Ordering::SeqCst).into());
+        // Prefer sync_buf (mirrors Python) over legacy offset
+        let buf = self.sync_buf.read().await.clone();
+        if !buf.is_empty() {
+            req["get_updates_buf"] = serde_json::Value::String(buf);
+        } else {
+            req["offset"] = serde_json::Value::Number(self.offset.load(Ordering::SeqCst).into());
+        }
         req["limit"] = serde_json::Value::Number(10.into());
         req["timeout"] = serde_json::Value::Number(LONG_POLL_TIMEOUT_MS.into());
 
@@ -409,8 +603,12 @@ impl WeixinAdapter {
                 .unwrap_or("")
                 .to_string();
 
-            // Update offset
-            if let Some(new_offset) = update.get("offset").and_then(|v| v.as_u64()) {
+            // Update sync_buf (mirrors Python) or fallback to offset
+            if let Some(new_buf) = update.get("get_updates_buf").and_then(|v| v.as_str()) {
+                let mut buf = self.sync_buf.write().await;
+                *buf = new_buf.to_string();
+                let _ = SyncBufStore { get_updates_buf: buf.clone() }.save();
+            } else if let Some(new_offset) = update.get("offset").and_then(|v| v.as_u64()) {
                 self.offset.store(new_offset, Ordering::SeqCst);
             }
 
@@ -511,14 +709,30 @@ impl WeixinAdapter {
                 content
             };
 
+            // Guess chat type (mirrors Python `_guess_chat_type`)
+            let room_id = update.get("room_id").and_then(|v| v.as_str()).unwrap_or("");
+            let chat_room_id = update.get("chat_room_id").and_then(|v| v.as_str()).unwrap_or("");
+            let to_user_id = update.get("to_user_id").and_then(|v| v.as_str()).unwrap_or("");
+            let is_group = !room_id.is_empty()
+                || !chat_room_id.is_empty()
+                || (!to_user_id.is_empty()
+                    && !self.config.session_key.is_empty()
+                    && to_user_id != self.config.session_key
+                    && msg_type == 1);
+
             events.push(WeixinMessageEvent {
-                message_id,
-                peer_id,
+                message_id: message_id.clone(),
+                peer_id: peer_id.clone(),
                 sender_name: None,
                 content: final_content,
                 msg_type: msg_type_str.to_string(),
+                is_group,
                 media_items,
             });
+
+            // Best-effort fetch typing ticket for this peer
+            let context_token = update.get("context_token").and_then(|v| v.as_str());
+            self.maybe_fetch_typing_ticket(&peer_id, context_token).await;
         }
 
         // Download and cache media attachments
@@ -931,50 +1145,49 @@ impl WeixinAdapter {
 
     /// Send typing indicator.
     ///
-    /// Mirrors Python `send_typing()` (weixin.py:889).
-    #[allow(dead_code)]
+    /// Mirrors Python `_send_typing()` (weixin.py:424).
     pub async fn send_typing(&self, peer_id: &str) -> Result<String, String> {
-        let mut req = self.build_request();
-        req["peer_id"] = serde_json::Value::String(peer_id.to_string());
-        req["cmd"] = serde_json::Value::String("typing".to_string());
-
-        let _resp = self
-            .client
-            .post(format!("{ILINK_BASE_URL}/ilink/bot/sendmessage"))
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send typing: {e}"))?;
-
-        debug!("Weixin typing indicator sent to {peer_id}");
+        if let Some(ticket) = self.typing_cache.get(peer_id) {
+            let mut req = self.build_request();
+            req["ilink_user_id"] = serde_json::Value::String(peer_id.to_string());
+            req["typing_ticket"] = serde_json::Value::String(ticket);
+            req["status"] = serde_json::Value::Number(1.into());
+            let _resp = self
+                .client
+                .post(format!("{ILINK_BASE_URL}/ilink/bot/sendtyping"))
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send typing: {e}"))?;
+            debug!("Weixin typing indicator sent to {peer_id}");
+        }
         Ok("ok".to_string())
     }
 
     /// Stop typing indicator.
-    #[allow(dead_code)]
     pub async fn stop_typing(&self, peer_id: &str) -> Result<String, String> {
-        let mut req = self.build_request();
-        req["peer_id"] = serde_json::Value::String(peer_id.to_string());
-        req["cmd"] = serde_json::Value::String("stop_typing".to_string());
-
-        let _ = self
-            .client
-            .post(format!("{ILINK_BASE_URL}/ilink/bot/sendmessage"))
-            .json(&req)
-            .send()
-            .await;
-
+        if let Some(ticket) = self.typing_cache.get(peer_id) {
+            let mut req = self.build_request();
+            req["ilink_user_id"] = serde_json::Value::String(peer_id.to_string());
+            req["typing_ticket"] = serde_json::Value::String(ticket);
+            req["status"] = serde_json::Value::Number(0.into());
+            let _ = self
+                .client
+                .post(format!("{ILINK_BASE_URL}/ilink/bot/sendtyping"))
+                .json(&req)
+                .send()
+                .await;
+        }
         Ok("ok".to_string())
     }
 
     /// Format a message with optional markdown-like styling.
     ///
-    /// Mirrors Python `format_message()` (weixin.py:1002).
-    /// Weixin doesn't support markdown, so this just returns plain text.
-    #[allow(dead_code)]
+    /// Format message content for WeChat compatibility.
+    ///
+    /// Mirrors Python `format_message()` (weixin.py:1755).
     pub fn format_message(&self, text: &str) -> String {
-        // Weixin plain text — no markdown support
-        text.to_string()
+        normalize_markdown_blocks(text)
     }
 
     /// Send text with chunking for long messages.
@@ -1139,6 +1352,10 @@ pub async fn qr_login() -> Result<WeixinConfig, String> {
                 return Ok(WeixinConfig {
                     session_key: session_key.to_string(),
                     encrypt_key: encrypt_key.to_string(),
+                    dm_policy: "open".to_string(),
+                    group_policy: "disabled".to_string(),
+                    allow_from: Vec::new(),
+                    group_allow_from: Vec::new(),
                 });
             }
             3 => {
@@ -1149,6 +1366,161 @@ pub async fn qr_login() -> Result<WeixinConfig, String> {
                 return Err(format!("Unknown QR status: {status}"));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown normalization — mirrors Python `_normalize_markdown_blocks()`
+// ---------------------------------------------------------------------------
+
+use regex::Regex;
+use std::sync::LazyLock;
+
+static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+?)\s*$").unwrap());
+static TABLE_RULE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$").unwrap());
+static FENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^```([^\n`]*)$").unwrap());
+static MARKDOWN_LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static MULTI_NEWLINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+
+/// Normalize markdown for WeChat compatibility.
+///
+/// Mirrors Python `_normalize_markdown_blocks()` (weixin.py:623).
+fn normalize_markdown_blocks(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    let mut in_code_block = false;
+
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        if FENCE_RE.is_match(line.trim()) {
+            in_code_block = !in_code_block;
+            result.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if in_code_block {
+            result.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if i + 1 < lines.len()
+            && lines[i].contains('|')
+            && TABLE_RULE_RE.is_match(lines[i + 1].trim_end())
+        {
+            let mut table_lines = vec![
+                lines[i].trim_end().to_string(),
+                lines[i + 1].trim_end().to_string(),
+            ];
+            i += 2;
+            while i < lines.len() && lines[i].contains('|') {
+                table_lines.push(lines[i].trim_end().to_string());
+                i += 1;
+            }
+            result.push(rewrite_table_block_for_weixin(&table_lines));
+            continue;
+        }
+
+        let rewritten = rewrite_headers_for_weixin(line);
+        let no_links = MARKDOWN_LINK_RE.replace_all(&rewritten, "$1 ($2)");
+        result.push(no_links.to_string());
+        i += 1;
+    }
+
+    let normalized = result.join("\n");
+    MULTI_NEWLINE_RE.replace_all(&normalized, "\n\n").trim().to_string()
+}
+
+/// Rewrite markdown headers for WeChat.
+///
+/// Mirrors Python `_rewrite_headers_for_weixin()` (weixin.py:577).
+fn rewrite_headers_for_weixin(line: &str) -> String {
+    if let Some(caps) = HEADER_RE.captures(line) {
+        let level = caps[1].len();
+        let title = caps[2].trim();
+        if level == 1 {
+            return format!("【{title}】");
+        }
+        return format!("**{title}**");
+    }
+    line.to_string()
+}
+
+/// Split a GFM table row into cells.
+///
+/// Mirrors Python `_split_table_row()` (weixin.py:568).
+fn split_table_row(line: &str) -> Vec<String> {
+    let mut row = line.trim();
+    if row.starts_with('|') {
+        row = &row[1..];
+    }
+    if row.ends_with('|') {
+        row = &row[..row.len() - 1];
+    }
+    row.split('|').map(|s| s.trim().to_string()).collect()
+}
+
+/// Flatten a markdown table into WeChat-friendly lines.
+///
+/// Mirrors Python `_rewrite_table_block_for_weixin()` (weixin.py:588).
+fn rewrite_table_block_for_weixin(lines: &[String]) -> String {
+    if lines.len() < 2 {
+        return lines.join("\n");
+    }
+    let headers = split_table_row(&lines[0]);
+    let body_rows: Vec<Vec<String>> = lines[2..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| split_table_row(l))
+        .collect();
+    if headers.is_empty() || body_rows.is_empty() {
+        return lines.join("\n");
+    }
+
+    let mut formatted_rows = Vec::new();
+    for row in &body_rows {
+        let mut pairs = Vec::new();
+        for (idx, header) in headers.iter().enumerate() {
+            if idx >= row.len() {
+                break;
+            }
+            let label = if header.is_empty() {
+                format!("Column {}", idx + 1)
+            } else {
+                header.clone()
+            };
+            let value = row[idx].trim();
+            if !value.is_empty() {
+                pairs.push((label, value.to_string()));
+            }
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        if pairs.len() == 1 {
+            let (label, value) = &pairs[0];
+            formatted_rows.push(format!("- {label}: {value}"));
+        } else if pairs.len() == 2 {
+            let (l1, v1) = &pairs[0];
+            let (l2, v2) = &pairs[1];
+            formatted_rows.push(format!("- {l1}: {v1}"));
+            formatted_rows.push(format!("  {l2}: {v2}"));
+        } else {
+            let summary = pairs
+                .iter()
+                .map(|(l, v)| format!("{l}: {v}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            formatted_rows.push(format!("- {summary}"));
+        }
+    }
+
+    if formatted_rows.is_empty() {
+        lines.join("\n")
+    } else {
+        formatted_rows.join("\n")
     }
 }
 
@@ -1174,6 +1546,10 @@ mod tests {
         let config = WeixinConfig {
             session_key: "test_key".to_string(),
             encrypt_key: "".to_string(),
+            dm_policy: "open".to_string(),
+            group_policy: "disabled".to_string(),
+            allow_from: Vec::new(),
+            group_allow_from: Vec::new(),
         };
         let adapter = WeixinAdapter::new(config);
         let req = adapter.build_request();

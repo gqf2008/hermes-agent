@@ -172,8 +172,8 @@ mod unix_impl {
                             &handler,
                             &call_count,
                         );
-                        if count.is_err() {
-                            eprintln!("UDS connection error: {:?}", count.err());
+                        if let Err(e) = count {
+                            tracing::error!("UDS connection error: {}", e);
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use serde_json::Value;
+/// Conversation message wrapped in Arc to avoid deep clones.
+pub(crate) type Message = Arc<serde_json::Value>;
 
 use hermes_prompt::CompressorConfig;
 use hermes_llm::credential_pool::CredentialPool;
@@ -22,7 +23,7 @@ pub type ActivityCallback = Arc<dyn Fn(&str) + Send + Sync>;
 #[allow(dead_code)]
 pub type PreLlmHook = Arc<dyn Fn(
     &str,             // system prompt
-    &[Value],         // messages
+    &[Message],       // messages
     usize,            // api_call_count
 ) -> PreLlmHookResult + Send + Sync>;
 
@@ -36,9 +37,9 @@ pub enum PreLlmHookResult {
     /// Replace the system prompt with a new value.
     OverrideSystem(String),
     /// Replace the entire message list with a new one.
-    OverrideMessages(Vec<Value>),
+    OverrideMessages(Vec<Message>),
     /// Replace both system prompt and messages.
-    OverrideBoth(String, Vec<Value>),
+    OverrideBoth(String, Vec<Message>),
 }
 
 /// Stream delta callback — fires on each text chunk from the LLM.
@@ -188,7 +189,7 @@ pub struct TurnResult {
     /// Final assistant response text.
     pub response: String,
     /// Complete message history after the turn.
-    pub messages: Vec<Value>,
+    pub messages: Vec<Message>,
     /// Number of API calls made.
     pub api_calls: usize,
     /// Exit reason.

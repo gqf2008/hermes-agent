@@ -63,6 +63,7 @@ impl SessionDB {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let conn = Arc::new(Mutex::new(conn));
         let write_count = Arc::new(Mutex::new(0usize));
@@ -99,12 +100,32 @@ impl SessionDB {
                     let _ = guard.execute_batch("ROLLBACK");
                     drop(guard);
                     if let StateError::Sqlite(ref se) = e {
-                        let msg = se.to_string().to_lowercase();
-                        if (msg.contains("locked") || msg.contains("busy")) && attempt < WRITE_MAX_RETRIES - 1 {
-                            last_err = Some(e);
-                            let jitter = rand::rng().random_range(WRITE_RETRY_MIN_MS..=WRITE_RETRY_MAX_MS);
-                            std::thread::sleep(std::time::Duration::from_millis(jitter));
-                            continue;
+                        match se.sqlite_error_code() {
+                            Some(rusqlite::ErrorCode::DatabaseBusy)
+                            | Some(rusqlite::ErrorCode::DatabaseLocked) => {
+                                if attempt < WRITE_MAX_RETRIES - 1 {
+                                    last_err = Some(e);
+                                    let jitter = rand::rng().random_range(WRITE_RETRY_MIN_MS..=WRITE_RETRY_MAX_MS);
+                                    std::thread::sleep(std::time::Duration::from_millis(jitter));
+                                    continue;
+                                }
+                            }
+                            Some(rusqlite::ErrorCode::DiskFull) => {
+                                return Err(StateError::Io(std::io::Error::other(
+                                    "Disk full: SQLite write failed",
+                                )));
+                            }
+                            Some(rusqlite::ErrorCode::ReadOnly) => {
+                                return Err(StateError::Io(std::io::Error::other(
+                                    "Database is read-only: check permissions or mount options",
+                                )));
+                            }
+                            Some(rusqlite::ErrorCode::DatabaseCorrupt) => {
+                                return Err(StateError::Io(std::io::Error::other(
+                                    "Database file is corrupt: try restoring from backup",
+                                )));
+                            }
+                            _ => {}
                         }
                     }
                     return Err(e);

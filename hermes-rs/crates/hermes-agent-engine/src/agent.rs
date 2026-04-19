@@ -35,6 +35,8 @@ use parking_lot::Mutex;
 
 use serde_json::Value;
 
+use crate::agent::types::Message;
+
 use hermes_core::{HermesConfig, Result};
 use hermes_prompt::{
     apply_anthropic_cache_control, build_system_prompt, CompressorConfig, ContextCompressor,
@@ -288,7 +290,7 @@ impl AIAgent {
         &mut self,
         user_message: &str,
         system_message: Option<&str>,
-        conversation_history: Option<&[Value]>,
+        conversation_history: Option<&[Message]>,
     ) -> TurnResult {
         // Restore primary runtime if fallback was activated last turn.
         // Mirrors Python `_restore_primary_runtime()` (run_agent.py:5994).
@@ -306,21 +308,21 @@ impl AIAgent {
             });
         }
 
-        let mut messages: Vec<Value> = conversation_history
+        let mut messages: Vec<Message> = conversation_history
             .map(|h| h.to_vec())
             .unwrap_or_default();
 
         // Build system prompt
-        let active_system_prompt = self.build_system_prompt(system_message);
+        let active_system_prompt: Arc<str> = Arc::from(self.build_system_prompt(system_message));
 
         // Add user message — sanitize stale memory-context blocks first.
         // Mirrors Python: sanitize_context(user_message) (run_agent.py:8163-8165).
         // Prevents stale memory tags from leaking into the conversation.
         let sanitized_user = sanitize_memory_context(user_message);
-        messages.push(serde_json::json!({
+        messages.push(Arc::new(serde_json::json!({
             "role": "user",
             "content": sanitized_user
-        }));
+        })));
 
         // Memory manager on_turn_start notification.
         // Mirrors Python: memory_manager.on_turn_start() (run_agent.py).
@@ -423,7 +425,8 @@ impl AIAgent {
                     }) {
                         if let Some(content) = first_user.get("content").and_then(Value::as_str) {
                             let combined = format!("{}\n\n{}", injected, content);
-                            first_user["content"] = Value::String(combined);
+                            let value = Arc::make_mut(first_user);
+                            value["content"] = Value::String(combined);
                         }
                     }
                 }
@@ -466,13 +469,13 @@ impl AIAgent {
                         break;
                     }
                     PreLlmHookResult::OverrideSystem(sys) => {
-                        hook_system_prompt = sys;
+                        hook_system_prompt = Arc::from(sys);
                     }
                     PreLlmHookResult::OverrideMessages(msgs) => {
                         hook_messages = msgs;
                     }
                     PreLlmHookResult::OverrideBoth(sys, msgs) => {
-                        hook_system_prompt = sys;
+                        hook_system_prompt = Arc::from(sys);
                         hook_messages = msgs;
                     }
                 }
@@ -541,11 +544,11 @@ impl AIAgent {
                                 .and_then(Value::as_str)
                                 .unwrap_or("");
                             truncated_response_prefix.push_str(content);
-                            messages.push(response);
-                            messages.push(serde_json::json!({
+                            messages.push(Arc::new(response));
+                            messages.push(Arc::new(serde_json::json!({
                                 "role": "user",
                                 "content": "Please continue your previous response from exactly where you left off. Do NOT repeat content, do NOT summarize — just continue."
-                            }));
+                            })));
                             continue;
                         }
                         // Exceeded retries — fall through to partial handling
@@ -567,7 +570,7 @@ impl AIAgent {
                     }
 
                     // Check for tool calls
-                    if let Some(tool_calls) = response.get("tool_calls").and_then(Value::as_array) {
+                    if let Some(tool_calls) = response.get("tool_calls").and_then(Value::as_array).cloned() {
                         if tool_calls.is_empty() {
                             // Empty tool_calls array — may still be length truncated
                             let is_length = response.get("finish_reason")
@@ -585,11 +588,11 @@ impl AIAgent {
                                     "Response truncated with empty tool_calls — continuing (attempt {}/{})",
                                     length_continue_retries, 3
                                 );
-                                messages.push(response.clone());
-                                messages.push(serde_json::json!({
+                                messages.push(Arc::new(response));
+                                messages.push(Arc::new(serde_json::json!({
                                     "role": "user",
                                     "content": "Please continue your previous response from exactly where you left off. Do NOT repeat content, do NOT summarize — just continue."
-                                }));
+                                })));
                                 continue;
                             }
 
@@ -607,16 +610,16 @@ impl AIAgent {
                                 );
                                 // Append the empty assistant message first so the
                                 // message sequence stays valid: tool(result) → assistant("(empty)") → user(nudge)
-                                messages.push(serde_json::json!({
+                                messages.push(Arc::new(serde_json::json!({
                                     "role": "assistant",
                                     "content": "(empty)"
-                                }));
-                                messages.push(serde_json::json!({
+                                })));
+                                messages.push(Arc::new(serde_json::json!({
                                     "role": "user",
                                     "content": "You just executed tool calls but returned an \
                                     empty response. Please process the tool \
                                     results above and continue with the task."
-                                }));
+                                })));
                                 continue;
                             }
 
@@ -628,7 +631,7 @@ impl AIAgent {
                                 final_response = content.to_string();
                             }
                             exit_reason = "completed".to_string();
-                            messages.push(response);
+                            messages.push(Arc::new(response));
                             break;
                         }
 
@@ -636,7 +639,7 @@ impl AIAgent {
                         let is_truncated = response.get("finish_reason")
                             .and_then(Value::as_str)
                             .is_some_and(|fr| fr == "length" || fr == "length_limit")
-                            && has_truncated_tool_args(tool_calls);
+                            && has_truncated_tool_args(&tool_calls);
 
                         if is_truncated {
                             truncated_retry = true;
@@ -648,11 +651,11 @@ impl AIAgent {
                         }
 
                         // Add assistant message with tool calls
-                        messages.push(response.clone());
+                        messages.push(Arc::new(response));
 
                         // Deduplicate tool calls before execution.
                         // Mirrors Python `_deduplicate_tool_calls()` (run_agent.py:3573).
-                        let deduped = Self::deduplicate_tool_calls(tool_calls);
+                        let deduped = Self::deduplicate_tool_calls(&tool_calls);
 
                         // Execute tools: concurrent for independent batches,
                         // sequential for interactive/dependent tools.
@@ -668,13 +671,13 @@ impl AIAgent {
 
                         // Append all tool results to message history
                         for tool_result in tool_results {
-                            messages.push(tool_result);
+                            messages.push(Arc::new(tool_result));
                         }
 
                         // Check for subagent delegation results
                         if let Some(delegate_results) = self.take_delegate_results() {
                             for r in delegate_results {
-                                messages.push(serde_json::json!({
+                                messages.push(Arc::new(serde_json::json!({
                                     "role": "tool",
                                     "content": serde_json::json!({
                                         "goal": r.goal,
@@ -683,14 +686,16 @@ impl AIAgent {
                                         "api_calls": r.api_calls,
                                     }).to_string(),
                                     "tool_call_id": "delegate_result",
-                                }));
+                                })));
                             }
                         }
 
                         // Check context compression
                         if let Some(ref mut compressor) = self.compressor {
                             if compressor.should_compress(None) {
-                                messages = compressor.compress(&messages, None, None);
+                                let temp: Vec<Value> = messages.iter().map(|m| (**m).clone()).collect();
+                                messages = compressor.compress(&temp, None, None)
+                                    .into_iter().map(Arc::new).collect();
                                 // Rebuild system prompt after compression
                                 self.cached_system_prompt = None;
                                 let _ = self.build_system_prompt(system_message);
@@ -731,11 +736,11 @@ impl AIAgent {
                                     length_continue_retries, 3
                                 );
                                 // Inject continue message
-                                messages.push(response.clone());
-                                messages.push(serde_json::json!({
+                                messages.push(Arc::new(response));
+                                messages.push(Arc::new(serde_json::json!({
                                     "role": "user",
                                     "content": "Please continue your previous response from exactly where you left off. Do NOT repeat content, do NOT summarize — just continue."
-                                }));
+                                })));
                                 continue;
                             } else {
                                 // Exceeded 3 retries — return partial response
@@ -746,7 +751,7 @@ impl AIAgent {
                                 truncated_response_prefix.push_str(content);
                                 final_response = truncated_response_prefix.clone();
                                 exit_reason = "partial".to_string();
-                                messages.push(response);
+                                messages.push(Arc::new(response));
                                 break;
                             }
                         }
@@ -763,7 +768,7 @@ impl AIAgent {
                             }
                         }
                         exit_reason = "completed".to_string();
-                        messages.push(response);
+                        messages.push(Arc::new(response));
                         break;
                     }
                 }
@@ -876,7 +881,9 @@ impl AIAgent {
                                     compression_attempts, max_compression_attempts
                                 );
                                 if let Some(ref mut compressor) = self.compressor {
-                                    messages = compressor.compress(&messages, None, None);
+                                    let temp: Vec<Value> = messages.iter().map(|m| (**m).clone()).collect();
+                                    messages = compressor.compress(&temp, None, None)
+                                        .into_iter().map(Arc::new).collect();
                                     self.cached_system_prompt = None;
                                     let _ = self.build_system_prompt(system_message);
                                     continue;
@@ -940,7 +947,7 @@ impl AIAgent {
                                             .unwrap_or("")
                                             .to_string();
                                         exit_reason = "completed".to_string();
-                                        messages.push(resp);
+                                        messages.push(Arc::new(resp));
                                         fallback_succeeded = true;
                                         // Mark fallback activated — next turn will restore primary.
                                         // Mirrors Python `_fallback_activated = True` (run_agent.py:5920).
@@ -1054,14 +1061,14 @@ impl AIAgent {
     async fn call_llm(
         &self,
         system_prompt: &str,
-        messages: &[Value],
+        messages: &[Message],
     ) -> Result<Value> {
         // Build API request with system prompt and messages
         let mut api_messages: Vec<Value> = vec![serde_json::json!({
             "role": "system",
             "content": system_prompt
         })];
-        api_messages.extend(messages.iter().cloned());
+        api_messages.extend(messages.iter().map(|m| (**m).clone()));
 
         // Apply Anthropic caching if enabled (skip for Codex Responses API)
         let is_codex = self.config.api_mode.as_deref() == Some("codex");
@@ -1100,7 +1107,7 @@ impl AIAgent {
         let request = hermes_llm::client::LlmRequest {
             model: self.config.model.clone(),
             messages: cached_messages,
-            tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions) },
+            tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions.iter().map(|v| (**v).clone()).collect()) },
             temperature: None,
             max_tokens: None,
             base_url: resolved_base_url,
@@ -1154,7 +1161,7 @@ impl AIAgent {
     async fn call_llm_stream(
         &self,
         system_prompt: &str,
-        messages: &[Value],
+        messages: &[Message],
     ) -> Result<Value> {
         use futures::StreamExt;
 
@@ -1165,7 +1172,7 @@ impl AIAgent {
             "role": "system",
             "content": system_prompt
         })];
-        api_messages.extend(messages.iter().cloned());
+        api_messages.extend(messages.iter().map(|m| (**m).clone()));
 
         let is_codex = self.config.api_mode.as_deref() == Some("codex");
         let cached_messages = if self.config.enable_caching && !is_codex {
@@ -1194,7 +1201,7 @@ impl AIAgent {
         let request = hermes_llm::client::LlmRequest {
             model: self.config.model.clone(),
             messages: cached_messages,
-            tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions) },
+            tools: if tool_definitions.is_empty() { None } else { Some(tool_definitions.iter().map(|v| (**v).clone()).collect()) },
             temperature: None,
             max_tokens: None,
             base_url: resolved_base_url,
@@ -1629,7 +1636,7 @@ impl AIAgent {
     fn looks_like_codex_intermediate_ack(
         user_message: &str,
         assistant_content: &str,
-        messages: &[Value],
+        messages: &[Message],
     ) -> bool {
         // Don't trigger if any tool result are present.
         if messages.iter().any(|msg| msg.get("role").and_then(Value::as_str) == Some("tool")) {
@@ -1751,7 +1758,7 @@ impl AIAgent {
     /// memories or skills if warranted. Never blocks the main conversation.
     fn spawn_background_review(
         &self,
-        messages: &[Value],
+        messages: &[Message],
         review_memory: bool,
         review_skills: bool,
     ) {
@@ -2681,7 +2688,7 @@ mod tests {
     fn test_turn_result_fields() {
         let result = TurnResult {
             response: "hello".to_string(),
-            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            messages: vec![Arc::new(serde_json::json!({"role": "user", "content": "hi"}))],
             api_calls: 1,
             exit_reason: "completed".to_string(),
             compression_exhausted: false,
@@ -2851,10 +2858,10 @@ mod tests {
     #[test]
     fn test_rollback_to_last_assistant() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "hi there"}),
-            serde_json::json!({"role": "user", "content": "follow up"}),
-            serde_json::json!({"role": "assistant", "content": "partial response", "tool_calls": []}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "hi there"})),
+            Arc::new(serde_json::json!({"role": "user", "content": "follow up"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "partial response", "tool_calls": []})),
         ];
         let rolled_back = rollback_to_last_assistant(&messages);
         // Should keep everything before the last assistant message
@@ -2867,7 +2874,7 @@ mod tests {
     #[test]
     fn test_rollback_no_assistant() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
         ];
         let rolled_back = rollback_to_last_assistant(&messages);
         // No assistant message — return original
@@ -2876,7 +2883,7 @@ mod tests {
 
     #[test]
     fn test_rollback_empty_messages() {
-        let messages: Vec<Value> = vec![];
+        let messages: Vec<Message> = vec![];
         let rolled_back = rollback_to_last_assistant(&messages);
         assert!(rolled_back.is_empty());
     }
@@ -2884,8 +2891,8 @@ mod tests {
     #[test]
     fn test_rollback_single_assistant() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "done"}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "done"})),
         ];
         let rolled_back = rollback_to_last_assistant(&messages);
         // Only one assistant — rollback removes it, keeping just the user msg
@@ -2986,8 +2993,8 @@ mod tests {
     #[test]
     fn test_estimate_tokens() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "hi there"}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "hi there"})),
         ];
         let tokens = estimate_tokens(&messages);
         // Now counts role strings too: "user" + "hello" + "assistant" + "hi there"
@@ -2997,7 +3004,7 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens_empty() {
-        let messages: Vec<Value> = vec![];
+        let messages: Vec<Message> = vec![];
         assert_eq!(estimate_tokens(&messages), 0);
     }
 
@@ -3018,7 +3025,7 @@ mod tests {
     fn test_stale_call_timeout_large_context() {
         // Simulate >100K tokens (chars/4 heuristic → need >400K chars)
         let large_content = "x".repeat(440_000);
-        let messages = vec![serde_json::json!({"role": "user", "content": large_content})];
+        let messages = vec![Arc::new(serde_json::json!({"role": "user", "content": large_content}))];
         let timeout = stale_call_timeout(Some("https://api.openai.com/v1"), &messages);
         assert_eq!(timeout, std::time::Duration::from_secs_f64(600.0));
     }
@@ -3027,7 +3034,7 @@ mod tests {
     fn test_stale_call_timeout_mid_context() {
         // Simulate >50K tokens but <100K (200K-400K chars)
         let content = "x".repeat(240_000);
-        let messages = vec![serde_json::json!({"role": "user", "content": content})];
+        let messages = vec![Arc::new(serde_json::json!({"role": "user", "content": content}))];
         let timeout = stale_call_timeout(Some("https://api.openai.com/v1"), &messages);
         assert_eq!(timeout, std::time::Duration::from_secs_f64(450.0));
     }
@@ -3218,8 +3225,8 @@ mod tests {
     #[test]
     fn test_sanitize_api_messages_basic() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "hi"}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "hi"})),
         ];
         let result = sanitize_api_messages(&messages);
         assert_eq!(result.len(), 2);
@@ -3228,12 +3235,12 @@ mod tests {
     #[test]
     fn test_sanitize_api_messages_removes_orphaned_tool() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "hi", "tool_calls": [
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "hi", "tool_calls": [
                 {"id": "call_1", "function": {"name": "read", "arguments": "{}"}}
-            ]}),
+            ]})),
             // Orphaned tool result — references non-existent tool_call_id
-            serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_999"}),
+            Arc::new(serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_999"})),
         ];
         let result = sanitize_api_messages(&messages);
         // Should remove the orphaned tool result
@@ -3243,11 +3250,11 @@ mod tests {
     #[test]
     fn test_sanitize_api_messages_keeps_valid_tool_result() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "hi", "tool_calls": [
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "hi", "tool_calls": [
                 {"id": "call_1", "function": {"name": "read", "arguments": "{}"}}
-            ]}),
-            serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_1"}),
+            ]})),
+            Arc::new(serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_1"})),
         ];
         let result = sanitize_api_messages(&messages);
         assert_eq!(result.len(), 3);
@@ -3256,9 +3263,9 @@ mod tests {
     #[test]
     fn test_sanitize_api_messages_merges_consecutive_users() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "user", "content": "follow up"}),
-            serde_json::json!({"role": "assistant", "content": "hi"}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "user", "content": "follow up"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "hi"})),
         ];
         let result = sanitize_api_messages(&messages);
         // Consecutive user messages should be merged
@@ -3271,8 +3278,8 @@ mod tests {
     #[test]
     fn test_normalize_messages_strips_assistant_whitespace() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "hello"}),
-            serde_json::json!({"role": "assistant", "content": "  hi there  \n"}),
+            Arc::new(serde_json::json!({"role": "user", "content": "hello"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "  hi there  \n"})),
         ];
         let result = normalize_messages(&messages);
         assert_eq!(result[1]["content"], "hi there");
@@ -3281,12 +3288,12 @@ mod tests {
     #[test]
     fn test_normalize_messages_canonicalizes_tool_args() {
         let messages = vec![
-            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+            Arc::new(serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
                 {"id": "call_1", "function": {
                     "name": "read",
                     "arguments": "{\"path\":\"/tmp\",\"mode\":\"r\"}"
                 }}
-            ]}),
+            ]})),
         ];
         let result = normalize_messages(&messages);
         let args = result[0]["tool_calls"][0]["function"]["arguments"]
@@ -3298,7 +3305,7 @@ mod tests {
     #[test]
     fn test_normalize_messages_preserves_user_content() {
         let messages = vec![
-            serde_json::json!({"role": "user", "content": "  hello  "}),
+            Arc::new(serde_json::json!({"role": "user", "content": "  hello  "})),
         ];
         let result = normalize_messages(&messages);
         // User content should NOT be stripped

@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+use crate::agent::types::Message;
+
 /// Configuration field definition for setup wizards.
 #[derive(Debug, Clone)]
 pub struct ConfigField {
@@ -131,10 +133,10 @@ pub trait MemoryProvider: Send + Sync {
     }
 
     /// Called when a session ends (explicit exit or timeout).
-    fn on_session_end(&self, _messages: &[Value]) {}
+    fn on_session_end(&self, _messages: &[Message]) {}
 
     /// Called before context compression discards old messages.
-    fn on_pre_compress(&self, _messages: &[Value]) -> String {
+    fn on_pre_compress(&self, _messages: &[Message]) -> String {
         String::new()
     }
 

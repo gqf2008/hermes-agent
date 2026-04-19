@@ -16,6 +16,9 @@
 use hermes_llm::credential_pool::CredentialPool;
 use hermes_llm::error_classifier::{ClassifiedError, FailoverReason};
 use serde_json::Value;
+use std::sync::Arc;
+
+use crate::agent::types::Message;
 
 /// Failover chain state for a single conversation turn.
 #[derive(Debug, Default)]
@@ -40,11 +43,12 @@ const MAX_SANITIZE_PASSES: u32 = 2;
 ///
 /// Mirrors Python: UnicodeEncodeError recovery (run_agent.py:9376-9489).
 /// Replaces invalid UTF-8 surrogate characters with replacement character.
-pub fn sanitize_unicode_messages(messages: &mut [Value]) {
+pub fn sanitize_unicode_messages(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
-        if let Some(obj) = msg.as_object_mut() {
-            for (_, value) in obj.iter_mut() {
-                sanitize_value(value);
+        let value = Arc::make_mut(msg);
+        if let Some(obj) = value.as_object_mut() {
+            for (_, val) in obj.iter_mut() {
+                sanitize_value(val);
             }
         }
     }
@@ -78,9 +82,10 @@ fn sanitize_value(value: &mut Value) {
 /// Mirrors Python: thinking signature recovery (run_agent.py:9574-9592).
 /// Removes `reasoning`, `reasoning_content`, `reasoning_details` fields
 /// and inline think tags from content.
-pub fn strip_reasoning_from_messages(messages: &mut [Value]) {
+pub fn strip_reasoning_from_messages(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
-        if let Some(obj) = msg.as_object_mut() {
+        let value = Arc::make_mut(msg);
+        if let Some(obj) = value.as_object_mut() {
             obj.remove("reasoning");
             obj.remove("reasoning_content");
             obj.remove("reasoning_details");
@@ -262,10 +267,10 @@ mod tests {
     #[test]
     fn test_sanitize_unicode_messages() {
         let mut messages = vec![
-            serde_json::json!({
+            Arc::new(serde_json::json!({
                 "role": "user",
                 "content": "Hello\u{FFFD}World"
-            }),
+            })),
         ];
         sanitize_unicode_messages(&mut messages);
         // Replacement characters should be filtered out
@@ -276,13 +281,13 @@ mod tests {
     #[test]
     fn test_strip_reasoning_fields() {
         let mut messages = vec![
-            serde_json::json!({
+            Arc::new(serde_json::json!({
                 "role": "assistant",
                 "reasoning": "I should think...",
                 "reasoning_content": "More thinking...",
                 "reasoning_details": [{"summary": "Summary"}],
                 "content": "Hello!"
-            }),
+            })),
         ];
         strip_reasoning_from_messages(&mut messages);
         assert!(messages[0].get("reasoning").is_none());

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::{interval, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Platform, PlatformConfig};
 use crate::platforms::api_server::{ApiServerAdapter, ApiServerConfig, ApiServerState};
@@ -843,8 +843,10 @@ async fn run_weixin_poll(
             Err(e) => {
                 consecutive_errors += 1;
                 if e.contains("session expired") {
-                    error!("Weixin session expired, stopping poll");
-                    break;
+                    error!("Weixin session expired, pausing for 10 minutes");
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    consecutive_errors = 0;
+                    continue;
                 }
                 if consecutive_errors > 5 {
                     warn!("Weixin: {consecutive_errors} consecutive errors: {e}");
@@ -879,12 +881,22 @@ async fn route_weixin_message(
         return;
     }
 
+    // DM / Group policy check (mirrors Python `_process_message`)
+    let chat_id = &event.peer_id;
+    if event.is_group {
+        if !adapter.is_group_allowed(chat_id) {
+            debug!("Weixin group message from {chat_id} blocked by policy");
+            return;
+        }
+    } else if !adapter.is_dm_allowed(chat_id) {
+        debug!("Weixin DM from {chat_id} blocked by policy");
+        return;
+    }
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-
-    let chat_id = &event.peer_id;
 
     // Check if this session is already running (busy session handling)
     let busy_elapsed_min: Option<f64> = {

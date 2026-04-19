@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent::types::Message;
 use hermes_core::Result;
 
 /// A single turn in ShareGPT conversation format.
@@ -43,7 +44,7 @@ pub fn has_incomplete_scratchpad(content: &str) -> bool {
 }
 
 /// Convert a list of OpenAI-format messages to ShareGPT conversation turns.
-pub fn messages_to_conversation(messages: &[Value]) -> Vec<ConversationTurn> {
+pub fn messages_to_conversation(messages: &[Message]) -> Vec<ConversationTurn> {
     messages
         .iter()
         .filter_map(|msg| {
@@ -107,6 +108,7 @@ pub fn save_trajectory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_convert_scratchpad() {
@@ -134,9 +136,9 @@ mod tests {
     #[test]
     fn test_messages_to_conversation() {
         let messages = vec![
-            serde_json::json!({"role": "system", "content": "You are helpful"}),
-            serde_json::json!({"role": "user", "content": "Hi"}),
-            serde_json::json!({"role": "assistant", "content": "Hello!"}),
+            Arc::new(serde_json::json!({"role": "system", "content": "You are helpful"})),
+            Arc::new(serde_json::json!({"role": "user", "content": "Hi"})),
+            Arc::new(serde_json::json!({"role": "assistant", "content": "Hello!"})),
         ];
         let turns = messages_to_conversation(&messages);
         assert_eq!(turns.len(), 3);

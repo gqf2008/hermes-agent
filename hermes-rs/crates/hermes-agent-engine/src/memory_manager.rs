@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::agent::types::Message;
 use crate::memory_provider::MemoryProvider;
 use once_cell::sync::Lazy;
 
@@ -279,14 +280,14 @@ impl MemoryManager {
     }
 
     /// Notify all providers of session end.
-    pub fn on_session_end(&self, messages: &[Value]) {
+    pub fn on_session_end(&self, messages: &[Message]) {
         for provider in &self.providers {
             provider.on_session_end(messages);
         }
     }
 
     /// Notify all providers before context compression.
-    pub fn on_pre_compress(&self, messages: &[Value]) -> String {
+    pub fn on_pre_compress(&self, messages: &[Message]) -> String {
         let parts: Vec<String> = self
             .providers
             .iter()
